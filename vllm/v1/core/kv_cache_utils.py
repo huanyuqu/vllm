@@ -7,7 +7,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, NewType, TypeAlias
+from typing import Any, NewType, Optional, TypeAlias
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -149,6 +149,44 @@ class KVCacheBlock:
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"
         )
+        
+        
+@dataclass
+class BuddyTreeNode:
+    """
+    Node in the buddy tree representing a block and its split relationships.
+    
+    Attributes:
+        block: The actual KVCacheBlock object
+        parent: Parent node (the larger block this was split from)
+        left_child: Left child (first half when split)
+        right_child: Right child (second half when split)
+        is_allocated: Whether this block is currently in use
+        is_split: Whether this block has been split into children
+    """
+    block: KVCacheBlock
+    parent: Optional['BuddyTreeNode'] = None
+    left_child: Optional['BuddyTreeNode'] = None
+    right_child: Optional['BuddyTreeNode'] = None
+    is_allocated: bool = False
+    is_split: bool = False
+
+    @property
+    def can_merge_with_buddy(self) -> bool:
+        """Check if this node can be merged with its buddy."""
+        if self.parent is None or self.is_allocated or self.is_split:
+            return False
+        
+        # Find buddy
+        buddy = (self.parent.right_child 
+                if self.parent.left_child == self 
+                else self.parent.left_child)
+        
+        if buddy is None:
+            return False
+        
+        # Both must be free and not split
+        return not buddy.is_allocated and not buddy.is_split
 
 
 class FreeKVCacheBlockQueue:
