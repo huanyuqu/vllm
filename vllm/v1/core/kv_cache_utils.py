@@ -152,24 +152,34 @@ class KVCacheBlock:
         
         
 @dataclass
-class BuddyTreeNode:
-    """
-    Node in the buddy tree representing a block and its split relationships.
+class BuddyTreeBlock(KVCacheBlock):
+    """KV-cache block metadata for variable-sized blocks in buddy tree allocation.
     
-    Attributes:
-        block: The actual KVCacheBlock object
-        parent: Parent node (the larger block this was split from)
-        left_child: Left child (first half when split)
-        right_child: Right child (second half when split)
-        is_allocated: Whether this block is currently in use
-        is_split: Whether this block has been split into children
+    This class extends KVCacheBlock to support buddy tree-based block allocation,
+    where each node in the tree represents a block that can be split or merged.
+    The block_id refers to the initial maximum block in the buddy tree, while
+    relative_block_id tracks the position within that maximum block.
     """
-    block: KVCacheBlock
-    parent: Optional['BuddyTreeNode'] = None
-    left_child: Optional['BuddyTreeNode'] = None
-    right_child: Optional['BuddyTreeNode'] = None
-    is_allocated: bool = False
+    
+    # The relative block ID within the parent maximum block
+    # Each block has a two dimensional ID: (block_id, relative_block_id)
+    relative_block_id: int = 0
+    
+    # Parent node (the larger block this was split from)
+    parent: Optional['BuddyTreeBlock'] = None
+    # Left child (first half when split)
+    left_child: Optional['BuddyTreeBlock'] = None
+    # Right child (second half when split)
+    right_child: Optional['BuddyTreeBlock'] = None
+    # Whether this block has been split into children
+    # If a block has been split, it will not exist in any slab
+    # Thus, this block cannot be actually allocated
     is_split: bool = False
+    
+    @property
+    def is_allocated(self) -> bool:
+        """Check if this block is currently allocated."""
+        return self.ref_cnt > 0
 
     @property
     def can_merge_with_buddy(self) -> bool:
@@ -187,6 +197,25 @@ class BuddyTreeNode:
         
         # Both must be free and not split
         return not buddy.is_allocated and not buddy.is_split
+
+    def __repr__(self) -> str:
+        prev_block_id = self.prev_free_block.block_id if self.prev_free_block else None
+        next_block_id = self.next_free_block.block_id if self.next_free_block else None
+        parent_block_id = self.parent.block_id if self.parent else None
+        left_child_block_id = self.left_child.block_id if self.left_child else None
+        right_child_block_id = self.right_child.block_id if self.right_child else None
+        return (
+            f"BuddyTreeBlock(block_id={self.block_id}, "
+            f"ref_cnt={self.ref_cnt}, "
+            f"_block_hash={self._block_hash!r}, "
+            f"prev_free_block={prev_block_id}, "
+            f"next_free_block={next_block_id}, "
+            f"relative_block_id={self.relative_block_id}, "
+            f"parent={parent_block_id}, "
+            f"left_child={left_child_block_id}, "
+            f"right_child={right_child_block_id}, "
+            f"is_split={self.is_split})"
+        )
 
 
 class FreeKVCacheBlockQueue:
