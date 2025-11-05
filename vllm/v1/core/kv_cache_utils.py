@@ -6,7 +6,7 @@ import copy
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NewType, Optional, TypeAlias
 
 from vllm import envs
@@ -162,9 +162,13 @@ class BuddyTreeBlock(KVCacheBlock):
     """
     
     # The relative block ID within the parent maximum block
-    # Each block has a two dimensional ID: (block_id, relative_block_id)
-    relative_block_id: int = 0
-    
+    # Each block has a two dimensional ID: (block_id, relative_id)
+    relative_id: int = 0
+    # Number of tokens in this block (for variable-sized blocks)
+    size: int = None
+    # Current number of tokens used in this block
+    _num_tokens: int = field(default=0, init=False)
+
     # Parent node (the larger block this was split from)
     parent: Optional['BuddyTreeBlock'] = None
     # Left child (first half when split)
@@ -172,9 +176,20 @@ class BuddyTreeBlock(KVCacheBlock):
     # Right child (second half when split)
     right_child: Optional['BuddyTreeBlock'] = None
     # Whether this block has been split into children
-    # If a block has been split, it will not exist in any slab
-    # Thus, this block cannot be actually allocated
     is_split: bool = False
+    # A virtual block is a placeholder in the buddy tree
+    # that does not correspond to an actual allocated block in slabs.
+    is_virtual: bool = False
+    
+    @property
+    def num_tokens(self) -> int:
+        return self._num_tokens
+
+    @num_tokens.setter
+    def num_tokens(self, value: int):
+        if self.size is not None and value > self.size:
+            raise ValueError(f"num_tokens {value} exceeds size {self.size}")
+        self._num_tokens = value
     
     @property
     def is_allocated(self) -> bool:
@@ -210,12 +225,20 @@ class BuddyTreeBlock(KVCacheBlock):
             f"_block_hash={self._block_hash!r}, "
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id}, "
-            f"relative_block_id={self.relative_block_id}, "
+            f"relative_id={self.relative_id}, "
             f"parent={parent_block_id}, "
             f"left_child={left_child_block_id}, "
             f"right_child={right_child_block_id}, "
             f"is_split={self.is_split})"
         )
+
+
+# TODO(huanyu): Implement a heap-based free block management strategy.
+# This approach could improve memory access patterns but increases metadata
+# management complexity from O(1) to O(log n). We plan to implement this later
+# for performance comparison.
+class FreeKVCacheBlockHeap:
+    pass
 
 
 class FreeKVCacheBlockQueue:
