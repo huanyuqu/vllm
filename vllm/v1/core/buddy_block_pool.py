@@ -10,6 +10,7 @@ This directly reuses the existing doubly linked list implementation with O(1) mi
 removal support, which is essential for prefix caching.
 """
 from typing import Optional
+import heapq
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
@@ -62,15 +63,14 @@ class BuddyBlockPool:
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
 
-        # Map coordinate (block_id, size, relative_id) to KVCacheBlock
+        # Map coordinate (block_id, size, relative_id) to BuddyTreeBlock
         self._blocks: dict[tuple[int, int, int], BuddyTreeBlock] = {}
         # Initialize free block queues (slabs) for each supported size
         # Each queue is a FreeKVCacheBlockQueue that manages blocks of that size
         self.slabs = self._initialize_block_pool(num_gpu_blocks)
-        
-        # Track allocated blocks: block_id -> (KVCacheBlock, size)
-        self.allocated_blocks: dict[int, tuple[KVCacheBlock, int]] = {}
-        
+        # Allocated blocks stored as a min-heap: (num_tokens, block)
+        self.allocated_blocks: dict[int, list[tuple[int, BuddyTreeBlock]]] = {}
+
         logger.info(
             f"BuddyBlockPool initialized with {num_gpu_blocks} blocks of "
             f"size {self.max_block_size}, supporting sizes: {supported_sizes}"
@@ -337,7 +337,9 @@ class BuddyBlockPool:
         else:
             return None
     
-    def _reclaim_from_allocated_blocks(self) -> Optional[BuddyTreeBlock]:
+    def _reclaim_from_allocated_blocks(
+        self, num_tokens: int
+    ) -> Optional[BuddyTreeBlock]:
         """
         Try to reclaim unused space from allocated blocks.
         
@@ -375,6 +377,51 @@ class BuddyBlockPool:
                 return block
         
         return None
+    
+    def _reclaim(self, size: int, num_tokens: int) -> Optional[BuddyTreeBlock]:
+        """
+        Try to reclaim unused space from blocks in the specified slab.
+        
+        Find a block in the slab that can be split to free up space.
+        
+        Args:
+            size: The size of the slab to reclaim from
+            
+        Returns:
+            The resized block if successful, None otherwise
+        """
+        slab = self.allocated_blocks[size]
+        
+        reclaimed_tokens = 0
+        for block_tuple in list(slab):
+            block_id, (block, current_size) = block_tuple
+            # Get actual token usage from tracking
+            num_tokens_used = self.block_usage.get(block_id, 0)
+            
+            # If no usage info, assume worst case (can't reclaim)
+            if num_tokens_used == 0:
+                continue
+            
+            # Check if we can split this block
+            can_split, new_size = self.can_split_block(block_id, num_tokens_used)
+            
+            if can_split:
+            freed_size = current_size - new_size
+            logger.debug(
+                f"Reclaiming space from slab block {block_id}: "
+                f"current_size={current_size}, used={num_tokens_used}, "
+                f"new_size={new_size}, freed_size={freed_size}"
+            )
+            
+            # Split the block and return freed portions to slabs
+            self._split_allocated_block(block, current_size, new_size)
+            reclaimed_tokens += freed_size
+            
+            if reclaimed_tokens >= num_tokens:
+                return block
+        
+        return None
+
     
     def _split_allocated_block(
         self, 
