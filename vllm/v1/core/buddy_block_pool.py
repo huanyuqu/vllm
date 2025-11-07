@@ -9,8 +9,8 @@ Each slab is simply a FreeKVCacheBlockQueue that manages free blocks of a specif
 This directly reuses the existing doubly linked list implementation with O(1) middle
 removal support, which is essential for prefix caching.
 """
+from collections import deque
 from typing import Optional
-import heapq
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
@@ -59,6 +59,7 @@ class BuddyBlockPool:
         self._check_supported_sizes()
         self._complete_supported_sizes()
         self.max_block_size = self.supported_sizes[0]
+        self.min_block_size = self.supported_sizes[-1]
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
@@ -69,7 +70,11 @@ class BuddyBlockPool:
         # Each queue is a FreeKVCacheBlockQueue that manages blocks of that size
         self.slabs = self._initialize_block_pool(num_gpu_blocks)
         # Allocated blocks stored as a min-heap: (num_tokens, block)
-        self.allocated_blocks: dict[int, list[tuple[int, BuddyTreeBlock]]] = {}
+        # TODO(huanyu): The best way to record allocated blocks is to use a
+        # min-heap based on their current token usage for better reclamation.
+        # However, this increases complexity from O(1) to O(log n).
+        # For now, we use a simple queue for allocated blocks.
+        self.allocated_blocks: dict[int, deque[BuddyTreeBlock]] = {}
 
         logger.info(
             f"BuddyBlockPool initialized with {num_gpu_blocks} blocks of "
@@ -332,53 +337,53 @@ class BuddyBlockPool:
         """
         slab = self.slabs[size]
         if slab.num_free_blocks > 0:
-            block = slab.popleft()
+            block: BuddyTreeBlock = slab.popleft()
+            self.allocated_blocks[size].append(block)
             return block
         else:
             return None
     
-    def _reclaim_from_allocated_blocks(
-        self, num_tokens: int
-    ) -> Optional[BuddyTreeBlock]:
+    def _reclaim_from_allocated_blocks(self, num_tokens: int) -> int:
         """
-        Try to reclaim unused space from allocated blocks.
-        
-        Find an allocated block with unused capacity, split it to fit actual usage,
-        and return the freed portions to their respective slabs.
-        
+        Repeatedly call _reclaim_one_block and try larger slabs first.
+
         Returns:
-            The resized block if successful, None otherwise
+            Remaining number of tokens that still need allocation (0 if satisfied).
         """
-        # Iterate through allocated blocks to find one with unused space
-        for block_id, (block, current_size) in list(self.allocated_blocks.items()):
-            # Skip if block has multiple references (can't safely resize)
-            if block.ref_cnt > 1:
-                continue
-            
-            # Get actual token usage from tracking
-            num_tokens_used = self.block_usage.get(block_id, 0)
-            
-            # If no usage info, assume worst case (can't reclaim)
-            if num_tokens_used == 0:
-                continue
-            
-            # Check if we can split this block
-            can_split, new_size = self.can_split_block(block_id, num_tokens_used)
-            
-            if can_split:
-                logger.debug(
-                    f"Reclaiming space from block {block_id}: "
-                    f"current_size={current_size}, used={num_tokens_used}, "
-                    f"new_size={new_size}"
-                )
-                
-                # Split the block and return freed portions to slabs
-                self._split_allocated_block(block, current_size, new_size)
-                return block
-        
-        return None
+        remaining = num_tokens
+
+        # Keep trying while there is work and progress can still be made
+        progress_made = True
+        while remaining > 0 and progress_made:
+            progress_made = False
+
+            for size in self.supported_sizes:
+                if remaining <= 0:
+                    break
+
+                if size not in self.allocated_blocks or not self.allocated_blocks[size]:
+                    continue
+
+                while remaining > 0:
+                    new_remaining = self._reclaim_one_block(size, remaining)
+                    if new_remaining < remaining:
+                        progress_made = True
+                        remaining = new_remaining
+                    else:
+                        break
+
+                if remaining <= 0:
+                    break
+
+            # If a full pass made no progress, stop to avoid infinite loop
+            if not progress_made:
+                break
+
+        return remaining
     
-    def _reclaim(self, size: int, num_tokens: int) -> Optional[BuddyTreeBlock]:
+    def _reclaim_one_block(
+        self, size: int, num_tokens: int
+    ) -> int:
         """
         Try to reclaim unused space from blocks in the specified slab.
         
@@ -386,275 +391,105 @@ class BuddyBlockPool:
         
         Args:
             size: The size of the slab to reclaim from
+            num_tokens: Number of tokens to accommodate
             
         Returns:
-            The resized block if successful, None otherwise
+            The remaining number of tokens that still need reclamation
         """
         slab = self.allocated_blocks[size]
+
+        # If no allocated blocks in this slab can be split to reclaim space,
+        # return immediately to avoid unnecessary work.
+        if not any(block.num_tokens <= size - self.min_block_size 
+                   for block in slab):
+            return num_tokens
         
-        reclaimed_tokens = 0
-        for block_tuple in list(slab):
-            block_id, (block, current_size) = block_tuple
-            # Get actual token usage from tracking
-            num_tokens_used = self.block_usage.get(block_id, 0)
-            
-            # If no usage info, assume worst case (can't reclaim)
-            if num_tokens_used == 0:
+        while slab:
+            reclaimed_block = slab.pop()
+            # Get current usage for this block
+            num_tokens_used = reclaimed_block.num_tokens
+            if num_tokens_used > size - self.min_block_size:
+                # Not enough space can be reclaimed
+                slab.appendleft(reclaimed_block)
                 continue
             
-            # Check if we can split this block
-            can_split, new_size = self.can_split_block(block_id, num_tokens_used)
-            
-            if can_split:
-            freed_size = current_size - new_size
-            logger.debug(
-                f"Reclaiming space from slab block {block_id}: "
-                f"current_size={current_size}, used={num_tokens_used}, "
-                f"new_size={new_size}, freed_size={freed_size}"
-            )
-            
-            # Split the block and return freed portions to slabs
-            self._split_allocated_block(block, current_size, new_size)
-            reclaimed_tokens += freed_size
-            
-            if reclaimed_tokens >= num_tokens:
-                return block
-        
-        return None
+            # Build a list of supported sizes (< current size), descending
+            idx = self.supported_sizes.index(size) + 1
+            supported_sizes = self.supported_sizes[idx:]
 
-    
-    def _split_allocated_block(
-        self, 
-        block: BuddyTreeBlock, 
-        current_size: int, 
-        new_size: int
-    ) -> None:
-        """
-        Split an allocated block to reduce its size, returning freed space to slabs.
-        
-        For example: 128-token block with 32 tokens used
-        -> Split into: 1x 32-token (keep allocated) + 1x 32-token (free) + 1x 64-token (free)
-        
-        Args:
-            block: The block to split
-            current_size: Current size of the block
-            new_size: New size to fit actual usage
-        """
-        remaining_size = current_size
-        kept_block = block
-        
-        # Repeatedly split until we reach new_size
-        while remaining_size > new_size:
-            half_size = remaining_size // 2
+            # Pick sizes (large to small) until we cover num_tokens_used
+            needed_sizes: list[int] = []
+            total = 0
+            for s in supported_sizes:
+                if total < num_tokens_used:
+                    needed_sizes.append(s)
+                    total += s
+                else:
+                    break
             
-            # Create buddy blocks at half_size
-            left_child, right_child = self._create_buddy_pair(
-                kept_block, remaining_size, half_size
-            )
+            # TODO(huanyu): how to link the original request to the new blocks
+            self._split_block(reclaimed_block, needed_sizes)
             
-            if half_size >= new_size:
-                # Keep splitting the left child
-                kept_block = left_child
-                # Free the right child
-                self.slabs[half_size].append(right_child)
-                logger.debug(f"Freed right child of size {half_size} to slab")
-            else:
-                # We've split too far, this shouldn't happen with proper logic
-                logger.error(
-                    f"Split logic error: half_size={half_size} < new_size={new_size}"
-                )
-                break
-            
-            remaining_size = half_size
-        
-        # Update the allocated block entry
-        self.allocated_blocks[block.block_id] = (kept_block, new_size)
-        logger.debug(
-            f"Resized block {block.block_id} from {current_size} to {new_size}"
-        )
-    
-    def _create_buddy_pair(
-        self,
-        parent_block: BuddyTreeBlock,
-        parent_size: int,
-        child_size: int
-    ) -> tuple[BuddyTreeBlock, BuddyTreeBlock]:
-        """
-        Create a pair of buddy blocks by splitting a parent.
-        
-        Args:
-            parent_block: The parent block to split
-            parent_size: Size of the parent block
-            child_size: Size of each child block
-            
-        Returns:
-            Tuple of (left_child, right_child)
-        """
-        assert parent_size == child_size * 2, "Invalid split ratio"
-        
-        # Create left and right children
-        left_child = BuddyTreeBlock(
-            block_id=parent_block.block_id,
-            relative_id=parent_block.relative_id * 2,
-            size=child_size,
-            is_virtual=False
-        )
-        
-        right_child = BuddyTreeBlock(
-            block_id=parent_block.block_id,
-            relative_id=parent_block.relative_id * 2 + 1,
-            size=child_size,
-            is_virtual=False
-        )
-        
-        # Establish parent-child relationships
-        left_child.parent = parent_block
-        right_child.parent = parent_block
-        parent_block.left_child = left_child
-        parent_block.right_child = right_child
-        parent_block.is_split = True
-        
-        # Store in blocks map
-        self._blocks[(left_child.block_id, child_size, left_child.relative_id)] = left_child
-        self._blocks[(right_child.block_id, child_size, right_child.relative_id)] = right_child
-        
-        return left_child, right_child
-    
-    def _find_suitable_size(self, requested_size: int) -> Optional[int]:
-        """
-        Find the smallest block size that can accommodate the requested size.
-        
-        Since supported_sizes is in descending order, we need to find from small to large.
-        
-        Args:
-            requested_size: Number of tokens to accommodate
-            
-        Returns:
-            The smallest block size >= requested_size, or None if none exists
-        """
-        # supported_sizes is sorted in descending order [128, 64, 32, 16]
-        # Find the smallest size that is >= requested_size
-        suitable = None
-        for size in reversed(self.supported_sizes):  # Iterate from small to large
-            if size >= requested_size:
-                suitable = size
-            else:
-                break  # No smaller size will work
-        return suitable
-    
-    def _allocate_from_slab(self, size: int) -> Optional[KVCacheBlock]:
-        """
-        Allocate a block from the specified queue (slab), splitting if necessary.
-        
-        Args:
-            size: Requested block size
-            
-        Returns:
-            KVCacheBlock if successful, None otherwise
-        """
-        queue = self.slabs[size]
-        
-        # Try to get a free block from the queue
-        if queue.num_free_blocks > 0:
-            return queue.popleft()
-        
-        # No free blocks, try to split a larger block
-        return self._split_larger_block(size)
-    
-    def _split_larger_block(self, target_size: int) -> Optional[KVCacheBlock]:
-        """
-        Split a larger block to create a block of target_size.
-        
-        Args:
-            target_size: Desired block size after splitting
-            
-        Returns:
-            KVCacheBlock of target_size, or None if splitting fails
-        """
-        # Find the next larger size
-        larger_size = None
-        for size in self.supported_sizes:
-            if size > target_size:
-                larger_size = size
-                break
-        
-        if larger_size is None:
-            logger.warning(f"Cannot split: no larger block available for size {target_size}")
-            return None
-        
-        # Recursively get a block of larger size
-        larger_block = self._allocate_from_slab(larger_size)
-        
-        if larger_block is None:
-            return None
-        
-        # Split the larger block
-        return self._split_block(larger_block, larger_size, target_size)
+            return num_tokens - needed_sizes[-1]
     
     def _split_block(
         self, 
-        parent_block: KVCacheBlock, 
-        parent_size: int,
-        target_size: int
-    ) -> KVCacheBlock:
+        parent_block: BuddyTreeBlock, 
+        needed_sizes: list[int]
+    ) -> None:
         """
-        Split a block into two buddies.
-        
-        This updates the buddy tree (for tracking merge opportunities) and
-        adds the new blocks to the appropriate slab.
-        
+        Materialize virtual descendant blocks of parent_block according
+        to needed_sizes and place them into their corresponding slabs.
+
         Args:
             parent_block: The block to split
-            parent_size: Current size of the parent block
-            target_size: Size of the blocks after splitting
-            
-        Returns:
-            One of the buddy blocks (left child)
+            needed_sizes: List of sizes for the descendant blocks to create
         """
-        assert parent_size == target_size * 2, "Can only split into half"
+        block_id = parent_block.block_id
+        parent_block.is_split = True
+        parent_block.is_virtual = True
+        total_tokens = parent_block.num_tokens
+
+        # Split from parent_size down to each needed size
+        # e.g., parent_size=64, needed_sizes=[32, 16] means:
+        #   1. Split 64 -> two 32s: allocate one, keep splitting the other
+        #   2. Split remaining 32 -> two 16s: allocate one, free the other
+        current_parent = parent_block
         
-        # Get the parent tree node
-        parent_tree_node = self.buddy_tree[parent_block.block_id]
-        
-        # Create two new BuddyTreeBlock objects for the buddies
-        # Use a scheme to derive unique block IDs for children
-        left_block_id = parent_block.block_id * 2
-        right_block_id = parent_block.block_id * 2 + 1
-        
-        left_block = BuddyTreeBlock(block_id=left_block_id, ref_cnt=0)
-        right_block = BuddyTreeBlock(block_id=right_block_id, ref_cnt=0)
-        
-        self._blocks[left_block_id] = left_block
-        self._blocks[right_block_id] = right_block
-        
-        # Create buddy tree nodes for tracking
-        left_block.parent = parent_tree_node
-        right_block.parent = parent_tree_node
-        
-        # Update parent node in the buddy tree
-        parent_tree_node.left_child = left_block
-        parent_tree_node.right_child = right_block
-        parent_tree_node.is_split = True
-        # Note: parent_tree_node.is_allocated stays False
-        # The parent tree node no longer represents a usable block
-        
-        # Store in buddy tree
-        self.buddy_tree[left_block_id] = left_block
-        self.buddy_tree[right_block_id] = right_block
-        
-        # Add right child to target queue's free list
-        # (we'll return left child as allocated)
-        target_queue = self.slabs[target_size]
-        target_queue.append(right_block)
-        
-        logger.debug(
-            f"Split block {parent_block.block_id} (size {parent_size}) "
-            f"into blocks {left_block_id} and {right_block_id} "
-            f"(size {target_size})"
-        )
-        
-        # Return left child (caller will add to allocated_blocks)
-        return left_block
+        for child_size in needed_sizes:
+            parent_relative_id = current_parent.relative_id
+            left_relative_id = parent_relative_id * 2
+            right_relative_id = left_relative_id + 1
+
+            left_child = self._blocks.get((block_id, child_size, left_relative_id))
+            right_child = self._blocks.get((block_id, child_size, right_relative_id))
+
+            if left_child is None or right_child is None:
+                raise KeyError(
+                    f"Child blocks not found for block_id={block_id}, "
+                    f"size={child_size}, left_rel={left_relative_id}, right_rel={right_relative_id}"
+                )
+
+            # Allocate left child to the original request
+            left_child.is_virtual = False
+            left_child.ref_cnt = parent_block.ref_cnt
+            left_child.num_tokens = min(child_size, total_tokens)
+            total_tokens -= left_child.num_tokens
+            # TODO(huanyu): link left_child to the original request
+            self.allocated_blocks[child_size].append(left_child)
+            
+            # Right child becomes the next block to split (or goes to slab if last)
+            if child_size == needed_sizes[-1]:
+                # Last split: right child goes to its slab as a free block
+                right_child.is_virtual = False
+                right_child.ref_cnt = 0
+                right_child.num_tokens = 0
+                self.slabs[child_size].append(right_child)
+            else:
+                # Continue splitting the right child
+                right_child.is_virtual = True
+                right_child.is_split = True
+                current_parent = right_child
     
     def free_blocks(self, ordered_blocks: list[KVCacheBlock]) -> None:
         """
