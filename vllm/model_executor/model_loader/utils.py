@@ -26,7 +26,7 @@ from vllm.model_executor.models.adapters import (
     try_create_mm_pooling_model_cls,
 )
 from vllm.model_executor.models.interfaces import SupportsQuant, supports_multimodal
-from vllm.utils import is_pin_memory_available
+from vllm.utils.platform_utils import is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -88,6 +88,14 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    if getattr(model, "process_weights_after_loading_already_called", False):
+        # In case `process_weights_after_loading` is called multiple times
+        # we'll skip it at later times
+        logger.debug_once(
+            "process_weights_after_loading already called for model %s", model
+        )
+        return
+
     # to avoid circular dependency
     from vllm.model_executor.model_loader.online_quantization import (
         maybe_save_metadata_and_attributes_for_weight_reloading,
