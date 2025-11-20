@@ -10,6 +10,7 @@ This directly reuses the existing doubly linked list implementation with O(1) mi
 removal support, which is essential for prefix caching.
 """
 from collections import deque
+from collections.abc import Iterable
 from typing import Optional
 
 from vllm.logger import init_logger
@@ -28,12 +29,14 @@ class BuddyBlockPool:
     
     This allocator maintains TWO separate data structures:
     
-    1. Buddy Tree: Tracks the hierarchical split/merge relationships of blocks.
-       Tree nodes may not correspond to actual usable blocks (e.g., a parent
-       node that has been split exists only for tracking merge opportunities).
+    1. Buddy Tree: Pre-creates all potential blocks at initialization to track
+       hierarchical split/merge relationships. All blocks exist in the tree,
+       but only blocks in slabs are available for allocation.
     
-    2. Free Block Queues (Slabs): Each size has a FreeKVCacheBlockQueue that
-       manages actual free KVCacheBlock objects.
+    2. Free Block Queues (Slabs): Each size has a FreeKVCacheBlockQueue.
+       A block is "available" if and only if it's in a slab. Initially, only
+       max-size blocks are in slabs. Splitting moves child blocks into slabs;
+       merging removes blocks from slabs and moves parent back to its slab.
     
     This class provides a compatible interface with BlockPool while supporting
     variable-sized blocks through buddy memory allocation.
@@ -73,8 +76,10 @@ class BuddyBlockPool:
         # TODO(huanyu): The best way to record allocated blocks is to use a
         # min-heap based on their current token usage for better reclamation.
         # However, this increases complexity from O(1) to O(log n).
-        # For now, we use a simple queue for allocated blocks.
-        self.allocated_blocks: dict[int, deque[BuddyTreeBlock]] = {}
+        # For now, we use a simple set for allocated blocks.
+        self.allocated_blocks: dict[int, set[BuddyTreeBlock]] = {
+            size: set() for size in self.supported_sizes
+        }
 
         logger.info(
             f"BuddyBlockPool initialized with {num_gpu_blocks} blocks of "
@@ -121,11 +126,13 @@ class BuddyBlockPool:
         self, num_blocks: int
     ) -> dict[int, FreeKVCacheBlockQueue]:
         """
-        Initialize all slabs with virtual blocks and establish buddy tree relationships.
+        Initialize buddy tree and slabs.
 
-        For the maximum block size, create actual blocks.
-        For smaller sizes, create virtual blocks that represent potential splits.
-        Build the buddy tree hierarchy where each max block has child blocks with the same block_id but different relative_block_ids.
+        Strategy:
+        1. Pre-create all potential blocks in the buddy tree for all sizes
+        2. Establish parent-child relationships in the tree
+        3. Only add max-size blocks to their slab (making them available)
+        4. Smaller blocks exist in the tree but not in slabs (unavailable until split)
         
         Args:
             num_blocks: Number of blocks to create at max size
@@ -133,60 +140,59 @@ class BuddyBlockPool:
         Returns:
             slabs: A dictionary mapping block sizes to their FreeKVCacheBlockQueue (slab)
         """
+        # First pass: create all blocks in the buddy tree
+        for size in self.supported_sizes:
+            size_ratio = self.max_block_size // size
+            total_blocks = num_blocks * size_ratio
+            
+            for i in range(total_blocks):
+                idx = i // size_ratio
+                relative_id = i % size_ratio
+                
+                block = BuddyTreeBlock(
+                    block_id=idx,
+                    relative_id=relative_id,
+                    size=size,
+                )
+                self._blocks[(idx, size, relative_id)] = block
+        
+        # Second pass: establish parent-child relationships
+        for size in self.supported_sizes[1:]:  # Skip max size (no parent)
+            size_ratio = self.max_block_size // size
+            total_blocks = num_blocks * size_ratio
+            
+            for i in range(total_blocks):
+                idx = i // size_ratio
+                relative_id = i % size_ratio
+                
+                block = self._blocks[(idx, size, relative_id)]
+                
+                # Find parent
+                parent_size = size * 2
+                parent_relative_id = relative_id // 2
+                parent_block = self._blocks[(idx, parent_size, parent_relative_id)]
+                
+                block.parent = parent_block
+                
+                # Link as left or right child
+                if relative_id % 2 == 0:
+                    parent_block.left_child = block
+                else:
+                    parent_block.right_child = block
+        
+        # Third pass: create slabs and only add max-size blocks
         slabs: dict[int, FreeKVCacheBlockQueue] = {}
         
         for size in self.supported_sizes:
-            blocks: list[BuddyTreeBlock] = []
-            
             if size == self.max_block_size:
-                # For max size, create actual root blocks
-                for idx in range(num_blocks):
-                    block = BuddyTreeBlock(
-                        block_id=idx,
-                        relative_id=0,
-                        size=size,
-                        is_virtual=False
-                    )
-                    blocks.append(block)
-                    self._blocks[(idx, size, 0)] = block
+                # Add all max-size blocks to slab (available for allocation)
+                max_blocks: list[KVCacheBlock] = [
+                    self._blocks[(idx, size, 0)] for idx in range(num_blocks)
+                ]
+                slabs[size] = FreeKVCacheBlockQueue(max_blocks)
             else:
-                # For smaller sizes, create virtual blocks and link to parents
-                size_ratio = self.max_block_size // size
-                total_virtual_blocks = num_blocks * size_ratio
-                
-                for i in range(total_virtual_blocks):
-                    idx = i // size_ratio
-                    relative_id = i % size_ratio
-                    
-                    block = BuddyTreeBlock(
-                        block_id=idx,
-                        relative_id=relative_id,
-                        size=size,
-                        is_virtual=True
-                    )
-                    blocks.append(block)
-                    self._blocks[(idx, size, relative_id)] = block
-                    
-                    # Establish parent-child relationships in buddy tree
-                    parent_size = size * 2
-                    parent_relative_id = relative_id // 2
-                    parent_coord = (idx, parent_size, parent_relative_id)
-                    parent_block = self._blocks.get(parent_coord)
-                    
-                    if parent_block:
-                        block.parent = parent_block
-                        child_position = relative_id % 2
-                        if child_position == 0:
-                            parent_block.left_child = block
-                        else:
-                            parent_block.right_child = block
-                    else:
-                        raise RuntimeError(
-                            f"Parent block not found for block_id={idx}, "
-                            f"size={size}, relative_id={relative_id}"
-                        )
-            
-            slabs[size] = FreeKVCacheBlockQueue(blocks)
+                # Create empty slab for smaller sizes
+                slabs[size] = FreeKVCacheBlockQueue([])
 
         return slabs
 
@@ -228,39 +234,13 @@ class BuddyBlockPool:
         )
         
         assert remaining_tokens <= 0, "Allocation should be satisfied after reclamation"
+        assert blocks is not None, "blocks should not be None after initial allocation"
+        assert reclaimed_blocks is not None, "reclaimed_blocks should not be None after reclamation"
         
         return blocks + reclaimed_blocks
     
-    def touch(self, blocks: tuple[list[KVCacheBlock], ...]) -> None:
-        """
-        Touch blocks to increase their reference count.
-        
-        Similar to BlockPool.touch(), this increases the reference count
-        and removes blocks from the free list if they were there.
-        This prevents cached blocks from being evicted when they are
-        hit by new requests.
-        
-        Args:
-            blocks: Tuple of block sequences, one per KV cache group.
-                   Each element is a list of KVCacheBlock objects.
-        """
-        for blocks_per_group in blocks:
-            for block in blocks_per_group:
-                # If ref_cnt is 0, the block is in the free list
-                if block.ref_cnt == 0:
-                    # Find which queue this block belongs to
-                    for size, queue in self.slabs.items():
-                        try:
-                            queue.remove(block)  # O(1) removal from middle
-                            break
-                        except RuntimeError:
-                            # Block not in this queue, continue
-                            continue
-                
-                # Increase reference count
-                block.ref_cnt += 1
-    
-    def update_block_usage(self, block_id: int, num_tokens_used: int) -> None:
+    def update_block_usage(self, block_id: int, size: int, relative_id: int,
+                           num_tokens_used: int) -> None:
         """
         Update the token usage for a block.
         
@@ -269,10 +249,15 @@ class BuddyBlockPool:
         
         Args:
             block_id: ID of the block
+            size: Size of the block
+            relative_id: Relative ID within the block's size category
             num_tokens_used: Number of tokens currently stored in the block
         """
-        self.block_usage[block_id] = num_tokens_used
-        logger.debug(f"Updated block {block_id} usage to {num_tokens_used} tokens")
+        coord = (block_id, size, relative_id)
+        if coord in self._blocks:
+            self._blocks[coord].num_tokens = num_tokens_used
+        else:
+            raise KeyError(f"Block {coord} not found")
 
     def _allocate_largest_blocks(
         self, num_tokens: int
@@ -337,8 +322,8 @@ class BuddyBlockPool:
         """
         slab = self.slabs[size]
         if slab.num_free_blocks > 0:
-            block: BuddyTreeBlock = slab.popleft()
-            self.allocated_blocks[size].append(block)
+            block: BuddyTreeBlock = slab.popleft()  # type: ignore
+            self.allocated_blocks[size].add(block)
             return block
         else:
             return None
@@ -410,7 +395,7 @@ class BuddyBlockPool:
             num_tokens_used = reclaimed_block.num_tokens
             if num_tokens_used > size - self.min_block_size:
                 # Not enough space can be reclaimed
-                slab.appendleft(reclaimed_block)
+                slab.add(reclaimed_block)
                 continue
             
             # Build a list of supported sizes (< current size), descending
@@ -438,22 +423,22 @@ class BuddyBlockPool:
         needed_sizes: list[int]
     ) -> None:
         """
-        Materialize virtual descendant blocks of parent_block according
-        to needed_sizes and place them into their corresponding slabs.
+        Split parent_block into child blocks and add them to slabs.
+        
+        The left children are allocated (added to allocated_blocks),
+        while the rightmost child goes to its free slab.
 
         Args:
-            parent_block: The block to split
-            needed_sizes: List of sizes for the descendant blocks to create
+            parent_block: The block to split (must already be in allocated_blocks)
+            needed_sizes: List of sizes for the descendant blocks, in descending order
         """
         block_id = parent_block.block_id
-        parent_block.is_split = True
-        parent_block.is_virtual = True
         total_tokens = parent_block.num_tokens
 
         # Split from parent_size down to each needed size
         # e.g., parent_size=64, needed_sizes=[32, 16] means:
-        #   1. Split 64 -> two 32s: allocate one, keep splitting the other
-        #   2. Split remaining 32 -> two 16s: allocate one, free the other
+        #   1. Split 64 -> two 32s: allocate left, keep splitting right
+        #   2. Split remaining 32 -> two 16s: allocate left, free right
         current_parent = parent_block
         
         for child_size in needed_sizes:
@@ -470,181 +455,116 @@ class BuddyBlockPool:
                     f"size={child_size}, left_rel={left_relative_id}, right_rel={right_relative_id}"
                 )
 
-            # Allocate left child to the original request
-            left_child.is_virtual = False
+            # Allocate left child
             left_child.ref_cnt = parent_block.ref_cnt
             left_child.num_tokens = min(child_size, total_tokens)
             total_tokens -= left_child.num_tokens
-            # TODO(huanyu): link left_child to the original request
-            self.allocated_blocks[child_size].append(left_child)
+            self.allocated_blocks[child_size].add(left_child)
             
-            # Right child becomes the next block to split (or goes to slab if last)
+            # Handle right child
             if child_size == needed_sizes[-1]:
-                # Last split: right child goes to its slab as a free block
-                right_child.is_virtual = False
+                # Last split: right child goes to slab as free block
                 right_child.ref_cnt = 0
                 right_child.num_tokens = 0
                 self.slabs[child_size].append(right_child)
             else:
                 # Continue splitting the right child
-                right_child.is_virtual = True
-                right_child.is_split = True
                 current_parent = right_child
+
+    def touch(self, blocks: tuple[list[BuddyTreeBlock], ...]) -> None:
+        """
+        Touch blocks to increase their reference count.
+        
+        Similar to BlockPool.touch(), this increases the reference count
+        and removes blocks from the free list if they were there.
+        This prevents cached blocks from being evicted when they are
+        hit by new requests.
+        
+        Args:
+            blocks: Tuple of block sequences, one per KV cache group.
+                   Each element is a list of KVCacheBlock objects.
+        """
+        for blocks_per_group in blocks:
+            for block in blocks_per_group:
+                # If ref_cnt is 0, the block is in the free list
+                if block.ref_cnt == 0:
+                    self.slabs[block.size].remove(block)
+                block.ref_cnt += 1
     
-    def free_blocks(self, ordered_blocks: list[KVCacheBlock]) -> None:
+    def free_blocks(self, ordered_blocks: Iterable[BuddyTreeBlock]) -> None:
         """
         Free a list of blocks and attempt to merge with buddies.
-        
-        The blocks should be ordered by their eviction priority, where the 
+
+        The blocks should be ordered by their eviction priority, where the
         first block will be evicted first.
-        
+
+        This uses a two-phase approach:
+        1. First, mark all blocks as free (ref_cnt--, remove from allocated)
+        2. Then, attempt to merge each block with its buddy
+
         Args:
             ordered_blocks: A list of blocks to free, ordered by eviction priority
         """
+        blocks_to_free: list[BuddyTreeBlock] = []
+        
+        # Phase 1: Mark all blocks as free
         for block in ordered_blocks:
-            block_id = block.block_id
-            
-            # Check if block is allocated
-            if block_id not in self.allocated_blocks:
+            size = block.size
+            if (size not in self.allocated_blocks or 
+                block not in self.allocated_blocks[size]):
                 continue
-            
-            # Decrease reference count
+
             block.ref_cnt -= 1
-            
-            # Only process further if ref_cnt reaches 0
             if block.ref_cnt > 0:
                 continue
-            
-            # Remove from allocated blocks
-            _, size = self.allocated_blocks.pop(block_id)
-            
-            # Try to merge with buddy (updates buddy tree)
-            merged_block, merged_size = self._try_merge(block, size)
-            
-            # Add the final block to appropriate queue
-            queue = self.slabs[merged_size]
-            queue.append(merged_block)
-            
-            logger.debug(
-                f"Freed block {block_id}, final block {merged_block.block_id}, "
-                f"final size: {merged_size}"
-            )
-    
-    def _try_merge(
-        self, 
-        block: KVCacheBlock, 
-        block_size: int
-    ) -> tuple[KVCacheBlock, int]:
-        """
-        Recursively merge a block with its buddy if possible.
+
+            # Remove from allocated set and prepare for freeing
+            self.allocated_blocks[size].discard(block)
+            block.num_tokens = 0
+            blocks_to_free.append(block)
         
+        # Phase 2: Add to free slabs first (so buddies can find each other)
+        for block in blocks_to_free:
+            self.slabs[block.size].append(block)
+        
+        # Phase 3: Try to merge each block with its buddy
+        # Process from smallest to largest to maximize merge opportunities
+        blocks_to_free.sort(key=lambda b: b.size)
+        
+        for block in blocks_to_free:
+            # Block might have been merged already
+            if (block.prev_free_block is None and
+                block.next_free_block is None):
+                continue
+            
+            self.slabs[block.size].remove(block)
+            self._try_merge(block)
+    
+    def _try_merge(self, block: BuddyTreeBlock) -> None:
+        """
+        Try to iteratively merge `block` with its free buddy.
+        If the buddy is free (in slab), remove it and promote parent.
+        Repeat until no further merge is possible or we reach the root.
+
         Args:
-            block: The block to merge
-            block_size: Current size of the block
-            
-        Returns:
-            Tuple of (merged_block, merged_size)
+            block: The block to start merging from
         """
-        tree_node = self.buddy_tree[block.block_id]
-        
-        if not tree_node.can_merge_with_buddy:
-            return block, block_size
-        
-        parent_tree_node = tree_node.parent
-        buddy_tree_node = (
-            parent_tree_node.right_child 
-            if parent_tree_node.left_child == tree_node 
-            else parent_tree_node.left_child
-        )
-        
-        # buddy_tree_node is itself the buddy block
-        buddy_block = buddy_tree_node
-        
-        # Remove buddy from its queue's free list
-        buddy_queue = self.slabs[block_size]
-        try:
-            buddy_queue.remove(buddy_block)  # O(1) removal from middle
-        except RuntimeError:
-            # Buddy was not in free list (shouldn't happen but handle gracefully)
-            logger.warning(
-                f"Attempted to merge with buddy block {buddy_block.block_id} "
-                "which was not in free list"
-            )
-            return block, block_size
-        
-        # The parent tree node now represents the merged block
-        parent_block = parent_tree_node
-        parent_size = block_size * 2
-        
-        # Reset parent tree node state
-        parent_tree_node.left_child = None
-        parent_tree_node.right_child = None
-        parent_tree_node.is_split = False
-        
-        logger.debug(
-            f"Merged blocks {block.block_id} and {buddy_block.block_id} "
-            f"into block {parent_block.block_id} (size {parent_size})"
-        )
-        
-        # Recursively try to merge parent
-        return self._try_merge(parent_block, parent_size)
-    
-    def can_split_block(self, block_id: int, num_tokens_used: int) -> tuple[bool, int]:
-        """
-        Check if a block can be split based on usage.
-        
-        Args:
-            block_id: ID of the block to check
-            num_tokens_used: Number of tokens currently used in the block
-            
-        Returns:
-            Tuple of (can_split, suggested_new_size)
-        """
-        if block_id not in self.allocated_blocks:
-            return False, 0
-        
-        _, current_size = self.allocated_blocks[block_id]
-        
-        # Find the smallest size that can accommodate the used tokens
-        new_size = self._find_suitable_size(num_tokens_used)
-        
-        if new_size is None:
-            return False, 0
-        
-        # Can split if new_size < current_size
-        if new_size < current_size:
-            return True, new_size
-        
-        return False, 0
-    
-    def get_num_free_blocks(self, size: Optional[int] = None) -> int:
-        """
-        Get the number of free blocks.
-        
-        Args:
-            size: If specified, return free blocks of this size only.
-                  If None, return total free blocks across all sizes.
-            
-        Returns:
-            Number of free blocks
-        """
-        if size is not None:
-            return self.slabs[size].num_free_blocks
-        
-        # Return total free blocks across all queues
-        return sum(queue.num_free_blocks for queue in self.slabs.values())
-    
-    def get_usage(self) -> float:
-        """
-        Get the KV cache usage.
-        
-        Returns:
-            The KV cache usage (between 0.0 and 1.0).
-        """
-        total_gpu_blocks = self.num_gpu_blocks
-        if not total_gpu_blocks:
-            return 0
-        return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+        current = block
+
+        while True:
+            buddy = current.buddy
+            if buddy is None:
+                break
+
+            try:
+                self.slabs[buddy.size].remove(buddy)
+            except (ValueError, KeyError):
+                # Buddy is not in slab (not free) -> cannot merge
+                break
+
+            current = current.parent
+
+        self.slabs[current.size].append(current)
     
     def reset_prefix_cache(self):
         raise NotImplementedError

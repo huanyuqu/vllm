@@ -176,11 +176,15 @@ class BuddyTreeBlock(KVCacheBlock):
     left_child: Optional['BuddyTreeBlock'] = None
     # Right child (second half when split)
     right_child: Optional['BuddyTreeBlock'] = None
-    # Whether this block has been split into children
-    is_split: bool = False
-    # A virtual block is a placeholder in the buddy tree
-    # that does not correspond to an actual allocated block in slabs.
-    is_virtual: bool = False
+
+    @property
+    def buddy(self) -> Optional['BuddyTreeBlock']:
+        """Get the buddy block (sibling) of this block."""
+        if self.parent is None:
+            return None
+        return (self.parent.right_child 
+                if self.parent.left_child == self 
+                else self.parent.left_child)
     
     @property
     def num_tokens(self) -> int:
@@ -191,28 +195,6 @@ class BuddyTreeBlock(KVCacheBlock):
         if self.size is not None and value > self.size:
             raise ValueError(f"num_tokens {value} exceeds size {self.size}")
         self._num_tokens = value
-    
-    @property
-    def is_allocated(self) -> bool:
-        """Check if this block is currently allocated."""
-        return self.ref_cnt > 0
-
-    @property
-    def can_merge_with_buddy(self) -> bool:
-        """Check if this node can be merged with its buddy."""
-        if self.parent is None or self.is_allocated or self.is_split:
-            return False
-        
-        # Find buddy
-        buddy = (self.parent.right_child 
-                if self.parent.left_child == self 
-                else self.parent.left_child)
-        
-        if buddy is None:
-            return False
-        
-        # Both must be free and not split
-        return not buddy.is_allocated and not buddy.is_split
 
     def __repr__(self) -> str:
         prev_block_id = self.prev_free_block.block_id if self.prev_free_block else None
@@ -229,8 +211,7 @@ class BuddyTreeBlock(KVCacheBlock):
             f"relative_id={self.relative_id}, "
             f"parent={parent_block_id}, "
             f"left_child={left_child_block_id}, "
-            f"right_child={right_child_block_id}, "
-            f"is_split={self.is_split})"
+            f"right_child={right_child_block_id})"
         )
 
 
