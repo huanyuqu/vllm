@@ -25,6 +25,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.core.kv_cache_utils import SegmentHash
 
 
 class Request:
@@ -126,6 +127,9 @@ class Request:
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
+            
+        # TODO(huanyu): implement hash computations for segments
+        self.segment_hashes: list[SegmentHash] = []
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 

@@ -7,7 +7,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, NewType, Optional, TypeAlias
+from typing import Any, NewType, Optional, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -33,10 +33,17 @@ from vllm.v1.utils import tensor_data
 # catch accidental misuse when passing around raw byte strings.
 BlockHash = NewType("BlockHash", bytes)
 
+# SegmentHash represents the hash of a semantic segment (a sequence of blocks).
+# A semantic segment is a logical unit that can be cached and reused across requests.
+# This is distinct from BlockHash to prevent accidental mixing of block and segment hashes.
+SegmentHash = NewType("SegmentHash", bytes)
+
 # `BlockHashWithGroupId` combines a `BlockHash` with its KV cache group ID.
 # It is represented as raw bytes for compactness and efficiency. The helper
 # functions below pack/unpack the `BlockHash` and group id into/from the key.
 BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
+
+SegmentHashWithGroupId = NewType("SegmentHashWithGroupId", bytes)
 
 # ExternalBlockHash is used for reproducible prefix-cache block hashing.
 # It's a union of `bytes` and `int` to keep backward compatibility
@@ -56,13 +63,33 @@ def make_block_hash_with_group_id(
     return BlockHashWithGroupId(block_hash + group_id.to_bytes(4, "big", signed=False))
 
 
+def make_segment_hash_with_group_id(
+    segment_hash: SegmentHash, group_id: int
+) -> SegmentHashWithGroupId:
+    """Pack a `SegmentHash` and group id into a `SegmentHashWithGroupId`.
+
+    The group id is encoded using 4 bytes in big-endian order and appended to
+    the segment hash bytes.  This representation avoids creating tuples while
+    still allowing us to recover both components when needed.
+    """
+    return SegmentHashWithGroupId(
+        segment_hash + group_id.to_bytes(4, "big", signed=False)
+    )
+
+
 def get_block_hash(key: BlockHashWithGroupId) -> BlockHash:
     """Extract the `BlockHash` from a `BlockHashWithGroupId`."""
     return BlockHash(key[:-4])
 
 
-def get_group_id(key: BlockHashWithGroupId) -> int:
-    """Extract the group id from a `BlockHashWithGroupId`."""
+def get_segment_hash(key: SegmentHashWithGroupId) -> SegmentHash:
+    """Extract the `SegmentHash` from a `SegmentHashWithGroupId`."""
+    return SegmentHash(key[:-4])
+
+
+def get_group_id(key: BlockHashWithGroupId | SegmentHashWithGroupId) -> int:
+    """Extract the group id from a `BlockHashWithGroupId` or 
+    `SegmentHashWithGroupId`."""
     return int.from_bytes(key[-4:], "big", signed=False)
 
 
@@ -176,7 +203,10 @@ class BuddyTreeBlock(KVCacheBlock):
     left_child: Optional['BuddyTreeBlock'] = None
     # Right child (second half when split)
     right_child: Optional['BuddyTreeBlock'] = None
-
+    
+    # Whether the block is sealed in a segment
+    is_sealed: bool = False
+    
     @property
     def buddy(self) -> Optional['BuddyTreeBlock']:
         """Get the buddy block (sibling) of this block."""
@@ -185,6 +215,10 @@ class BuddyTreeBlock(KVCacheBlock):
         return (self.parent.right_child 
                 if self.parent.left_child == self 
                 else self.parent.left_child)
+        
+    @property
+    def full_id(self) -> tuple[int, int, int]:
+        return (self.block_id, self.size, self.relative_id)
     
     @property
     def num_tokens(self) -> int:
@@ -213,6 +247,100 @@ class BuddyTreeBlock(KVCacheBlock):
             f"left_child={left_child_block_id}, "
             f"right_child={right_child_block_id})"
         )
+        
+        
+@dataclass
+class SemanticSegment:
+    """
+    Represents a semantic segment of KV cache blocks.
+    
+    A semantic segment is a sequence of blocks that form a logical unit
+    (e.g., a sentence, a paragraph, or a specific functional block).
+    It is the unit for prefix caching and reference counting.
+    """
+    segment_id: int
+    blocks: list[BuddyTreeBlock] = []
+    _segment_hash: Optional[SegmentHash] = None
+    ref_cnt: int = 0
+    is_evicted: bool = False
+    is_sealed: bool = True
+    
+    @property
+    def segment_hash(self) -> SegmentHashWithGroupId | None:
+        return self._segment_hash
+
+    @segment_hash.setter
+    def segment_hash(self, segment_hash: SegmentHashWithGroupId):
+        assert self.segment_hash is None, (
+            "The segment already has a hash. This should not happen."
+        )
+        self._segment_hash = segment_hash
+        
+    @overload
+    def append(self, block: BuddyTreeBlock) -> None:
+        ...
+
+    @overload
+    def append(self, blocks: list[BuddyTreeBlock]) -> None:
+        ...
+
+    def append(self, block: BuddyTreeBlock | list[BuddyTreeBlock]) -> None:
+        """Add block(s) to this segment."""
+        if isinstance(block, list):
+            self.blocks.extend(block)
+        else:
+            self.blocks.append(block)
+            
+    def seal(self) -> None:
+        """Ensure that when sealing a segment, we increment the ref count of every
+        block managed by the segment by 1. This prevents those blocks from being
+        reclaimed even if the segment's own ref count becomes 0. A segment must
+        be unsealed before its blocks may be reallocated.
+        """
+        if self.is_sealed:
+            raise RuntimeError("Segment is already sealed")
+        self.is_sealed = True
+        for block in self.blocks:
+            block.is_sealed = True
+        self.ref_cnt = 1
+      
+    @property      
+    def ref_counts(self) -> list[int]:
+        """Get the reference counts of all blocks in this segment."""
+        return [block.ref_cnt for block in self.blocks]
+    
+    @property
+    def all_ref_counts_equal(self) -> bool:
+        """Check if all blocks in this segment have the same reference count."""
+        return len(set(self.ref_counts)) == 1
+    
+    @property
+    def last_block(self) -> BuddyTreeBlock:
+        """Get the last block in this segment."""
+        return self.blocks[-1]
+            
+    def unseal(self) -> None:
+        """Unseal the segment by decrementing the ref count of every block
+        managed by the segment by 1. This allows those blocks to be reclaimed
+        if the segment's own ref count is 0.
+        """
+        for block in self.blocks:
+            block.ref_cnt -= 1
+
+    def __repr__(self) -> str:
+        return (f"SemanticSegment(id={self.segment_id}, hash={self.content_hash}, "
+                f"blocks={len(self.blocks)}, ref_cnt={self.ref_cnt})")
+
+    def reset_hash(self):
+        """Reset the segment hash when the segment is evicted."""
+        self._segment_hash = None
+
+    def __repr__(self) -> str:
+        block_ids = [block.full_id for block in self.blocks]
+        return (f"SemanticSegment(segment_id={self.segment_id}, "
+                f"block_ids={block_ids}, "
+                f"ref_cnt={self.ref_cnt}, "
+                f"_segment_hash={self._segment_hash!r})")
 
 
 # TODO(huanyu): Implement a heap-based free block management strategy.
