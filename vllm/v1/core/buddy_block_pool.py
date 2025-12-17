@@ -9,16 +9,23 @@ Each slab is simply a FreeKVCacheBlockQueue that manages free blocks of a specif
 This directly reuses the existing doubly linked list implementation with O(1) middle
 removal support, which is essential for prefix caching.
 """
-from collections import deque
 from collections.abc import Iterable
 from typing import Optional
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    ExternalBlockHash,
     FreeKVCacheBlockQueue, 
     KVCacheBlock, 
     BuddyTreeBlock,
+    get_block_hash,
+    make_block_hash_with_group_id,
+    maybe_convert_block_hash,
 )
+from vllm.v1.core.block_pool import BlockHashToBlockMap
+from vllm.distributed.kv_events import MEDIUM_GPU, BlockRemoved, BlockStored, KVCacheEvent
+from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -81,10 +88,10 @@ class BuddyBlockPool:
             size: set() for size in self.supported_sizes
         }
 
-        logger.info(
-            f"BuddyBlockPool initialized with {num_gpu_blocks} blocks of "
-            f"size {self.max_block_size}, supporting sizes: {supported_sizes}"
-        )
+        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        
+        # TODO(huanyu): implement KV events
+        self.kv_event_queue: list[KVCacheEvent] = []
         
     def _check_supported_sizes(self) -> None:
         """
@@ -154,7 +161,7 @@ class BuddyBlockPool:
                     relative_id=relative_id,
                     size=size,
                 )
-                self._blocks[(idx, size, relative_id)] = block
+                self._blocks[block.full_id] = block
         
         # Second pass: establish parent-child relationships
         for size in self.supported_sizes[1:]:  # Skip max size (no parent)
@@ -165,7 +172,7 @@ class BuddyBlockPool:
                 idx = i // size_ratio
                 relative_id = i % size_ratio
                 
-                block = self._blocks[(idx, size, relative_id)]
+                block = self._blocks[block.full_id]
                 
                 # Find parent
                 parent_size = size * 2
@@ -195,6 +202,144 @@ class BuddyBlockPool:
                 slabs[size] = FreeKVCacheBlockQueue([])
 
         return slabs
+    
+    def get_cached_block(
+        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+    ) -> Optional[list[BuddyTreeBlock]]:
+        """Get the cached block by the block hash for each group in
+        `kv_cache_group_ids`, or None if cache miss for any group.
+        If there are duplicated blocks, we return the first block in the cache.
+
+        Args:
+            block_hash: The hash value of the block.
+            kv_cache_group_ids: The ids of the KV cache groups.
+
+        Returns:
+            The cached blocks if exists, or None.
+        """
+        cached_blocks: list[BuddyTreeBlock] = []
+        for group_id in kv_cache_group_ids:
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, group_id
+            )
+            block = self.cached_block_hash_to_block.get_one_block(
+                block_hash_with_group_id
+            )
+            if not block:
+                return None
+            cached_blocks.append(block)
+        return cached_blocks
+
+    # NOTE: This method is copied from block_pool.py
+    def cache_full_blocks(
+        self,
+        request: Request,
+        blocks: list[BuddyTreeBlock],
+        num_cached_blocks: int,
+        num_full_blocks: int,
+        block_size: int,
+        kv_cache_group_id: int,
+    ) -> None:
+        """Cache a list of full blocks for prefix caching.
+        This function takes a list of blocks that will have their block hash
+        metadata to be updated and cached. Given a request, it updates the
+        metadata for each block and caching it in the
+        `cached_block_hash_to_block`.
+        The block hashes values are computed by the Request object immediately
+        when it is created and when new tokens are appended.
+
+        Args:
+            request: The request to cache the blocks.
+            blocks: All blocks in the request.
+            num_cached_blocks: The number of blocks that are already cached.
+            num_full_blocks: The number of blocks that are full and should
+                be cached after this function.
+            block_size: Number of tokens in each block.
+            kv_cache_group_id: The id of the KV cache group.
+        """
+        if num_cached_blocks >= num_full_blocks:
+            return
+        new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+        assert len(request.block_hashes) >= num_full_blocks
+        new_block_hashes = request.block_hashes[num_cached_blocks:]
+
+        new_hashes: list[ExternalBlockHash] | None = (
+            [] if self.enable_kv_cache_events else None
+        )
+        for i, blk in enumerate(new_full_blocks):
+            assert blk.block_hash is None
+            block_hash = new_block_hashes[i]
+
+            # Update and added the full block to the cache.
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, kv_cache_group_id
+            )
+            blk.block_hash = block_hash_with_group_id
+            self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            if new_hashes is not None:
+                new_hashes.append(maybe_convert_block_hash(block_hash))
+
+        if self.enable_kv_cache_events:
+            if num_cached_blocks == 0:
+                parent_block_hash: ExternalBlockHash | None = None
+            else:
+                parent_block = blocks[num_cached_blocks - 1]
+                assert parent_block.block_hash is not None
+                parent_block_hash = maybe_convert_block_hash(
+                    get_block_hash(parent_block.block_hash)
+                )
+
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=new_hashes,
+                    parent_block_hash=parent_block_hash,
+                    token_ids=request.all_token_ids[
+                        num_cached_blocks * block_size : num_full_blocks * block_size
+                    ],
+                    block_size=block_size,
+                    lora_id=request.lora_request.adapter_id
+                    if request.lora_request
+                    else None,
+                    medium=MEDIUM_GPU,
+                )
+            )
+         
+    # NOTE: This method is copied from block_pool.py
+    def _maybe_evict_cached_block(self, block: BuddyTreeBlock) -> bool:
+        """
+        If a block is cached in `cached_block_hash_to_block`, we reset its hash
+        metadata and evict it from the cache.
+
+        Args:
+            block: The block to evict.
+
+        Returns:
+            True if the block is evicted, False otherwise.
+        """
+        block_hash = block.block_hash
+        if block_hash is None:
+            # The block doesn't have hash, eviction is not needed
+            return False
+
+        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
+            # block not found in cached_block_hash_to_block,
+            # eviction is not needed
+            return False
+
+        block.reset_hash()
+
+        if self.enable_kv_cache_events:
+            # FIXME (Chen): Not sure whether we should return `hash_value`
+            # or `(hash_value, group_id)` here. But it's fine now because
+            # we disable hybrid kv cache manager when kv cache event is
+            # enabled, so there is only one group.
+            self.kv_event_queue.append(
+                BlockRemoved(
+                    block_hashes=[maybe_convert_block_hash(get_block_hash(block_hash))],
+                    medium=MEDIUM_GPU,
+                )
+            )
+        return True
 
     def get_new_blocks(self, num_tokens: int) -> list[BuddyTreeBlock]:
         """
@@ -237,7 +382,17 @@ class BuddyBlockPool:
         assert blocks is not None, "blocks should not be None after initial allocation"
         assert reclaimed_blocks is not None, "reclaimed_blocks should not be None after reclamation"
         
-        return blocks + reclaimed_blocks
+        new_blocks =  blocks + reclaimed_blocks
+        
+        if self.enable_caching:
+            for block in new_blocks:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+        else:
+            for block in new_blocks:
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
     
     def update_block_usage(self, block_id: int, size: int, relative_id: int,
                            num_tokens_used: int) -> None:
@@ -491,6 +646,8 @@ class BuddyBlockPool:
                     self.slabs[block.size].remove(block)
                 block.ref_cnt += 1
     
+    # TODO(huanyu): This method is implemented incorrectly. Merges should occur
+    # during eviction; free should only add blocks to slabs (the free queue).
     def free_blocks(self, ordered_blocks: Iterable[BuddyTreeBlock]) -> None:
         """
         Free a list of blocks and attempt to merge with buddies.
