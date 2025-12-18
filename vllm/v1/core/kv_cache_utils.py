@@ -193,7 +193,7 @@ class BuddyTreeBlock(KVCacheBlock):
     # Each block has a two dimensional ID: (block_id, relative_id)
     relative_id: int = 0
     # Number of tokens in this block (for variable-sized blocks)
-    size: int = None
+    size: int = 0
     # Current number of tokens used in this block
     _num_tokens: int = field(default=0, init=False)
 
@@ -204,6 +204,10 @@ class BuddyTreeBlock(KVCacheBlock):
     # Right child (second half when split)
     right_child: Optional['BuddyTreeBlock'] = None
     
+    # Linked list for blocks in a segment
+    prev_block: Optional['BuddyTreeBlock'] = None
+    next_block: Optional['BuddyTreeBlock'] = None
+
     # Whether the block is sealed in a segment
     is_sealed: bool = False
     
@@ -260,13 +264,13 @@ class SemanticSegment:
     """
     segment_id: int
     blocks: list[BuddyTreeBlock] = []
-    _segment_hash: Optional[SegmentHash] = None
+    _segment_hash: Optional[SegmentHashWithGroupId] = None
     ref_cnt: int = 0
     is_evicted: bool = False
-    is_sealed: bool = True
+    is_sealed: bool = False
     
     @property
-    def segment_hash(self) -> SegmentHashWithGroupId | None:
+    def segment_hash(self) -> Optional[SegmentHashWithGroupId]:
         return self._segment_hash
 
     @segment_hash.setter
@@ -281,14 +285,18 @@ class SemanticSegment:
         ...
 
     @overload
-    def append(self, blocks: list[BuddyTreeBlock]) -> None:
+    def append(self, block: list[BuddyTreeBlock]) -> None:
         ...
 
     def append(self, block: BuddyTreeBlock | list[BuddyTreeBlock]) -> None:
         """Add block(s) to this segment."""
         if isinstance(block, list):
-            self.blocks.extend(block)
+            for b in block:
+                self.append(b)
         else:
+            if self.blocks:
+                self.last_block.next_block = block
+                block.prev_block = self.last_block
             self.blocks.append(block)
             
     def seal(self) -> None:
@@ -303,16 +311,6 @@ class SemanticSegment:
         for block in self.blocks:
             block.is_sealed = True
         self.ref_cnt = 1
-      
-    @property      
-    def ref_counts(self) -> list[int]:
-        """Get the reference counts of all blocks in this segment."""
-        return [block.ref_cnt for block in self.blocks]
-    
-    @property
-    def all_ref_counts_equal(self) -> bool:
-        """Check if all blocks in this segment have the same reference count."""
-        return len(set(self.ref_counts)) == 1
     
     @property
     def last_block(self) -> BuddyTreeBlock:
@@ -326,10 +324,6 @@ class SemanticSegment:
         """
         for block in self.blocks:
             block.ref_cnt -= 1
-
-    def __repr__(self) -> str:
-        return (f"SemanticSegment(id={self.segment_id}, hash={self.content_hash}, "
-                f"blocks={len(self.blocks)}, ref_cnt={self.ref_cnt})")
 
     def reset_hash(self):
         """Reset the segment hash when the segment is evicted."""
