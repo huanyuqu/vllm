@@ -5,11 +5,10 @@ import itertools
 
 from vllm.logger import init_logger
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
-from vllm.v1.core.block_pool import BlockHashToBlockMap
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
-    SegmentHash, 
+    SegmentHashWithGroupId, 
     BuddyTreeBlock, 
     SemanticSegment, 
     make_segment_hash_with_group_id,
@@ -50,9 +49,9 @@ class SegmentHashToSegmentMap:
     """
 
     def __init__(self):
-        self._cache: dict[SegmentHash, SemanticSegment | dict[int, SemanticSegment]] = {}
+        self._cache: dict[SegmentHashWithGroupId, SemanticSegment | dict[int, SemanticSegment]] = {}
 
-    def get_one_segment(self, key: SegmentHash) -> Optional[SemanticSegment]:
+    def get_one_segment(self, key: SegmentHashWithGroupId) -> Optional[SemanticSegment]:
         """
         Gets any segment with the given segment hash key.
         """
@@ -65,7 +64,8 @@ class SegmentHashToSegmentMap:
             self._unexpected_segments_type(segments)
         return None
 
-    def insert(self, key: SegmentHash, segment: SemanticSegment) -> None:
+    def insert(self, key: SegmentHashWithGroupId, 
+               segment: SemanticSegment) -> None:
         """
         Inserts the SemanticSegment to the cache
         """
@@ -81,7 +81,7 @@ class SegmentHashToSegmentMap:
             self._unexpected_segments_type(segments)
 
     def pop(
-        self, key: SegmentHash, segment_id: int
+        self, key: SegmentHashWithGroupId, segment_id: int
     ) -> Optional[SemanticSegment]:
         """
         Checks if segment_hash exists and pop segment from the cache
@@ -131,6 +131,18 @@ class SemanticSegments:
         """Get the last segment in the collection."""
         return self.segments[-1] if self.segments else None
     
+    @last_segment.setter
+    def last_segment(self, segment: SemanticSegment) -> None:
+        """Set/replace the last segment in the collection.
+        If the collection is empty, append the given segment.
+        """
+        if not isinstance(segment, SemanticSegment):
+            raise TypeError("last_segment must be a SemanticSegment")
+        if self.segments:
+            self.segments[-1] = segment
+        else:
+            self.segments.append(segment)
+    
     @property
     def unsealed_segment(self) -> Optional[SemanticSegment]:
         """Get the last unsealed segment, if any."""
@@ -140,6 +152,18 @@ class SemanticSegments:
     
     def __len__(self) -> int:
         return len(self.segments)
+
+    def __iter__(self):
+        """Support iteration: for segment in semantic_segments:"""
+        return iter(self.segments)
+
+    def __reversed__(self):
+        """Support reversed(): reversed(semantic_segments)"""
+        return reversed(self.segments)
+
+    def __contains__(self, segment: SemanticSegment) -> bool:
+        """Support in operator: if segment in semantic_segments:"""
+        return segment in self.segments
 
 
 # TODO(huanyu): record KV events
@@ -162,7 +186,7 @@ class SemanticSegmentManager:
         self.req_to_segments: dict[str, SemanticSegments] = defaultdict(SemanticSegments)
         
         # Prefix cache: hash -> SemanticSegment
-        self.cached_segments: SegmentHashToSegmentMap = SegmentHashToSegmentMap()
+        self.cached_segments = SegmentHashToSegmentMap()
         
         # This queue records the segments with ref_cnt = 0
         # All segments in this queue must in self.cached_segments
@@ -227,7 +251,7 @@ class SemanticSegmentManager:
         segments = self.req_to_segments[request_id]
         unsealed_segment = segments.unsealed_segment
         if not unsealed_segment:
-            logger.warning(f"Request {request_id} has no unsealed segment to seal.")
+            logger.debug(f"Request {request_id} has no unsealed segment to seal.")
             return
         
         segment_hash = request.segment_hashes[-1] if request.segment_hashes else None
@@ -253,37 +277,36 @@ class SemanticSegmentManager:
             unsealed_segment.seal()
             self.cached_segments.insert(unsealed_segment.segment_hash, 
                                         unsealed_segment)
-        self.block_pool.free_blocks(reversed(unsealed_segment.blocks))
 
-    def free(self, request_id: str) -> None:
+    def free(self, request: Request, kv_cache_group_id: int) -> None:
         """
-        Free resources associated with a request.
-        
-        1. Free any unfinalized blocks.
-        2. Decrement reference counts for finalized segments.
+        Release resources for a request.
+
+        Steps:
+        1) Seal any unsealed segment and free its blocks.
+        2) Remove the request's segment list and decrement each segment's ref_cnt.
+        3) Enqueue segments with ref_cnt == 0 into free_segment_queue for later reclamation.
+
+        Note: Segments remain in cached_segments for potential reuse (prefix caching);
+        actual eviction is handled separately by cache policy.
         """
         # Default to empty SemanticSegments in case request is freed before allocation
+        self.seal_segment(request, kv_cache_group_id)
+        request_id = request.request_id
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
         
-        for segment in reversed(segments.segments):
-            if segment.is_sealed:
-                segment.ref_cnt -= 1
-                if segment.ref_cnt == 0:
-                    self.free_segment_queue.append(segment)
-                # Note: We do not automatically free the segment from cache when ref_cnt drops to 0.
-                # It remains in cached_segments for future reuse (prefix caching).
-                # Eviction should be handled by a separate policy or when memory is low.
-            else:
-                # When segment is unsealed, the management is still at the block level.
-                # Free blocks of unsealed segment in reverse order
-                self.block_pool.free_blocks(reversed(segment.blocks))
+        for segment in reversed(segments):
+            segment.ref_cnt -= 1
+            if segment.ref_cnt == 0:
+                self.free_segment_queue.append(segment)  # type: ignore
                 
     # TODO(huanyu): This method is not expected to be used during serving; it is primarily for RL.
     def reset(self) -> None:
         raise NotImplementedError("SemanticSegmentManager.reset is not implemented yet.")
                 
     def get_cached_segment(
-        self, segment_hash: SegmentHash, kv_cache_group_ids: list[int]
+        self, segment_hash: SegmentHashWithGroupId, 
+        kv_cache_group_ids: list[int]
     ) -> Optional[list[SemanticSegment]]:
         """Get the cached segment by the segment hash for the given group,
         or None if cache miss.
@@ -310,7 +333,7 @@ class SemanticSegmentManager:
     
     def find_longest_cache_hit(
         self,
-        segment_hashes: list[SegmentHash],
+        segment_hashes: list[SegmentHashWithGroupId],
         block_hashes: list[BlockHash],
         max_length: int,
         kv_cache_group_ids: list[int],
