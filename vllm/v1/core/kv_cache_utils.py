@@ -209,7 +209,12 @@ class BuddyTreeBlock(KVCacheBlock):
     next_block: Optional['BuddyTreeBlock'] = None
 
     # Whether the block is sealed in a segment
-    is_sealed: bool = False
+    segment: Optional['SemanticSegment'] = None
+    
+    @property
+    def is_sealed(self) -> bool:
+        """Check whether the block is sealed in a segment."""
+        return self.segment is not None
     
     @property
     def buddy(self) -> Optional['BuddyTreeBlock']:
@@ -264,10 +269,9 @@ class SemanticSegment:
     """
     segment_id: int
     blocks: list[BuddyTreeBlock] = []
-    _segment_hash: Optional[SegmentHashWithGroupId] = None
+    _segment_hash: Optional[SegmentHashWithGroupId] = field(init=False, default=None)
     ref_cnt: int = 0
-    is_evicted: bool = False
-    is_sealed: bool = False
+    is_sealed: bool = field(init=False, default=False)
     
     @property
     def segment_hash(self) -> Optional[SegmentHashWithGroupId]:
@@ -299,7 +303,7 @@ class SemanticSegment:
                 block.prev_block = self.last_block
             self.blocks.append(block)
             
-    def seal(self) -> None:
+    def seal(self, ref_cnt: int = 1) -> None:
         """Ensure that when sealing a segment, we increment the ref count of every
         block managed by the segment by 1. This prevents those blocks from being
         reclaimed even if the segment's own ref count becomes 0. A segment must
@@ -309,8 +313,8 @@ class SemanticSegment:
             raise RuntimeError("Segment is already sealed")
         self.is_sealed = True
         for block in self.blocks:
-            block.is_sealed = True
-        self.ref_cnt = 1
+            block.segment = self
+        self.ref_cnt = ref_cnt
     
     @property
     def last_block(self) -> BuddyTreeBlock:

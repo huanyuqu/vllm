@@ -125,6 +125,14 @@ class SemanticSegments:
     def append(self, segment: SemanticSegment) -> None:
         """Add a segment to the collection."""
         self.segments.append(segment)
+        
+    def pop(self) -> SemanticSegment:
+        """Remove and return the last segment."""
+        return self.segments.pop()
+
+    def extend(self, segments: list[SemanticSegment]) -> None:
+        """Extend the collection with multiple segments."""
+        self.segments.extend(segments)
     
     @property
     def last_segment(self) -> Optional[SemanticSegment]:
@@ -240,12 +248,14 @@ class SemanticSegmentManager:
         self, request: Request, kv_cache_group_id: int
     ) -> None:
         """
-        Seal the currently unsealed segment of a request.
+        Seal the unsealed segment for a request by processing its blocks.
         
-        If a segment with the same hash already exists in the cache, we reuse it
-        and free the newly allocated blocks (deduplication). (normally this
-        will not happen)
-        Otherwise, we mark the current segment as sealed and add it to the cache.
+        For each block in the unsealed segment:
+        - If the block is sealed, reuse the existing sealed segment and increment its ref_cnt.
+        - If the block is unsealed, group consecutive blocks with the same ref_cnt into a new segment,
+          seal it, compute its hash, and insert it into the cache.
+        
+        Extend the request's segment list with the processed segments.
         """
         request_id = request.request_id
         segments = self.req_to_segments[request_id]
@@ -254,29 +264,68 @@ class SemanticSegmentManager:
             logger.debug(f"Request {request_id} has no unsealed segment to seal.")
             return
         
-        segment_hash = request.segment_hashes[-1] if request.segment_hashes else None
-        if segment_hash is None:
-            raise ValueError(f"Request {request_id} has no segment hash and cannot seal segment.")
+        blocks = unsealed_segment.blocks
+        if not blocks:
+            raise ValueError(f"Cannot seal segment for request {request_id}: "
+                             f"no blocks in unsealed segment.")
+
+
+        new_segments_list = []
+        current_idx = 0
         
-        segment_hash_with_group_id = make_segment_hash_with_group_id(
-            segment_hash, kv_cache_group_id
-        )
-        unsealed_segment.segment_hash = segment_hash_with_group_id
-        
-        # Check for prefix cache hit
-        cached_segment = self.cached_segments.get_one_segment(
-            unsealed_segment.segment_hash
-        )
-        if cached_segment:
-            # Cache hit: replace unsealed segment with cached segment
-            segments.last_segment = cached_segment
-            cached_segment.ref_cnt += 1
-            del unsealed_segment
-        else:
-            # Cache miss: seal the current segment
-            unsealed_segment.seal()
-            self.cached_segments.insert(unsealed_segment.segment_hash, 
-                                        unsealed_segment)
+        while current_idx < len(blocks):
+            current_block = blocks[current_idx]
+            
+            if current_block.is_sealed:
+                sealed_segment = current_block.segment
+                
+                # Find prefix length
+                end_idx = current_idx + 1
+                while end_idx < len(blocks):
+                    blk = blocks[end_idx]
+                    if blk.is_sealed and blk.segment == sealed_segment:
+                        end_idx += 1
+                    else:
+                        break
+                
+                # Reuse sealed_segment
+                sealed_segment.ref_cnt += 1
+                new_segments_list.append(sealed_segment)
+                current_idx = end_idx
+            else:
+                # Unsealed sequence
+                # Since we cannot have sealed blocks after unsealed blocks,
+                # the rest of the blocks must be unsealed.
+                # We group consecutive blocks with the same ref_cnt into one segment.
+                while current_idx < len(blocks):
+                    start_idx = current_idx
+                    current_ref_cnt = blocks[start_idx].ref_cnt
+                    end_idx = start_idx + 1
+                    
+                    while end_idx < len(blocks):
+                        if blocks[end_idx].ref_cnt == current_ref_cnt:
+                            end_idx += 1
+                        else:
+                            break
+                    
+                    sub_blocks = blocks[start_idx:end_idx]
+                    segment_hash = sub_blocks[-1].block_hash
+                    segment_hash_with_group_id = make_segment_hash_with_group_id(
+                        segment_hash, kv_cache_group_id
+                    )
+                    new_segment = SemanticSegment(
+                        segment_id=SegmentIdGenerator().generate(),
+                        blocks=sub_blocks
+                    )
+                    new_segment.seal(current_ref_cnt)
+                    new_segment.segment_hash = segment_hash_with_group_id
+                    self.cached_segments.insert(
+                        segment_hash_with_group_id, new_segment
+                    )
+                    new_segments_list.append(new_segment)
+                    current_idx = end_idx
+        segments.extend(new_segments_list)
+        return
 
     def free(self, request: Request, kv_cache_group_id: int) -> None:
         """
