@@ -30,6 +30,7 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+# TODO(huanyu): record KV events
 class BuddyBlockPool:
     """
     Buddy Memory Allocator for variable-sized KV cache blocks.
@@ -303,18 +304,17 @@ class BuddyBlockPool:
                     medium=MEDIUM_GPU,
                 )
             )
-         
-    # NOTE: This method is copied from block_pool.py
+
     def _maybe_evict_cached_block(self, block: BuddyTreeBlock) -> bool:
         """
-        If a block is cached in `cached_block_hash_to_block`, we reset its hash
-        metadata and evict it from the cache.
+        Evict the block from the cache if it is cached in `cached_block_hash_to_block`,
+        reset its hash metadata, and attempt to merge it with its buddy if possible.
 
         Args:
-            block: The block to evict.
+            block: The block to evict and potentially merge.
 
         Returns:
-            True if the block is evicted, False otherwise.
+            True if the block was evicted from the cache, False otherwise.
         """
         block_hash = block.block_hash
         if block_hash is None:
@@ -327,47 +327,55 @@ class BuddyBlockPool:
             return False
 
         block.reset_hash()
-
-        if self.enable_kv_cache_events:
-            # FIXME (Chen): Not sure whether we should return `hash_value`
-            # or `(hash_value, group_id)` here. But it's fine now because
-            # we disable hybrid kv cache manager when kv cache event is
-            # enabled, so there is only one group.
-            self.kv_event_queue.append(
-                BlockRemoved(
-                    block_hashes=[maybe_convert_block_hash(get_block_hash(block_hash))],
-                    medium=MEDIUM_GPU,
-                )
-            )
+        
+        # Block might have been merged already
+        if (block.prev_free_block is None and
+            block.next_free_block is None):
+            return True
+            
+        self._try_merge(block)
+            
         return True
 
-    def get_new_blocks(self, num_tokens: int) -> list[BuddyTreeBlock]:
+    def get_new_blocks(self, num_tokens: int) -> tuple[Optional[list[BuddyTreeBlock]], int]:
         """
-        Allocate blocks to hold num_tokens.
-        
-        Strategy:
-        1. Try to allocate from the largest available slab first
-        2. If no blocks available in any slab, try to reclaim space from 
-           allocated blocks by splitting them
-        3. Split reclaimed blocks and return freed portions to their slabs
+        Allocate blocks to hold `num_tokens`.
         
         Args:
             num_tokens: Number of tokens to allocate blocks for
             
         Returns:
-            BuddyTreeBlocks if allocation succeeds, None otherwise
+            A tuple of (allocated_blocks: list[BuddyTreeBlock], remaining_tokens: int)
+            where allocated_blocks contains the successfully allocated blocks,
+            and remaining_tokens is the number of tokens still needing allocation
+            (0 if fully satisfied).
         """
         assert num_tokens > 0, "num_tokens must be positive"
         
         # Try to allocate from slabs, preferring larger sizes
         blocks, remaining_tokens = self._allocate_largest_blocks(num_tokens)
-
+        
+        if blocks:
+            if self.enable_caching:
+                for block in blocks:
+                    self._maybe_evict_cached_block(block)
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+            else:
+                for block in blocks:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                
         if blocks is not None and remaining_tokens <= 0:
             # Successfully allocated from block pool
-            return blocks
+            return blocks, 0
+        else:
+            return blocks, remaining_tokens
         
+    # TODO(huanyu): This method needs to consider the impact on hash after reclaim
+    def reclaim_new_blocks(self, num_tokens: int) -> list[BuddyTreeBlock]:
         # No free blocks available, try to reclaim space from allocated blocks
-        remaining_tokens = self._reclaim_from_allocated_blocks(remaining_tokens)
+        remaining_tokens = self._reclaim_from_allocated_blocks(num_tokens)
         
         if remaining_tokens > 0:
             raise ValueError("Failed to allocate blocks: insufficient memory")
@@ -379,20 +387,19 @@ class BuddyBlockPool:
         )
         
         assert remaining_tokens <= 0, "Allocation should be satisfied after reclamation"
-        assert blocks is not None, "blocks should not be None after initial allocation"
         assert reclaimed_blocks is not None, "reclaimed_blocks should not be None after reclamation"
         
-        new_blocks =  blocks + reclaimed_blocks
-        
         if self.enable_caching:
-            for block in new_blocks:
+            for block in reclaimed_blocks:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
         else:
-            for block in new_blocks:
+            for block in reclaimed_blocks:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                
+        return reclaimed_blocks
     
     def update_block_usage(self, block_id: int, size: int, relative_id: int,
                            num_tokens_used: int) -> None:
@@ -595,6 +602,7 @@ class BuddyBlockPool:
         #   1. Split 64 -> two 32s: allocate left, keep splitting right
         #   2. Split remaining 32 -> two 16s: allocate left, free right
         current_parent = parent_block
+        allocated_children: list[BuddyTreeBlock] = []
         
         for child_size in needed_sizes:
             parent_relative_id = current_parent.relative_id
@@ -615,6 +623,7 @@ class BuddyBlockPool:
             left_child.num_tokens = min(child_size, total_tokens)
             total_tokens -= left_child.num_tokens
             self.allocated_blocks[child_size].add(left_child)
+            allocated_children.append(left_child)
             
             # Handle right child
             if child_size == needed_sizes[-1]:
@@ -625,6 +634,37 @@ class BuddyBlockPool:
             else:
                 # Continue splitting the right child
                 current_parent = right_child
+
+        # Update segment if parent block belongs to one
+        if parent_block.segment:
+            segment = parent_block.segment
+            
+            # Update segment pointers
+            for child in allocated_children:
+                child.segment = segment
+            
+            # Update linked list pointers
+            # 1. Link children together
+            for i in range(len(allocated_children) - 1):
+                allocated_children[i].next_block = allocated_children[i+1]
+                allocated_children[i+1].prev_block = allocated_children[i]
+            
+            # 2. Link first child to prev
+            first_child = allocated_children[0]
+            first_child.prev_block = parent_block.prev_block
+            if first_child.prev_block:
+                first_child.prev_block.next_block = first_child
+                
+            # 3. Link last child to next
+            last_child = allocated_children[-1]
+            last_child.next_block = parent_block.next_block
+            if last_child.next_block:
+                last_child.next_block.prev_block = last_child
+            
+            # Clear parent pointers
+            parent_block.segment = None
+            parent_block.prev_block = None
+            parent_block.next_block = None
 
     def touch(self, blocks: tuple[list[BuddyTreeBlock], ...]) -> None:
         """
@@ -646,56 +686,32 @@ class BuddyBlockPool:
                     self.slabs[block.size].remove(block)
                 block.ref_cnt += 1
     
-    # TODO(huanyu): This method is implemented incorrectly. Merges should occur
-    # during eviction; free should only add blocks to slabs (the free queue).
     def free_blocks(self, ordered_blocks: Iterable[BuddyTreeBlock]) -> None:
         """
-        Free a list of blocks and attempt to merge with buddies.
+        Free a list of blocks.
 
         The blocks should be ordered by their eviction priority, where the
         first block will be evicted first.
 
-        This uses a two-phase approach:
-        1. First, mark all blocks as free (ref_cnt--, remove from allocated)
-        2. Then, attempt to merge each block with its buddy
-
         Args:
             ordered_blocks: A list of blocks to free, ordered by eviction priority
         """
-        blocks_to_free: list[BuddyTreeBlock] = []
-        
-        # Phase 1: Mark all blocks as free
         for block in ordered_blocks:
+            if block.is_sealed:
+                raise ValueError(f"Cannot free sealed block {block}")
+            
             size = block.size
             if (size not in self.allocated_blocks or 
                 block not in self.allocated_blocks[size]):
-                continue
+                raise ValueError(f"Block {block} not found in allocated blocks for size {size}")
 
             block.ref_cnt -= 1
             if block.ref_cnt > 0:
                 continue
 
-            # Remove from allocated set and prepare for freeing
             self.allocated_blocks[size].discard(block)
             block.num_tokens = 0
-            blocks_to_free.append(block)
-        
-        # Phase 2: Add to free slabs first (so buddies can find each other)
-        for block in blocks_to_free:
             self.slabs[block.size].append(block)
-        
-        # Phase 3: Try to merge each block with its buddy
-        # Process from smallest to largest to maximize merge opportunities
-        blocks_to_free.sort(key=lambda b: b.size)
-        
-        for block in blocks_to_free:
-            # Block might have been merged already
-            if (block.prev_free_block is None and
-                block.next_free_block is None):
-                continue
-            
-            self.slabs[block.size].remove(block)
-            self._try_merge(block)
     
     def _try_merge(self, block: BuddyTreeBlock) -> None:
         """

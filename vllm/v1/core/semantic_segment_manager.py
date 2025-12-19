@@ -210,7 +210,29 @@ class SemanticSegmentManager:
         If the last segment is sealed or doesn't exist, a new unsealed segment is created.
         """
         # Allocate by blocks and manage by segments
-        blocks = self.block_pool.get_new_blocks(num_tokens)
+        
+        # 1. Try allocate from slabs
+        blocks, remaining = self.block_pool.get_new_blocks(num_tokens)
+        if blocks is None:
+            blocks = []
+            
+        if remaining > 0:
+            # 2. Free segments if needed
+            while remaining > 0 and self.free_segment_queue.num_free_blocks > 0:
+                segment: SemanticSegment = self.free_segment_queue.popleft()
+                self._maybe_evict_cached_segment(segment)
+                segment.unseal()
+                self.block_pool.free_blocks(segment.blocks)
+                
+                new_blocks, new_remaining = self.block_pool.get_new_blocks(remaining)
+                if new_blocks:
+                    blocks.extend(new_blocks)
+                remaining = new_remaining
+
+            if remaining > 0:
+                # 3. Reclaim from allocated blocks if still needed
+                reclaimed_blocks = self.block_pool.reclaim_new_blocks(remaining)
+                blocks.extend(reclaimed_blocks)
         
         segments = self.req_to_segments[request_id]
         if not segments.unsealed_segment:
