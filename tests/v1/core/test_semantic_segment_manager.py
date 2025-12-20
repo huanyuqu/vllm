@@ -1,0 +1,178 @@
+import pytest
+from unittest.mock import MagicMock
+from vllm.v1.core.buddy_block_pool import BuddyBlockPool
+from vllm.v1.core.semantic_segment_manager import SemanticSegmentManager
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id, BlockHash
+from vllm.v1.request import Request
+
+@pytest.fixture
+def block_pool():
+    return BuddyBlockPool(
+        num_gpu_blocks=1024,
+        supported_sizes=[128, 64, 32, 16],
+        enable_caching=True
+    )
+
+@pytest.fixture
+def segment_manager(block_pool):
+    return SemanticSegmentManager(block_pool)
+
+def test_allocate_new_blocks(segment_manager):
+    request_id = "req1"
+    blocks = segment_manager.allocate_new_blocks(request_id, 256)
+    assert len(blocks) > 0
+    assert sum(b.size for b in blocks) == 128
+    
+    segments = segment_manager.req_to_segments[request_id]
+    assert len(segments) == 1
+    assert segments.unsealed_segment is not None
+    assert len(segments.unsealed_segment.blocks) == len(blocks)
+
+def test_seal_segment(segment_manager):
+    request_id = "req1"
+    request = MagicMock(spec=Request)
+    request.request_id = request_id
+    
+    # Allocate blocks
+    blocks = segment_manager.allocate_new_blocks(request_id, 64)
+    
+    # Manually set block hashes as if they were computed and cached
+    group_id = 0
+    for i, block in enumerate(blocks):
+        block_hash = BlockHash(f"hash_{i}".encode())
+        block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
+        block.ref_cnt = 1 # Simulate usage
+        
+    # Seal
+    segment_manager.seal_segment(request, group_id)
+    
+    segments = segment_manager.req_to_segments[request_id]
+    assert len(segments) == 1
+    assert segments.unsealed_segment is None
+    assert segments.last_segment.is_sealed
+    assert segments.last_segment.segment_hash is not None
+
+def test_free_request_and_eviction():
+    # Create a very small pool: 2 blocks of size 64
+    pool = BuddyBlockPool(num_gpu_blocks=2, supported_sizes=[64], enable_caching=True)
+    manager = SemanticSegmentManager(pool)
+    
+    req1 = MagicMock(spec=Request)
+    req1.request_id = "req1"
+    
+    # Allocate all memory for req1 (128 tokens)
+    manager.allocate_new_blocks("req1", 128)
+    
+    # Seal and free req1
+    group_id = 0
+    segments = manager.req_to_segments["req1"]
+    # We need to set block hashes for seal to work
+    for block in segments.unsealed_segment.blocks:
+        block.block_hash = make_block_hash_with_group_id(BlockHash(b"h"), group_id)
+        block.ref_cnt = 1
+        
+    manager.free(req1, group_id)
+    
+    # Check that segments are in free queue
+    assert manager.free_segment_queue.num_free_blocks > 0
+    
+    # Now allocate for req2, should trigger eviction
+    req2 = MagicMock(spec=Request)
+    req2.request_id = "req2"
+    
+    # This should succeed by evicting req1's segments
+    # We request 64 tokens, which requires 1 block.
+    # The pool is full (used by req1's freed segments).
+    # Eviction should free up space.
+    blocks = manager.allocate_new_blocks("req2", 64)
+    assert len(blocks) > 0
+    
+    # Check that free queue is reduced (one segment evicted)
+    # Note: exact behavior depends on how many segments were created for req1.
+    # If 128 tokens were 2 blocks of 64, and they were sealed into 1 segment (if hashes match/logic allows) or 2 segments.
+    # seal_segment groups consecutive blocks with same ref_cnt.
+    # Here all have ref_cnt=1. So they should be 1 segment if logic allows.
+    # But wait, seal_segment logic:
+    # "We group consecutive blocks with the same ref_cnt into one segment."
+    # So likely 1 segment of 2 blocks.
+    # If we evict that segment, we free 2 blocks.
+    # Then we allocate 1 block.
+    # So we have 1 free block left in pool, and 0 segments in free queue.
+    
+    assert manager.free_segment_queue.num_free_blocks == 0
+
+def test_reclaim_from_allocated_blocks():
+    # Test the 3rd stage of allocation: reclaiming from allocated blocks
+    # Pool: 1 block of 64.
+    pool = BuddyBlockPool(num_gpu_blocks=1, supported_sizes=[64, 32], enable_caching=True)
+    manager = SemanticSegmentManager(pool)
+    
+    req1 = MagicMock(spec=Request)
+    req1.request_id = "req1"
+    
+    # Allocate 32 tokens for req1. This splits the 64 block into 32 (allocated) and 32 (free).
+    manager.allocate_new_blocks("req1", 32)
+    
+    # Now we have 32 free.
+    
+    # Allocate another 32 for req2.
+    manager.allocate_new_blocks("req2", 32)
+    
+    # Now pool is full (in terms of 32-blocks). 
+    # Actually, 64 -> 32(req1) + 32(req2). Both allocated.
+    
+    # Now req1 is done but NOT freed (simulating fragmentation or just usage).
+    # Wait, if req1 is not freed, we can't reclaim from it unless we implement partial reclamation which BuddyBlockPool supports?
+    # BuddyBlockPool.reclaim_from_allocated_blocks tries to split blocks that are larger than needed?
+    # No, it reclaims from blocks that are *allocated* but have *unused* space?
+    # Let's check BuddyBlockPool._reclaim_one_block logic.
+    # It checks `block.num_tokens <= size - self.min_block_size`.
+    # If we allocated 32 tokens, `num_tokens` is likely 32 (capacity).
+    # But `update_block_usage` updates `num_tokens` (used).
+    # If we didn't call `update_block_usage`, `num_tokens` might be 0 or capacity?
+    # BuddyTreeBlock `num_tokens` defaults to 0? No, `size` is capacity. `num_tokens` is usage?
+    # In `_split_block`: `left_child.num_tokens = min(child_size, total_tokens)`.
+    # When allocating, `get_new_blocks` calls `_allocate_largest_blocks`.
+    # It doesn't seem to set `num_tokens` (usage) on the block?
+    # Ah, `BuddyTreeBlock` has `_num_tokens`.
+    
+    # Let's look at `BuddyBlockPool` again.
+    # `_allocate_block`: `self.allocated_blocks[size].add(block)`.
+    # It doesn't set `num_tokens`.
+    # So `num_tokens` is 0 initially?
+    # `BuddyTreeBlock` definition: `_num_tokens: int = field(default=0, init=False)`.
+    # So yes, 0.
+    
+    # So if we allocate a 64 block, `num_tokens` is 0.
+    # `_reclaim_one_block` checks `block.num_tokens <= size - self.min_block_size`.
+    # 0 <= 64 - 32 (if min is 32). True.
+    # So it can reclaim.
+    
+    # So if we allocate a 64 block for req1, but only use 32 tokens (conceptually),
+    # we can reclaim the other 32.
+    
+    # Let's try:
+    # Pool: 1 block of 64.
+    pool = BuddyBlockPool(num_gpu_blocks=1, supported_sizes=[64, 32], enable_caching=True)
+    manager = SemanticSegmentManager(pool)
+    
+    # Allocate 64 tokens for req1. This takes the whole 64 block.
+    # But we only "use" 32 tokens.
+    # Wait, `allocate_new_blocks` takes `num_tokens`.
+    # If we ask for 32, it splits and gives us 32.
+    # If we ask for 64, it gives us 64.
+    
+    # To test reclamation, we need a block that is allocated as LARGE, but used SMALL.
+    # E.g. allocate 64.
+    blocks = manager.allocate_new_blocks("req1", 64)
+    block = blocks[0]
+    # Simulate usage: only 32 tokens used.
+    pool.update_block_usage(block.block_id, block.size, block.relative_id, 32)
+    
+    # Now try to allocate another 32 tokens for req2.
+    # The pool has no free blocks.
+    # But it should be able to reclaim from req1's block (split 64 -> 32 used + 32 free).
+    
+    blocks2 = manager.allocate_new_blocks("req2", 32)
+    assert len(blocks2) > 0
+    assert blocks2[0].size == 32
