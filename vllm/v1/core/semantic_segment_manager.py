@@ -8,9 +8,11 @@ from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
+    SegmentHash,
     SegmentHashWithGroupId, 
     BuddyTreeBlock, 
     SemanticSegment, 
+    get_block_hash,
     make_segment_hash_with_group_id,
 )
 from vllm.v1.request import Request
@@ -189,8 +191,8 @@ class SemanticSegmentManager:
     def __init__(self, block_pool: BuddyBlockPool):
         self.block_pool = block_pool
         
-        # request_id -> list of segments used by this request
-        # The last segment in the list might be unsealed (is_sealed=False)
+        # request_id -> semantic segments used by this request
+        # The last segment might be unsealed (is_sealed=False)
         self.req_to_segments: dict[str, SemanticSegments] = defaultdict(SemanticSegments)
         
         # Prefix cache: hash -> SemanticSegment
@@ -331,7 +333,16 @@ class SemanticSegmentManager:
                             break
                     
                     sub_blocks = blocks[start_idx:end_idx]
-                    segment_hash = sub_blocks[-1].block_hash
+                    last_block_hash_with_group_id = sub_blocks[-1].block_hash
+                    if last_block_hash_with_group_id is None:
+                        raise ValueError(
+                            f"Cannot seal segment for request {request_id}: "
+                            "last block has no block_hash."
+                        )
+
+                    # SegmentHash is group-agnostic; we pack group id only when
+                    # forming the cache key.
+                    segment_hash = SegmentHash(get_block_hash(last_block_hash_with_group_id))
                     segment_hash_with_group_id = make_segment_hash_with_group_id(
                         segment_hash, kv_cache_group_id
                     )
@@ -376,7 +387,7 @@ class SemanticSegmentManager:
         raise NotImplementedError("SemanticSegmentManager.reset is not implemented yet.")
                 
     def get_cached_segment(
-        self, segment_hash: SegmentHashWithGroupId, 
+        self, segment_hash: SegmentHash,
         kv_cache_group_ids: list[int]
     ) -> Optional[list[SemanticSegment]]:
         """Get the cached segment by the segment hash for the given group,
@@ -384,7 +395,7 @@ class SemanticSegmentManager:
 
         Args:
             segment_hash: The hash value of the segment.
-            kv_cache_group_id: The id of the KV cache group.
+            kv_cache_group_ids: The ids of the KV cache groups.
 
         Returns:
             The cached segment if exists, or None.
@@ -404,7 +415,7 @@ class SemanticSegmentManager:
     
     def find_longest_cache_hit(
         self,
-        segment_hashes: list[SegmentHashWithGroupId],
+        segment_hashes: list[SegmentHash],
         block_hashes: list[BlockHash],
         max_length: int,
         kv_cache_group_ids: list[int],
@@ -422,7 +433,6 @@ class SemanticSegmentManager:
             
         # 1. Try to match full segments first
         current_token_count = 0
-        matched_segments_count = 0
         
         for segment_hash in segment_hashes:
             cached_segments = self.get_cached_segment(segment_hash, kv_cache_group_ids)
@@ -439,7 +449,6 @@ class SemanticSegmentManager:
                 computed.extend(segment.blocks)
                 
             current_token_count += segment_len
-            matched_segments_count += 1
 
         # 2. For the remaining part, try to match individual blocks
         # Calculate starting block index for block matching
