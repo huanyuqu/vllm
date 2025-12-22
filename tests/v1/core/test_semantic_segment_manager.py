@@ -189,11 +189,11 @@ def test_segment_sharing(segment_manager):
     assert req2_segs[0] is shared_segment
     assert req2_segs[1].is_sealed
     assert req2_segs[1].blocks == blocks2
-
     
-def test_free_request_and_eviction():
-    # Create a very small pool: 2 blocks of size 64
-    pool = BuddyBlockPool(num_gpu_blocks=2, supported_sizes=[64], enable_caching=True)
+    
+def test_allocate_free_eviction():
+    # Create a small pool: 2 blocks of size 64
+    pool = BuddyBlockPool(num_max_gpu_blocks=2, supported_sizes=[64], enable_caching=True)
     manager = SemanticSegmentManager(pool)
     
     req1 = MagicMock(spec=Request)
@@ -205,40 +205,28 @@ def test_free_request_and_eviction():
     # Seal and free req1
     group_id = 0
     segments = manager.req_to_segments["req1"]
-    # We need to set block hashes for seal to work
-    for block in segments.unsealed_segment.blocks:
-        block.block_hash = make_block_hash_with_group_id(BlockHash(b"h"), group_id)
+    for i, block in enumerate(segments.unsealed_segment.blocks):
+        block_hash = BlockHash(f"hash_{i}".encode())
+        block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         block.ref_cnt = 1
         
     manager.free(req1, group_id)
     
     # Check that segments are in free queue
-    assert manager.free_segment_queue.num_free_blocks > 0
+    assert manager.free_segment_queue.num_free_segments == 1
     
     # Now allocate for req2, should trigger eviction
     req2 = MagicMock(spec=Request)
     req2.request_id = "req2"
     
     # This should succeed by evicting req1's segments
-    # We request 64 tokens, which requires 1 block.
-    # The pool is full (used by req1's freed segments).
-    # Eviction should free up space.
     blocks = manager.allocate_new_blocks("req2", 64)
-    assert len(blocks) > 0
+    assert len(blocks) == 1
     
-    # Check that free queue is reduced (one segment evicted)
-    # Note: exact behavior depends on how many segments were created for req1.
-    # If 128 tokens were 2 blocks of 64, and they were sealed into 1 segment (if hashes match/logic allows) or 2 segments.
-    # seal_segment groups consecutive blocks with same ref_cnt.
-    # Here all have ref_cnt=1. So they should be 1 segment if logic allows.
-    # But wait, seal_segment logic:
-    # "We group consecutive blocks with the same ref_cnt into one segment."
-    # So likely 1 segment of 2 blocks.
-    # If we evict that segment, we free 2 blocks.
-    # Then we allocate 1 block.
-    # So we have 1 free block left in pool, and 0 segments in free queue.
-    
+    # Check that free queue is empty (segment evicted)
     assert manager.free_segment_queue.num_free_blocks == 0
+    # Check that we have 1 free block left in the pool (2 freed - 1 allocated)
+    assert pool.slabs[64].num_free_blocks == 1
 
 
 def test_reclaim_from_allocated_blocks():
