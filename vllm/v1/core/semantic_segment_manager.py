@@ -231,8 +231,6 @@ class SemanticSegmentManager:
         """
         # 1. Try allocate from slabs
         blocks, remaining = self.block_pool.get_new_blocks(num_tokens)
-        if blocks is None:
-            blocks = []
             
         if remaining > 0:
             # 2. Free segments if needed

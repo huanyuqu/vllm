@@ -416,6 +416,16 @@ class FreeKVCacheBlockQueue:
             # For empty list, simply connect the fake head and tail.
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+            
+    @property
+    def num_free_elements(self) -> int:
+        """Get the number of free elements in the queue."""
+        return self.num_free_blocks
+    
+    @property
+    def num_free_segments(self) -> int: 
+        """Get the number of free segments in the queue."""
+        return self.num_free_blocks
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.

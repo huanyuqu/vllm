@@ -337,7 +337,7 @@ class BuddyBlockPool:
             
         return True
 
-    def get_new_blocks(self, num_tokens: int) -> tuple[list[BuddyTreeBlock], int]:
+    def get_new_blocks(self, num_tokens: int):
         """
         Allocate blocks to hold `num_tokens`.
         
@@ -366,11 +366,7 @@ class BuddyBlockPool:
                     assert block.ref_cnt == 0
                     block.ref_cnt += 1
                 
-        if blocks is not None and remaining_tokens <= 0:
-            # Successfully allocated from block pool
-            return blocks, 0
-        else:
-            return blocks, remaining_tokens
+        return blocks, max(remaining_tokens, 0)
         
     # TODO(huanyu): This method needs to consider the impact on hash after reclaim
     def reclaim_new_blocks(self, num_tokens: int) -> list[BuddyTreeBlock]:
@@ -421,9 +417,7 @@ class BuddyBlockPool:
         else:
             raise KeyError(f"Block {coord} not found")
 
-    def _allocate_largest_blocks(
-        self, num_tokens: int
-    ) -> tuple[Optional[list[BuddyTreeBlock]], int]:
+    def _allocate_largest_blocks(self, num_tokens: int):
         """
         Allocate blocks from the largest available slabs until the request is satisfied.
 
@@ -447,7 +441,7 @@ class BuddyBlockPool:
         # Allocate the first block
         block = self._allocate_largest_block()
         if block is None:
-            return None, num_tokens
+            return blocks, num_tokens
 
         remaining_tokens = num_tokens - block.size
         blocks.append(block)
