@@ -211,8 +211,6 @@ class SemanticSegmentManager:
         These blocks are added to the last segment of the request.
         If the last segment is sealed or doesn't exist, a new unsealed segment is created.
         """
-        # Allocate by blocks and manage by segments
-        
         # 1. Try allocate from slabs
         blocks, remaining = self.block_pool.get_new_blocks(num_tokens)
         if blocks is None:

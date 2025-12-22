@@ -30,7 +30,6 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
-# TODO(huanyu): record KV events
 class BuddyBlockPool:
     """
     Buddy Memory Allocator for variable-sized KV cache blocks.
@@ -52,7 +51,7 @@ class BuddyBlockPool:
     
     def __init__(
         self,
-        num_gpu_blocks: int,
+        num_max_gpu_blocks: int,
         supported_sizes: list[int],
         enable_caching: bool,
         enable_kv_cache_events: bool = False,
@@ -66,12 +65,9 @@ class BuddyBlockPool:
             enable_caching: Whether to enable prefix caching (for compatibility)
             enable_kv_cache_events: Whether to enable KV cache events (for compatibility)
         """
-        self.supported_sizes = sorted(supported_sizes, reverse=True)
-        self._check_supported_sizes()
+        self.supported_sizes = supported_sizes
         self._complete_supported_sizes()
-        self.max_block_size = self.supported_sizes[0]
-        self.min_block_size = self.supported_sizes[-1]
-        self.num_gpu_blocks = num_gpu_blocks
+        self.num_max_gpu_blocks = num_max_gpu_blocks
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
 
@@ -79,7 +75,7 @@ class BuddyBlockPool:
         self._blocks: dict[tuple[int, int, int], BuddyTreeBlock] = {}
         # Initialize free block queues (slabs) for each supported size
         # Each queue is a FreeKVCacheBlockQueue that manages blocks of that size
-        self.slabs = self._initialize_block_pool(num_gpu_blocks)
+        self.slabs = self._initialize_block_pool(num_max_gpu_blocks)
         # Allocated blocks stored as a min-heap: (num_tokens, block)
         # TODO(huanyu): The best way to record allocated blocks is to use a
         # min-heap based on their current token usage for better reclamation.
@@ -101,6 +97,9 @@ class BuddyBlockPool:
         Raises:
             ValueError: If any size is not a power of 2
         """
+        if not self.supported_sizes:
+            raise ValueError("supported_sizes cannot be empty")
+
         for size in self.supported_sizes:
             if size <= 0 or (size & (size - 1)) != 0:
                 raise ValueError(
@@ -116,19 +115,20 @@ class BuddyBlockPool:
         For example, if supported_sizes is [128, 32, 8], it will be
         completed to [128, 64, 32, 16, 8].
         """
-        if not self.supported_sizes:
-            return
+        self._check_supported_sizes()
         
-        min_size = self.supported_sizes[-1]
-        max_size = self.supported_sizes[0]
+        self.supported_sizes = sorted(set(self.supported_sizes), reverse=True)
+                
+        self.min_block_size = self.supported_sizes[-1]
+        self.max_block_size = self.supported_sizes[0]
         
         completed_sizes = []
-        current_size = min_size
-        while current_size <= max_size:
+        current_size = self.max_block_size
+        while current_size >= self.min_block_size:
             completed_sizes.append(current_size)
-            current_size *= 2
+            current_size //= 2
         
-        self.supported_sizes = sorted(completed_sizes, reverse=True)
+        self.supported_sizes = set(completed_sizes)
 
     def _initialize_block_pool(
         self, num_blocks: int
@@ -337,7 +337,7 @@ class BuddyBlockPool:
             
         return True
 
-    def get_new_blocks(self, num_tokens: int) -> tuple[Optional[list[BuddyTreeBlock]], int]:
+    def get_new_blocks(self, num_tokens: int) -> tuple[list[BuddyTreeBlock], int]:
         """
         Allocate blocks to hold `num_tokens`.
         
@@ -346,9 +346,9 @@ class BuddyBlockPool:
             
         Returns:
             A tuple of (allocated_blocks: list[BuddyTreeBlock], remaining_tokens: int)
-            where allocated_blocks contains the successfully allocated blocks,
-            and remaining_tokens is the number of tokens still needing allocation
-            (0 if fully satisfied).
+            where allocated_blocks contains the successfully allocated blocks 
+            ([] if no available blocks), and remaining_tokens is the number of 
+            tokens still needing allocation (0 if fully satisfied).
         """
         assert num_tokens > 0, "num_tokens must be positive"
         
