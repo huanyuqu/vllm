@@ -128,7 +128,7 @@ class BuddyBlockPool:
             completed_sizes.append(current_size)
             current_size //= 2
         
-        self.supported_sizes = set(completed_sizes)
+        self.supported_sizes = tuple(completed_sizes)
 
     def _initialize_block_pool(
         self, num_blocks: int

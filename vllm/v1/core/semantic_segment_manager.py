@@ -135,6 +135,13 @@ class SemanticSegments:
     def extend(self, segments: list[SemanticSegment]) -> None:
         """Extend the collection with multiple segments."""
         self.segments.extend(segments)
+        
+    def __getitem__(self, key):
+        """Support indexing and slicing: segment = semantic_segments[0] or segments = semantic_segments[1:3]"""
+        if isinstance(key, slice):
+            return SemanticSegments(self.segments[key])
+        else:
+            return self.segments[key]
     
     @property
     def last_segment(self) -> Optional[SemanticSegment]:
@@ -162,6 +169,17 @@ class SemanticSegments:
     
     def __len__(self) -> int:
         return len(self.segments)
+    
+    def __getitem__(self, key: slice | int):
+        """
+        Support indexing and slicing: 
+        - segment = semantic_segments[0]
+        - segments = semantic_segments[1:3]
+        """
+        if isinstance(key, slice):
+            return SemanticSegments(self.segments[key])
+        else:
+            return self.segments[key]
 
     def __iter__(self):
         """Support iteration: for segment in semantic_segments:"""
@@ -355,7 +373,7 @@ class SemanticSegmentManager:
                     )
                     new_segments_list.append(new_segment)
                     current_idx = end_idx
-        segments.extend(new_segments_list)
+        segments.segments[-1:] = new_segments_list
         return
 
     def free(self, request: Request, kv_cache_group_id: int) -> None:

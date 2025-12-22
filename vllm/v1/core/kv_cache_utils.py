@@ -229,6 +229,14 @@ class BuddyTreeBlock(KVCacheBlock):
     def num_tokens(self) -> int:
         return self._num_tokens
 
+    def __hash__(self) -> int:
+        return hash(self.full_id)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, BuddyTreeBlock):
+            return NotImplemented
+        return self.full_id == other.full_id
+
     @num_tokens.setter
     def num_tokens(self, value: int):
         if self.size is not None and value > self.size:
@@ -264,10 +272,13 @@ class SemanticSegment:
     It is the unit for prefix caching and reference counting.
     """
     segment_id: int
-    blocks: list[BuddyTreeBlock] = []
+    blocks: list[BuddyTreeBlock] = field(default_factory=list)
     _segment_hash: Optional[SegmentHashWithGroupId] = field(init=False, default=None)
     ref_cnt: int = 0
     is_sealed: bool = field(init=False, default=False)
+    
+    def __len__(self) -> int:
+        return len(self.blocks)
     
     @property
     def capacity(self) -> int:
