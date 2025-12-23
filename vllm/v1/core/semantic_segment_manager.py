@@ -234,16 +234,19 @@ class SemanticSegmentManager:
             
         if remaining > 0:
             # 2. Free segments if needed
-            while remaining > 0 and self.free_segment_queue.num_free_segments > 0:
+            freed_capacity = 0            
+            while (remaining > freed_capacity and 
+                   self.free_segment_queue.num_free_segments > 0):
                 segment: SemanticSegment = self.free_segment_queue.popleft()
                 self._maybe_evict_cached_segment(segment)
                 segment.unseal()
+                freed_capacity += segment.capacity
                 self.block_pool.free_blocks(reversed(segment.blocks))
-                
-                new_blocks, new_remaining = self.block_pool.get_new_blocks(remaining)
+            
+            if freed_capacity > 0:
+                new_blocks, remaining = self.block_pool.get_new_blocks(remaining)
                 if new_blocks:
                     blocks.extend(new_blocks)
-                remaining = new_remaining
 
             if remaining > 0:
                 # 3. Reclaim from allocated blocks if still needed

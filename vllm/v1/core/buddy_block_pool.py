@@ -480,7 +480,8 @@ class BuddyBlockPool:
         slab = self.slabs[size]
         if slab.num_free_blocks > 0:
             block: BuddyTreeBlock = slab.popleft()  # type: ignore
-            self.allocated_blocks[size].add(block)
+            block = self._try_merge(block)
+            self.allocated_blocks[block.size].add(block)
             return block
         else:
             return None
@@ -683,7 +684,7 @@ class BuddyBlockPool:
             block.num_tokens = 0
             self.slabs[block.size].append(block)
     
-    def _try_merge(self, block: BuddyTreeBlock) -> None:
+    def _try_merge(self, block: BuddyTreeBlock) -> BuddyTreeBlock:
         """
         Try to iteratively merge `block` with its free buddy.
         If the buddy is free (in slab), remove it and promote parent.
@@ -699,15 +700,16 @@ class BuddyBlockPool:
             if buddy is None:
                 break
 
-            try:
-                self.slabs[buddy.size].remove(buddy)
-            except (ValueError, KeyError):
-                # Buddy is not in slab (not free) -> cannot merge
+            # Buddy must be available and free (i.e., currently in its slab) to merge.
+            if not buddy.is_in_slab:
                 break
 
+            self.slabs[buddy.size].remove(buddy)
+
+            # Promote to parent and continue attempting to merge upward.
             current = current.parent
 
-        self.slabs[current.size].append(current)
+        return current
     
     def reset_prefix_cache(self):
         raise NotImplementedError

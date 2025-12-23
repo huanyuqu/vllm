@@ -222,6 +222,12 @@ class BuddyTreeBlock(KVCacheBlock):
                 else self.parent.left_child)
         
     @property
+    def is_in_slab(self) -> bool:
+        # FreeKVCacheBlockQueue keeps blocks in a doubly-linked list.
+        # When a block is removed/popped, its pointers are reset to None.
+        return self.prev_free_block is not None and self.next_free_block is not None
+        
+    @property
     def full_id(self) -> tuple[int, int, int]:
         return (self.block_id, self.size, self.relative_id)
     
@@ -292,6 +298,12 @@ class SemanticSegment:
     
     def __len__(self) -> int:
         return self._length
+    
+    def __iter__(self):
+        current = self.head
+        while current:
+            yield current
+            current = current.next_block
     
     @property
     def blocks(self) -> list[BuddyTreeBlock]:
