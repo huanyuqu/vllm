@@ -242,6 +242,16 @@ class BuddyTreeBlock(KVCacheBlock):
         if self.size is not None and value > self.size:
             raise ValueError(f"num_tokens {value} exceeds size {self.size}")
         self._num_tokens = value
+        
+    def reset(self):
+        """Reset the block to its initial state."""
+        self.ref_cnt = 0
+        self._block_hash = None
+        self.prev_block = None
+        self.next_block = None
+        self.segment = None
+        self.is_sealed = False
+        self._num_tokens = 0
 
     def __repr__(self) -> str:
         prev_block_id = self.prev_free_block.block_id if self.prev_free_block else None
@@ -272,17 +282,20 @@ class SemanticSegment:
     It is the unit for prefix caching and reference counting.
     """
     segment_id: int
-    blocks: list[BuddyTreeBlock] = field(default_factory=list)
+    head: Optional[BuddyTreeBlock] = None
+    tail: Optional[BuddyTreeBlock] = None
+    _length: int = 0
+    _capacity: int = 0
     _segment_hash: Optional[SegmentHashWithGroupId] = field(init=False, default=None)
     ref_cnt: int = 0
     is_sealed: bool = field(init=False, default=False)
     
     def __len__(self) -> int:
-        return len(self.blocks)
+        return self._length
     
     @property
     def capacity(self) -> int:
-        return sum(block.size for block in self.blocks)
+        return self._capacity
     
     @property
     def segment_hash(self) -> Optional[SegmentHashWithGroupId]:
@@ -309,11 +322,16 @@ class SemanticSegment:
             for b in block:
                 self.append(b)
         else:
-            if self.blocks:
-                self.last_block.next_block = block
-                block.prev_block = self.last_block
-            self.blocks.append(block)
             block.segment = self
+            if self.tail:
+                self.tail.next_block = block
+                block.prev_block = self.tail
+                self.tail = block
+            else:
+                self.head = block
+                self.tail = block
+            self._length += 1
+            self._capacity += block.size
             
     def seal(self, ref_cnt: int = 1) -> None:
         """Ensure that when sealing a segment, we increment the ref count of every
@@ -324,15 +342,19 @@ class SemanticSegment:
         if self.is_sealed:
             raise RuntimeError("Segment is already sealed")
         self.is_sealed = True
-        for block in self.blocks:
-            block.segment = self
-            block.is_sealed = True
+        current = self.head
+        while current:
+            current.segment = self
+            current.is_sealed = True
+            current = current.next_block
         self.ref_cnt = ref_cnt
     
     @property
     def last_block(self) -> BuddyTreeBlock:
         """Get the last block in this segment."""
-        return self.blocks[-1]
+        if not self.tail:
+            raise IndexError("Segment is empty")
+        return self.tail
             
     def unseal(self) -> None:
         """Unseal the segment by decrementing the ref count of every block
@@ -340,21 +362,69 @@ class SemanticSegment:
         if the segment's own ref count is 0.
         """
         self.is_sealed = False
-        for block in self.blocks:
-            block.is_sealed = False
-            block.segment = None
-            block.ref_cnt = 1
+        current = self.head
+        while current:
+            current.is_sealed = False
+            current.segment = None
+            current.ref_cnt = 1
+            current = current.next_block
 
     def reset_hash(self):
         """Reset the segment hash when the segment is evicted."""
         self._segment_hash = None
 
     def __repr__(self) -> str:
-        block_ids = [block.full_id for block in self.blocks]
+        block_ids = []
+        current = self.head
+        while current:
+            block_ids.append(current.full_id)
+            current = current.next_block
         return (f"SemanticSegment(segment_id={self.segment_id}, "
                 f"block_ids={block_ids}, "
+                f"length={len(self)}, "
                 f"ref_cnt={self.ref_cnt}, "
                 f"_segment_hash={self._segment_hash!r})")
+        
+        
+def replace_block_in_segment(old_block: BuddyTreeBlock, 
+                             new_blocks: list[BuddyTreeBlock]) -> None:
+    """Replace a block in its segment with new blocks.
+    Args:
+        block: The block to be replaced.
+        new_blocks: The new blocks to replace the old block.
+    """
+    if old_block.segment:
+        segment = old_block.segment
+        
+        # 1. Link new blocks together and update segment pointers
+        for i in range(len(new_blocks) - 1):
+            new_blocks[i].next_block = new_blocks[i+1]
+            new_blocks[i+1].prev_block = new_blocks[i]
+            new_blocks[i].segment = segment
+        
+        # 2. Link first new block to prev
+        first_block = new_blocks[0]
+        first_block.prev_block = old_block.prev_block
+        if first_block.prev_block:
+            first_block.prev_block.next_block = first_block
+            
+        # 3. Link last new block to next
+        last_block = new_blocks[-1]
+        last_block.next_block = old_block.next_block
+        if last_block.next_block:
+            last_block.next_block.prev_block = last_block
+            
+        # 4. Update segment head/tail if needed
+        if segment.head == old_block:
+            segment.head = first_block
+        if segment.tail == old_block:
+            segment.tail = last_block
+            
+        # 5. Update segment length and capacity
+        segment._length += len(new_blocks) - 1
+        segment._capacity += sum(b.size for b in new_blocks) - old_block.size
+    else:
+        raise RuntimeError("Block to replace is not in a segment")
 
 
 # TODO(huanyu): Implement a heap-based free block management strategy.

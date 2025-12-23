@@ -22,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_block_hash,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
+    replace_block_in_segment,
 )
 from vllm.v1.core.block_pool import BlockHashToBlockMap
 from vllm.distributed.kv_events import MEDIUM_GPU, BlockRemoved, BlockStored, KVCacheEvent
@@ -622,43 +623,18 @@ class BuddyBlockPool:
             # Handle right child
             if child_size == needed_sizes[-1]:
                 # Last split: right child goes to slab as free block
-                right_child.ref_cnt = 0
-                right_child.num_tokens = 0
+                right_child.reset()
                 self.slabs[child_size].append(right_child)
             else:
                 # Continue splitting the right child
                 current_parent = right_child
 
         # Update segment if parent block belongs to one
-        if parent_block.segment:
-            segment = parent_block.segment
+        replace_block_in_segment(parent_block, allocated_children)
             
-            # Update segment pointers
-            for child in allocated_children:
-                child.segment = segment
-            
-            # Update linked list pointers
-            # 1. Link children together
-            for i in range(len(allocated_children) - 1):
-                allocated_children[i].next_block = allocated_children[i+1]
-                allocated_children[i+1].prev_block = allocated_children[i]
-            
-            # 2. Link first child to prev
-            first_child = allocated_children[0]
-            first_child.prev_block = parent_block.prev_block
-            if first_child.prev_block:
-                first_child.prev_block.next_block = first_child
-                
-            # 3. Link last child to next
-            last_child = allocated_children[-1]
-            last_child.next_block = parent_block.next_block
-            if last_child.next_block:
-                last_child.next_block.prev_block = last_child
-            
-            # Clear parent pointers
-            parent_block.segment = None
-            parent_block.prev_block = None
-            parent_block.next_block = None
+        # Reset parent block
+        parent_block.reset()
+        self.allocated_blocks[parent_block.size].discard(parent_block)
 
     def touch(self, blocks: tuple[list[BuddyTreeBlock], ...]) -> None:
         """
