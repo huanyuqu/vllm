@@ -230,80 +230,30 @@ def test_allocate_free_eviction():
 
 
 def test_reclaim_from_allocated_blocks():
-    # Test the 3rd stage of allocation: reclaiming from allocated blocks
     # Pool: 1 block of 64.
-    pool = BuddyBlockPool(num_gpu_blocks=1, supported_sizes=[64, 32], enable_caching=True)
+    pool = BuddyBlockPool(num_max_gpu_blocks=1, supported_sizes=[64, 32], 
+                          enable_caching=True)
     manager = SemanticSegmentManager(pool)
     
-    req1 = MagicMock(spec=Request)
-    req1.request_id = "req1"
-    
-    # Allocate 32 tokens for req1. This splits the 64 block into 32 (allocated) and 32 (free).
-    manager.allocate_new_blocks("req1", 32)
-    
-    # Now we have 32 free.
-    
-    # Allocate another 32 for req2.
-    manager.allocate_new_blocks("req2", 32)
-    
-    # Now pool is full (in terms of 32-blocks). 
-    # Actually, 64 -> 32(req1) + 32(req2). Both allocated.
-    
-    # Now req1 is done but NOT freed (simulating fragmentation or just usage).
-    # Wait, if req1 is not freed, we can't reclaim from it unless we implement partial reclamation which BuddyBlockPool supports?
-    # BuddyBlockPool.reclaim_from_allocated_blocks tries to split blocks that are larger than needed?
-    # No, it reclaims from blocks that are *allocated* but have *unused* space?
-    # Let's check BuddyBlockPool._reclaim_one_block logic.
-    # It checks `block.num_tokens <= size - self.min_block_size`.
-    # If we allocated 32 tokens, `num_tokens` is likely 32 (capacity).
-    # But `update_block_usage` updates `num_tokens` (used).
-    # If we didn't call `update_block_usage`, `num_tokens` might be 0 or capacity?
-    # BuddyTreeBlock `num_tokens` defaults to 0? No, `size` is capacity. `num_tokens` is usage?
-    # In `_split_block`: `left_child.num_tokens = min(child_size, total_tokens)`.
-    # When allocating, `get_new_blocks` calls `_allocate_largest_blocks`.
-    # It doesn't seem to set `num_tokens` (usage) on the block?
-    # Ah, `BuddyTreeBlock` has `_num_tokens`.
-    
-    # Let's look at `BuddyBlockPool` again.
-    # `_allocate_block`: `self.allocated_blocks[size].add(block)`.
-    # It doesn't set `num_tokens`.
-    # So `num_tokens` is 0 initially?
-    # `BuddyTreeBlock` definition: `_num_tokens: int = field(default=0, init=False)`.
-    # So yes, 0.
-    
-    # So if we allocate a 64 block, `num_tokens` is 0.
-    # `_reclaim_one_block` checks `block.num_tokens <= size - self.min_block_size`.
-    # 0 <= 64 - 32 (if min is 32). True.
-    # So it can reclaim.
-    
-    # So if we allocate a 64 block for req1, but only use 32 tokens (conceptually),
-    # we can reclaim the other 32.
-    
-    # Let's try:
-    # Pool: 1 block of 64.
-    pool = BuddyBlockPool(num_gpu_blocks=1, supported_sizes=[64, 32], enable_caching=True)
-    manager = SemanticSegmentManager(pool)
-    
-    # Allocate 64 tokens for req1. This takes the whole 64 block.
-    # But we only "use" 32 tokens.
-    # Wait, `allocate_new_blocks` takes `num_tokens`.
-    # If we ask for 32, it splits and gives us 32.
-    # If we ask for 64, it gives us 64.
-    
-    # To test reclamation, we need a block that is allocated as LARGE, but used SMALL.
-    # E.g. allocate 64.
-    blocks = manager.allocate_new_blocks("req1", 64)
-    block = blocks[0]
-    # Simulate usage: only 32 tokens used.
-    pool.update_block_usage(block.block_id, block.size, block.relative_id, 32)
+    blocks = manager.allocate_new_blocks("req1", 32)
+    assert len(blocks) == 1
+    assert blocks[0].size == 64  # Allocated size
+    pool.update_block_usage(0, 64, 0, 32)
+    assert blocks[0].num_tokens == 32
     
     # Now try to allocate another 32 tokens for req2.
     # The pool has no free blocks.
     # But it should be able to reclaim from req1's block (split 64 -> 32 used + 32 free).
-    
     blocks2 = manager.allocate_new_blocks("req2", 32)
-    assert len(blocks2) > 0
+    assert len(blocks2) == 1
     assert blocks2[0].size == 32
+    
+    first_block = manager.req_to_segments["req1"].unsealed_segment.head
+    assert first_block.size == 32
+    assert first_block.num_tokens == 32
+    assert blocks[0].size == 64
+    assert blocks[0] not in pool.allocated_blocks[blocks[0].size]
+    assert pool.slabs[blocks[0].size].num_free_blocks == 0
 
 
 def test_get_cached_segment_hit(segment_manager):
