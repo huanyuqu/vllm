@@ -294,6 +294,16 @@ class SemanticSegment:
         return self._length
     
     @property
+    def blocks(self) -> list[BuddyTreeBlock]:
+        """Get all blocks in this segment."""
+        blocks = []
+        current = self.head
+        while current:
+            blocks.append(current)
+            current = current.next_block
+        return blocks
+    
+    @property
     def capacity(self) -> int:
         return self._capacity
     
