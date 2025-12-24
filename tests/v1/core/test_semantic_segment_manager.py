@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
-from vllm.v1.core.semantic_segment_manager import SemanticSegmentManager
+from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegmentManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     get_segment_hash,
@@ -258,11 +258,13 @@ def test_reclaim_from_allocated_blocks():
     assert pool.slabs[blocks[0].size].num_free_blocks == 0
     
     
-def test_automatic_merge():
+@pytest.mark.parametrize("eviction_policy", [EvictionPolicy.TIGHT, EvictionPolicy.OVERPROVISION])
+@pytest.mark.parametrize("request_size", [32, 64])
+def test_automatic_merge(request_size, eviction_policy):
     # 1. Create pool with 1 block of size 64
     pool = BuddyBlockPool(num_max_gpu_blocks=1, supported_sizes=[64, 32], 
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(pool, eviction_policy=eviction_policy)
     
     # 2. Allocate two 32-token requests to split the 64 block
     # req1 takes 32 tokens (half of the 64 block)
@@ -271,17 +273,21 @@ def test_automatic_merge():
     assert len(blocks1) == 1
     assert blocks1[0].size == 64
     assert blocks1[0].num_tokens == 32
+    assert blocks1[0].parent is None  # Largest block
     
     # req2 takes 32 tokens (the other half)
     blocks2 = manager.allocate_new_blocks("req2", 32)
     assert len(blocks2) == 1
     assert blocks2[0].size == 32
+    assert blocks2[0].parent is blocks1[0]
     
     # Verify correct reclamation
     segments1 = manager.req_to_segments["req1"]
     first_block = segments1.unsealed_segment.head
     assert first_block.size == 32
     assert first_block.num_tokens == 32
+    assert first_block.parent is blocks1[0]
+    assert first_block.buddy is blocks2[0]
     
     # Verify pool is empty
     assert pool.slabs[64].num_free_blocks == 0
@@ -311,15 +317,34 @@ def test_automatic_merge():
     # Verify segments are in free queue
     assert manager.free_segment_queue.num_free_segments == 2
     
-    # 4. Allocate a 64-token request
-    # This requires merging the two 32 blocks back into a 64 block
-    blocks3 = manager.allocate_new_blocks("req3", 64)
+    # 4. Allocate a request
+    # This requires merging the two 32 blocks back into a 64 block if request_size is 64
+    # or if eviction_policy is OVERPROVISION (which rounds up to max_block_size)
+    blocks3 = manager.allocate_new_blocks("req3", request_size)
     
     assert len(blocks3) == 1
-    assert blocks3[0].size == 64
     
-    # Verify free queue is empty
-    assert manager.free_segment_queue.num_free_segments == 0
+    expect_merge = (request_size == 64) or (eviction_policy == EvictionPolicy.OVERPROVISION)
+    
+    if expect_merge:
+        assert blocks3[0].size == 64
+        assert blocks3[0] is blocks1[0]
+        assert first_block.parent is blocks3[0]
+        assert blocks2[0].parent is blocks3[0]
+        assert pool.slabs[64].num_free_blocks == 0
+        assert pool.slabs[32].num_free_blocks == 0
+        assert pool.allocated_blocks[64] == {blocks3[0]}
+        assert pool.allocated_blocks[32] == set()
+        assert manager.free_segment_queue.num_free_segments == 0
+    else:
+        assert blocks3[0].size == 32
+        assert pool.slabs[64].num_free_blocks == 0
+        assert pool.slabs[32].num_free_blocks == 0
+        assert len(pool.allocated_blocks[64]) == 0
+        assert len(pool.allocated_blocks[32]) == 2
+        assert len(manager.cached_segments) == 1
+        assert manager.free_segment_queue.num_free_segments == 1
+
 
 
 def test_get_cached_segment_hit(segment_manager):
