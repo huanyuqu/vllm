@@ -1,6 +1,7 @@
 from collections import defaultdict
 from typing import Any, Optional
 from dataclasses import dataclass, field
+from enum import Enum
 import itertools
 
 from vllm.logger import init_logger
@@ -192,6 +193,11 @@ class SemanticSegments:
     def __contains__(self, segment: SemanticSegment) -> bool:
         """Support in operator: if segment in semantic_segments:"""
         return segment in self.segments
+    
+    
+class EvictionPolicy(Enum):
+    TIGHT = 0
+    OVERPROVISION = 1
 
 
 # TODO(huanyu): record KV events
@@ -206,8 +212,11 @@ class SemanticSegmentManager:
     4. Managing reference counts for segments.
     """
 
-    def __init__(self, block_pool: BuddyBlockPool):
+    def __init__(self, block_pool: BuddyBlockPool, 
+                 eviction_policy: EvictionPolicy = EvictionPolicy.TIGHT):
         self.block_pool = block_pool
+        
+        self.eviction_policy = eviction_policy
         
         # request_id -> semantic segments used by this request
         # The last segment might be unsealed (is_sealed=False)
@@ -234,9 +243,14 @@ class SemanticSegmentManager:
             
         if remaining > 0:
             # 2. Free segments if needed
-            freed_capacity = 0            
+            freed_capacity = 0
+            original_remaining = remaining
+            if self.eviction_policy == EvictionPolicy.OVERPROVISION:
+                remaining = (((remaining + self.block_pool.max_block_size - 1) // 
+                             self.block_pool.max_block_size) * 
+                             self.block_pool.max_block_size)          
             while (remaining > freed_capacity and 
-                   self.free_segment_queue.num_free_segments > 0):
+                self.free_segment_queue.num_free_segments > 0):
                 segment: SemanticSegment = self.free_segment_queue.popleft()
                 self._maybe_evict_cached_segment(segment)
                 segment.unseal()
@@ -244,9 +258,12 @@ class SemanticSegmentManager:
                 self.block_pool.free_blocks(reversed(segment.blocks))
             
             if freed_capacity > 0:
-                new_blocks, remaining = self.block_pool.get_new_blocks(remaining)
+                new_blocks, remaining = self.block_pool.get_new_blocks(
+                    original_remaining)
                 if new_blocks:
                     blocks.extend(new_blocks)
+            else:
+                remaining = original_remaining
 
             if remaining > 0:
                 # 3. Reclaim from allocated blocks if still needed
