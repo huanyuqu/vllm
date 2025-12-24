@@ -174,7 +174,7 @@ class BuddyBlockPool:
                 idx = i // size_ratio
                 relative_id = i % size_ratio
                 
-                block = self._blocks[block.full_id]
+                block = self._blocks[(idx, size, relative_id)]
                 
                 # Find parent
                 parent_size = size * 2
