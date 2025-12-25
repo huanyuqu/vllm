@@ -274,7 +274,7 @@ class SemanticSegmentManager:
         if not segments.unsealed_segment:
             # Create new unsealed segment
             segment_id = SegmentIdGenerator().generate()
-            new_segment = SemanticSegment(segment_id=segment_id)
+            new_segment = SemanticSegment(segment_id=segment_id, ref_cnt=1)
             segments.append(new_segment)
         
         # Append to unsealed segment
@@ -465,6 +465,19 @@ class SemanticSegmentManager:
             segment.ref_cnt -= 1
             if segment.ref_cnt == 0:
                 self.free_segment_queue.append(segment)  # type: ignore
+                
+    def touch(self, segments: tuple[list[SemanticSegment], ...]) -> None:
+        """
+        Touch segments to increase their reference count and prevent eviction.
+
+        Args:
+            segments: A tuple of lists of segments to touch.
+        """
+        for segments_per_group in segments:
+            for segment in segments_per_group:
+                if segment.ref_cnt == 0:
+                    self.free_segment_queue.remove(segment)  # type: ignore
+                segment.ref_cnt += 1
                 
     # TODO(huanyu): This method is not expected to be used during serving; it is primarily for RL.
     def reset(self) -> None:
