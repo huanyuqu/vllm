@@ -56,8 +56,6 @@ def test_allocate_block_with_excessive_memory(segment_manager):
 
 def test_seal_segment(segment_manager):
     request_id = "req1"
-    request = MagicMock(spec=Request)
-    request.request_id = request_id
     
     # Allocate blocks
     blocks = segment_manager.allocate_new_blocks(request_id, 256)
@@ -69,7 +67,7 @@ def test_seal_segment(segment_manager):
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         
     # Seal
-    segment_manager.seal_segment(request, group_id)
+    segment_manager.seal_segment(request_id, group_id)
     
     segments = segment_manager.req_to_segments[request_id]
     assert len(segments) == 1
@@ -115,8 +113,6 @@ def test_seal_segment(segment_manager):
     
 def test_seal_multiple_segments(segment_manager):
     request_id = "req1"
-    request = MagicMock(spec=Request)
-    request.request_id = request_id
     
     # First allocation and seal
     blocks1 = segment_manager.allocate_new_blocks(request_id, 256)
@@ -125,7 +121,7 @@ def test_seal_multiple_segments(segment_manager):
         block_hash = BlockHash(f"hash1_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
     
-    segment_manager.seal_segment(request, group_id)
+    segment_manager.seal_segment(request_id, group_id)
     
     # Second allocation and seal
     blocks2 = segment_manager.allocate_new_blocks(request_id, 64)
@@ -133,7 +129,7 @@ def test_seal_multiple_segments(segment_manager):
         block_hash = BlockHash(f"hash2_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
     
-    segment_manager.seal_segment(request, group_id)
+    segment_manager.seal_segment(request_id, group_id)
     
     segments = segment_manager.req_to_segments[request_id]
     assert len(segments) == 2
@@ -198,9 +194,6 @@ def test_allocate_free_eviction():
     pool = BuddyBlockPool(num_max_gpu_blocks=2, supported_sizes=[64], enable_caching=True)
     manager = SemanticSegmentManager(pool)
     
-    req1 = MagicMock(spec=Request)
-    req1.request_id = "req1"
-    
     # Allocate all memory for req1 (128 tokens)
     manager.allocate_new_blocks("req1", 128)
     
@@ -211,15 +204,11 @@ def test_allocate_free_eviction():
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         
-    manager.free(req1, group_id)
+    manager.free("req1", group_id)
     
     # Check that segments are in free queue
     assert manager.free_segment_queue.num_free_segments == 1
-    
-    # Now allocate for req2, should trigger eviction
-    req2 = MagicMock(spec=Request)
-    req2.request_id = "req2"
-    
+
     # This should succeed by evicting req1's segments
     blocks = manager.allocate_new_blocks("req2", 64)
     assert len(blocks) == 1
@@ -307,13 +296,8 @@ def test_automatic_merge(request_size, eviction_policy):
         block_hash = BlockHash(f"hash2_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         
-    req1 = MagicMock(spec=Request)
-    req1.request_id = "req1"
-    manager.free(req1, group_id)
-    
-    req2 = MagicMock(spec=Request)
-    req2.request_id = "req2"
-    manager.free(req2, group_id)
+    manager.free("req1", group_id)
+    manager.free("req2", group_id)
     
     # Verify segments are in free queue
     assert manager.free_segment_queue.num_free_segments == 2
@@ -349,8 +333,6 @@ def test_automatic_merge(request_size, eviction_policy):
         
 def test_touch(segment_manager):
     request_id = "req1"
-    request = MagicMock(spec=Request)
-    request.request_id = request_id
     
     # Allocate blocks
     blocks = segment_manager.allocate_new_blocks(request_id, 256)
@@ -363,7 +345,7 @@ def test_touch(segment_manager):
     assert segment.ref_cnt == 1
     
     # Free request to put segment in free queue
-    segment_manager.free(request, group_id)
+    segment_manager.free(request_id, group_id)
     
     assert segment.ref_cnt == 0
     assert segment_manager.free_segment_queue.num_free_segments == 1
@@ -377,8 +359,6 @@ def test_touch(segment_manager):
 
 def test_get_cached_segment_hit(segment_manager):
     request_id = "req1"
-    request = MagicMock(spec=Request)
-    request.request_id = request_id
 
     blocks = segment_manager.allocate_new_blocks(request_id, 256)
 
@@ -387,7 +367,7 @@ def test_get_cached_segment_hit(segment_manager):
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
 
-    segment_manager.seal_segment(request, group_id)
+    segment_manager.seal_segment(request_id, group_id)
     segments = segment_manager.req_to_segments[request_id]
     sealed = segments.last_segment
     assert sealed is not None
@@ -405,8 +385,6 @@ def test_get_cached_segment_hit(segment_manager):
 
 def test_find_longest_cache_hit(segment_manager):
     request_id = "req1"
-    request = MagicMock(spec=Request)
-    request.request_id = request_id
 
     blocks = segment_manager.allocate_new_blocks(request_id, 1024)
     group_id = 0
@@ -414,7 +392,7 @@ def test_find_longest_cache_hit(segment_manager):
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
 
-    segment_manager.seal_segment(request, group_id)
+    segment_manager.seal_segment(request_id, group_id)
     sealed = segment_manager.req_to_segments[request_id].last_segment
     assert sealed is not None
     assert sealed.is_sealed

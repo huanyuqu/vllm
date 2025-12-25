@@ -395,7 +395,7 @@ class SemanticSegmentManager:
     #     return
     
     def seal_segment(
-        self, request: Request, kv_cache_group_id: int
+        self, request_id: str, kv_cache_group_id: int
     ) -> None:
         """
         Seal the unsealed segment for a request.
@@ -406,14 +406,13 @@ class SemanticSegmentManager:
         Note: blocks within a segment cannot be shared by other requests before sealing.
         
         Args:
-            request: The request whose unsealed segment is to be sealed.
+            request_id: The request whose unsealed segment is to be sealed.
             kv_cache_group_id: The KV cache group ID for hashing.
             
         Raises:
             ValueError: If there are no blocks in the unsealed segment or if the last block
                         lacks a block_hash.
         """
-        request_id = request.request_id
         segments = self.req_to_segments[request_id]
         unsealed_segment = segments.unsealed_segment
         if not unsealed_segment:
@@ -426,6 +425,9 @@ class SemanticSegmentManager:
                 "no blocks in unsealed segment."
             )
 
+        # We can directly use the tail block's hash as the segment hash because
+        # cache_full_blocks is always executed before sealing the segment,
+        # ensuring all blocks have a block_hash.
         last_block_hash_with_group_id = unsealed_segment.tail.block_hash
         if last_block_hash_with_group_id is None:
             raise ValueError(
@@ -444,7 +446,7 @@ class SemanticSegmentManager:
         self.cached_segments.insert(segment_hash_with_group_id, unsealed_segment)
         return
 
-    def free(self, request: Request, kv_cache_group_id: int) -> None:
+    def free(self, request_id: str, kv_cache_group_id: int) -> None:
         """
         Release resources for a request.
 
@@ -457,8 +459,7 @@ class SemanticSegmentManager:
         actual eviction is handled separately by cache policy.
         """
         # Default to empty SemanticSegments in case request is freed before allocation
-        self.seal_segment(request, kv_cache_group_id)
-        request_id = request.request_id
+        self.seal_segment(request_id, kv_cache_group_id)
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
         
         for segment in reversed(segments):
