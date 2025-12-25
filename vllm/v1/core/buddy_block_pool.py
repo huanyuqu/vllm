@@ -232,14 +232,12 @@ class BuddyBlockPool:
             cached_blocks.append(block)
         return cached_blocks
 
-    # NOTE: This method is copied from block_pool.py
     def cache_full_blocks(
         self,
         request: Request,
         blocks: list[BuddyTreeBlock],
         num_cached_blocks: int,
         num_full_blocks: int,
-        block_size: int,
         kv_cache_group_id: int,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
@@ -280,31 +278,6 @@ class BuddyBlockPool:
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
-
-        if self.enable_kv_cache_events:
-            if num_cached_blocks == 0:
-                parent_block_hash: ExternalBlockHash | None = None
-            else:
-                parent_block = blocks[num_cached_blocks - 1]
-                assert parent_block.block_hash is not None
-                parent_block_hash = maybe_convert_block_hash(
-                    get_block_hash(parent_block.block_hash)
-                )
-
-            self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=new_hashes,
-                    parent_block_hash=parent_block_hash,
-                    token_ids=request.all_token_ids[
-                        num_cached_blocks * block_size : num_full_blocks * block_size
-                    ],
-                    block_size=block_size,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
-                    medium=MEDIUM_GPU,
-                )
-            )
 
     def _maybe_evict_cached_block(self, block: BuddyTreeBlock) -> bool:
         """

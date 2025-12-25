@@ -408,3 +408,44 @@ def test_find_longest_cache_hit(segment_manager):
     assert len(hit_segments) == 1
     assert len(hit_segments[0]) == 1
     assert hit_segments[0][0] is sealed
+
+
+def test_cache_blocks_seal_segment(segment_manager):
+    request_id = "req1"
+    request = MagicMock(spec=Request)
+    request.request_id = request_id
+    
+    # Allocate blocks
+    blocks = segment_manager.allocate_new_blocks(request_id, 256)
+    
+    # Setup request block hashes
+    group_id = 0
+    block_hashes = [BlockHash(f"hash_{i}".encode()) for i in range(len(blocks))]
+    request.block_hashes = block_hashes
+    
+    # Cache full blocks
+    segment_manager.block_pool.cache_full_blocks(
+        request,
+        blocks,
+        num_cached_blocks=0,
+        num_full_blocks=len(blocks),
+        kv_cache_group_id=group_id
+    )
+    
+    # Verify blocks have hashes
+    for i, block in enumerate(blocks):
+        assert block.block_hash is not None
+        expected = make_block_hash_with_group_id(block_hashes[i], group_id)
+        assert block.block_hash == expected
+
+    # Seal segment
+    segment_manager.seal_segment(request_id, group_id)
+    
+    # Verify segment
+    segments = segment_manager.req_to_segments[request_id]
+    sealed = segments.last_segment
+    assert sealed.is_sealed
+    assert sealed.segment_hash is not None
+    
+    # Verify segment hash matches last block hash
+    assert sealed.segment_hash == blocks[-1].block_hash
