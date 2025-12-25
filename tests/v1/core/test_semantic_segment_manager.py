@@ -345,7 +345,34 @@ def test_automatic_merge(request_size, eviction_policy):
         assert len(pool.allocated_blocks[32]) == 2
         assert len(manager.cached_segments) == 1
         assert manager.free_segment_queue.num_free_segments == 1
+        
+        
+def test_touch(segment_manager):
+    request_id = "req1"
+    request = MagicMock(spec=Request)
+    request.request_id = request_id
+    
+    # Allocate blocks
+    blocks = segment_manager.allocate_new_blocks(request_id, 256)
+    group_id = 0
+    for i, block in enumerate(blocks):
+        block_hash = BlockHash(f"hash_{i}".encode())
+        block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
 
+    segment = segment_manager.req_to_segments[request_id].last_segment
+    assert segment.ref_cnt == 1
+    
+    # Free request to put segment in free queue
+    segment_manager.free(request, group_id)
+    
+    assert segment.ref_cnt == 0
+    assert segment_manager.free_segment_queue.num_free_segments == 1
+    
+    # Touch the segment
+    segment_manager.touch(([segment],))
+    
+    assert segment.ref_cnt == 1
+    assert segment_manager.free_segment_queue.num_free_segments == 0
 
 
 def test_get_cached_segment_hit(segment_manager):
