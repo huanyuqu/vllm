@@ -500,56 +500,24 @@ class SemanticSegmentManager:
     def find_longest_cache_hit(
         self,
         segment_hashes: list[SegmentHash],
-        block_hashes: list[BlockHash],
-        max_length: int,
         kv_cache_group_ids: list[int],
-        block_size: int,
-        use_eagle: bool,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-    ) -> tuple[list[BuddyTreeBlock], ...]:
-        computed_blocks: tuple[list[BuddyTreeBlock], ...] = tuple(
+        use_eagle: bool
+    ) -> tuple[list[SemanticSegment], ...]:
+        matched_segments: tuple[list[SemanticSegment], ...] = tuple(
             [] for _ in range(len(kv_cache_group_ids))
         )
-        
-        if dcp_world_size * pcp_world_size > 1:
-            block_size *= dcp_world_size * pcp_world_size
-            
-        # 1. Try to match full segments first
-        current_token_count = 0
         
         for segment_hash in segment_hashes:
             cached_segments = self.get_cached_segment(segment_hash, kv_cache_group_ids)
             if not cached_segments:
                 break
                 
-            # Verify segment length doesn't exceed max_length
-            segment_len = len(cached_segments[0].blocks) * block_size
-            if current_token_count + segment_len > max_length:
-                break
+            # Add segments to matched_segments
+            for matched, segment in zip(matched_segments, cached_segments):
+                matched.append(segment)
                 
-            # Add segment blocks to computed_blocks
-            for computed, segment in zip(computed_blocks, cached_segments):
-                computed.extend(segment.blocks)
+        if use_eagle and matched_segments[0]:
+            for matched in matched_segments:
+                matched.pop()
                 
-            current_token_count += segment_len
-
-        # 2. For the remaining part, try to match individual blocks
-        # Calculate starting block index for block matching
-        start_block_idx = current_token_count // block_size
-        max_num_blocks = max_length // block_size
-        
-        for block_hash in itertools.islice(block_hashes, start_block_idx, max_num_blocks):
-            if cached_block := self.block_pool.get_cached_block(
-                block_hash, kv_cache_group_ids
-            ):
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed.append(cached)
-            else:
-                break
-                
-        if use_eagle and computed_blocks[0]:
-            for computed in computed_blocks:
-                computed.pop()
-                
-        return computed_blocks
+        return matched_segments
