@@ -4,6 +4,7 @@ from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegmentManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    get_block_hash,
     get_segment_hash,
     make_block_hash_with_group_id,
 )
@@ -352,19 +353,21 @@ def test_get_cached_segment_hit(segment_manager):
     request = MagicMock(spec=Request)
     request.request_id = request_id
 
-    blocks = segment_manager.allocate_new_blocks(request_id, 64)
+    blocks = segment_manager.allocate_new_blocks(request_id, 256)
 
     group_id = 0
     for i, block in enumerate(blocks):
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
-        block.ref_cnt = 1
 
     segment_manager.seal_segment(request, group_id)
     segments = segment_manager.req_to_segments[request_id]
     sealed = segments.last_segment
     assert sealed is not None
+    assert sealed.is_sealed
     assert sealed.segment_hash is not None
+    assert sealed.segment_hash == sealed.tail.block_hash
+    assert not(sealed.segment_hash is sealed.tail.block_hash)
 
     # Lookup uses the group-agnostic SegmentHash.
     base_segment_hash = get_segment_hash(sealed.segment_hash)
@@ -373,33 +376,30 @@ def test_get_cached_segment_hit(segment_manager):
     assert cached[0].segment_id == sealed.segment_id
 
 
-def test_find_longest_cache_hit_segments_only(segment_manager):
+def test_find_longest_cache_hit(segment_manager):
     request_id = "req1"
     request = MagicMock(spec=Request)
     request.request_id = request_id
 
-    blocks = segment_manager.allocate_new_blocks(request_id, 64)
+    blocks = segment_manager.allocate_new_blocks(request_id, 1024)
     group_id = 0
     for i, block in enumerate(blocks):
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
-        block.ref_cnt = 1
 
     segment_manager.seal_segment(request, group_id)
     sealed = segment_manager.req_to_segments[request_id].last_segment
-    assert sealed is not None and sealed.segment_hash is not None
+    assert sealed is not None
+    assert sealed.is_sealed
+    assert sealed.segment_hash is not None
+    assert sealed.segment_hash == sealed.tail.block_hash
+    assert not(sealed.segment_hash is sealed.tail.block_hash)
 
-    base_segment_hash = get_segment_hash(sealed.segment_hash)
-
-    # Segment matching should return the full segment blocks without relying on
-    # block-level cached_block_hash_to_block.
-    hit_blocks = segment_manager.find_longest_cache_hit(
-        segment_hashes=[base_segment_hash],
-        block_hashes=[],
-        max_length=10**9,
+    hit_segments = segment_manager.find_longest_cache_hit(
+        segment_hashes=[get_block_hash(sealed.tail.block_hash)],
         kv_cache_group_ids=[group_id],
-        block_size=64,
         use_eagle=False,
     )
-    assert len(hit_blocks) == 1
-    assert hit_blocks[0] == sealed.blocks
+    assert len(hit_segments) == 1
+    assert len(hit_segments[0]) == 1
+    assert hit_segments[0][0] is sealed
