@@ -77,7 +77,9 @@ class BuddyBlockPool:
         # Initialize free block queues (slabs) for each supported size
         # Each queue is a FreeKVCacheBlockQueue that manages blocks of that size
         self.slabs = self._initialize_block_pool(num_max_gpu_blocks)
-        # Allocated blocks stored as a min-heap: (num_tokens, block)
+        self.num_total_tokens = num_max_gpu_blocks * self.max_block_size
+        self.num_free_tokens = self.num_total_tokens
+
         # TODO(huanyu): The best way to record allocated blocks is to use a
         # min-heap based on their current token usage for better reclamation.
         # However, this increases complexity from O(1) to O(log n).
@@ -204,6 +206,12 @@ class BuddyBlockPool:
                 slabs[size] = FreeKVCacheBlockQueue([])
 
         return slabs
+    
+    def get_usage(self):
+        raise 1.0 - (self.get_num_free_tokens() / self.num_total_tokens)
+    
+    def get_num_free_tokens(self):
+        return self.num_free_tokens
     
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -388,6 +396,7 @@ class BuddyBlockPool:
         coord = (block_id, size, relative_id)
         if coord in self._blocks:
             self._blocks[coord].num_tokens = num_tokens_used
+            self.num_free_tokens -= ((num_tokens_used + self.min_block_size - 1) // self.min_block_size) * self.min_block_size
         else:
             raise KeyError(f"Block {coord} not found")
 

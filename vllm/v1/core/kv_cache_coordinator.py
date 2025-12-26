@@ -4,7 +4,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    SegmentHash,
+    BuddyTreeBlock,
+    SemanticSegment,
+)
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     FullAttentionManager,
@@ -12,6 +18,9 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.request import Request
+
+from vllm.v1.core.buddy_block_pool import BuddyBlockPool
+from vllm.v1.core.semantic_segment_manager import SemanticSegmentManager
 
 
 class KVCacheCoordinator(ABC):
@@ -458,6 +467,234 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return hit_blocks, hit_length
 
 
+class SemanticSegmentCoordinator:
+    """
+    KV cache coordinator for semantic segment-based caching.
+    
+    This coordinator uses BuddyBlockPool for variable-sized block allocation
+    and SemanticSegmentManager for segment-based prefix caching. It supports
+    dynamic block sizes and semantic-aware cache management.
+    
+    Key differences from other coordinators:
+    - Uses BuddyBlockPool instead of BlockPool for variable-sized blocks
+    - Uses SemanticSegmentManager instead of SingleTypeKVCacheManager
+    - Caches at segment granularity rather than block granularity
+    - Supports variable-length segments based on semantic boundaries
+    """
+
+    def __init__(
+        self,
+        kv_cache_config: KVCacheConfig,
+        supported_block_sizes: list[int],
+        max_model_len: int,
+        use_eagle: bool,
+        enable_caching: bool,
+        enable_kv_cache_events: bool,
+        dcp_world_size: int,
+        pcp_world_size: int,
+    ):
+        self.kv_cache_config = kv_cache_config
+        self.max_model_len = max_model_len
+        self.enable_caching = enable_caching
+        self.use_eagle = use_eagle
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+
+        # Initialize BuddyBlockPool for variable-sized block allocation
+        self.block_pool: BuddyBlockPool = BuddyBlockPool(
+            num_max_gpu_blocks=kv_cache_config.num_blocks,
+            supported_sizes=supported_block_sizes,
+            enable_caching=enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+        )
+
+        # Initialize SemanticSegmentManagers for each kv cache group
+        self.segment_managers: tuple[SemanticSegmentManager, ...] = tuple(
+            SemanticSegmentManager(self.block_pool)
+            for _ in self.kv_cache_config.kv_cache_groups
+        )
+        
+        self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
+
+    def get_num_tokens_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[BuddyTreeBlock], ...],
+        num_encoder_tokens: int,
+    ) -> int:
+        """
+        Get the number of tokens needed to be allocated for the request.
+        """
+        num_tokens_to_allocate = 0
+        for i, manager in enumerate(self.segment_managers):
+            num_tokens_to_allocate += manager.get_num_tokens_to_allocate(
+                request_id, num_tokens, new_computed_blocks[i]
+            )
+        return num_tokens_to_allocate
+
+    def save_new_computed_blocks(
+        self, request_id: str, new_computed_blocks: tuple[Sequence[KVCacheBlock], ...]
+    ) -> None:
+        """
+        Save new computed blocks to the request.
+        
+        For SemanticSegmentCoordinator, this is a no-op as segment sealing
+        is handled by cache_blocks().
+        """
+        # SemanticSegmentManager handles segment sealing internally
+        pass
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_encoder_tokens: int = 0
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """
+        Allocate new blocks for the request to give it at least `num_tokens`
+        token slots.
+        
+        Returns:
+            A tuple of lists of newly allocated blocks for each kv cache group.
+        """
+        return tuple(
+            manager.allocate_new_blocks(request_id, num_tokens)
+            for manager in self.segment_managers
+        )
+
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        """
+        Cache the blocks for the request by sealing segments.
+        
+        This method seals segments for each kv cache group, making them
+        available for prefix caching.
+        """
+        for i, manager in enumerate(self.segment_managers):
+            manager.seal_segment(request.request_id, i)
+
+    def free(self, request_id: str) -> None:
+        """
+        Free the blocks for the request.
+        
+        This releases all segments associated with the request and decrements
+        their reference counts.
+        """
+        for i, manager in enumerate(self.segment_managers):
+            manager.free(request_id, i)
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        """
+        Get the number of common prefix blocks for all requests.
+        
+        For SemanticSegmentCoordinator, this is not supported as we operate
+        at segment granularity.
+        
+        Returns:
+            A list of zeros for each kv cache group.
+        """
+        return [0] * self.num_kv_cache_groups
+
+    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+        """
+        Remove blocks that are no longer needed.
+        
+        For SemanticSegmentCoordinator, this is not supported as segments
+        are managed as atomic units.
+        """
+        # Not supported for segment-based caching
+        pass
+
+    def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
+        """
+        Get all blocks for the request across all kv cache groups.
+        
+        Returns:
+            A tuple of lists of blocks for each kv cache group.
+        """
+        blocks_tuple: list[list[BuddyTreeBlock]] = []
+        for manager in self.segment_managers:
+            segments = manager.req_to_segments.get(request_id)
+            if segments:
+                blocks: list[BuddyTreeBlock] = []
+                for segment in segments:
+                    if segment.blocks:
+                        blocks.extend(segment.blocks)
+                blocks_tuple.append(blocks)
+            else:
+                blocks_tuple.append([])
+        return tuple(blocks_tuple)
+
+    def find_longest_cache_hit(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """
+        Find the longest cache hit for the request.
+        
+        Note: This method signature uses block_hashes for compatibility with
+        the base class interface. However, SemanticSegmentCoordinator operates
+        on segment_hashes. For proper usage, use find_longest_segment_cache_hit()
+        which accepts segment_hashes.
+        
+        Returns:
+            A tuple containing empty block lists and 0 hit length.
+        """
+        # This method cannot be properly implemented with block_hashes
+        # Use find_longest_segment_cache_hit() for segment-based caching
+        blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(self.num_kv_cache_groups)
+        )
+        return blocks, 0
+
+    def find_longest_segment_cache_hit(
+        self,
+        segment_hashes: list[SegmentHash],
+        max_cache_hit_length: int,
+    ) -> tuple[tuple[list[SemanticSegment], ...], int]:
+        """
+        Find the longest cache hit using segment hashes.
+        
+        This is the preferred method for finding cache hits in
+        SemanticSegmentCoordinator.
+        
+        Args:
+            segment_hashes: The segment hashes of the request.
+            max_cache_hit_length: The maximum length of the cache hit.
+            
+        Returns:
+            A tuple containing:
+                - A tuple of lists of matched segments for each kv cache group.
+                - The total number of tokens in the cache hit.
+        """
+        if not self.enable_caching or not segment_hashes:
+            return tuple([] for _ in range(self.num_kv_cache_groups)), 0
+
+        # Use the first manager to find cache hits (all managers share the same block pool)
+        kv_cache_group_ids = list(range(self.num_kv_cache_groups))
+        matched_segments = self.segment_managers[0].find_longest_cache_hit(
+            segment_hashes=segment_hashes,
+            kv_cache_group_ids=kv_cache_group_ids,
+            use_eagle=self.use_eagle,
+        )
+        
+        # Calculate hit length from matched segments
+        hit_length = 0
+        if matched_segments[0]:
+            for segment in matched_segments[0]:
+                hit_length += segment.num_tokens
+        
+        return matched_segments, hit_length
+
+    def touch(self, segments: tuple[list[SemanticSegment], ...]) -> None:
+        """
+        Touch segments to prevent them from being evicted.
+        
+        Args:
+            segments: A tuple of lists of segments to touch.
+        """
+        for manager in self.segment_managers:
+            manager.touch(segments)
+
+
 def get_kv_cache_coordinator(
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
@@ -466,7 +703,25 @@ def get_kv_cache_coordinator(
     enable_kv_cache_events: bool,
     dcp_world_size: int,
     pcp_world_size: int,
-) -> KVCacheCoordinator:
+    enable_semantic_segment_cache: bool = False,
+    supported_block_sizes: list[int] | None = None,
+) -> "KVCacheCoordinator | SemanticSegmentCoordinator":
+    if enable_semantic_segment_cache:
+        assert supported_block_sizes is not None, (
+            "supported_block_sizes must be provided when "
+            "enable_semantic_segment_cache is True."
+        )
+        return SemanticSegmentCoordinator(
+            kv_cache_config,
+            supported_block_sizes,
+            max_model_len,
+            use_eagle,
+            enable_caching,
+            enable_kv_cache_events,
+            dcp_world_size,
+            pcp_world_size,
+        )
+
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,

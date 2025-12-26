@@ -1,13 +1,11 @@
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-import itertools
 
 from vllm.logger import init_logger
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
     FreeKVCacheBlockQueue,
     SegmentHash,
     SegmentHashWithGroupId, 
@@ -16,7 +14,6 @@ from vllm.v1.core.kv_cache_utils import (
     get_block_hash,
     make_segment_hash_with_group_id,
 )
-from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -124,6 +121,11 @@ class SemanticSegments:
     Container for managing multiple semantic segments.
     """
     segments: list[SemanticSegment] = field(default_factory=list)
+    
+    @property
+    def capacity(self) -> int:
+        """Get the total capacity of all segments."""
+        return sum(segment.capacity for segment in self.segments)
     
     def append(self, segment: SemanticSegment) -> None:
         """Add a segment to the collection."""
@@ -535,3 +537,42 @@ class SemanticSegmentManager:
                 matched.pop()
                 
         return matched_segments
+    
+    def get_num_tokens_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[BuddyTreeBlock],
+    ) -> int:
+        """
+        Get the number of tokens needed to be allocated for the request.
+
+        Args:
+            request_id: The request ID.
+            num_tokens: The total number of tokens that need a slot (including
+                tokens that are already allocated).
+            new_computed_blocks: The new computed blocks just hitting the
+                prefix caching.
+
+        Returns:
+            The number of tokens.
+        """
+        # Calculate total existing blocks for the request
+        segments = self.req_to_segments.get(request_id, SemanticSegments())
+        num_allocated_tokens = segments.capacity
+
+        num_new_tokens = (
+            num_tokens
+            - sum(blk.size for blk in new_computed_blocks)
+            - num_allocated_tokens
+        )
+        
+        # If a computed block of a request is an eviction candidate (in the
+        # free queue and ref_cnt == 0), it will be changed from a free block
+        # to a computed block when the request is allocated, so we also count
+        # it as needed to be allocated.
+        num_evictable_computed_tokens = sum(blk.size 
+                                            for blk in new_computed_blocks if
+                                            blk.ref_cnt == 0 and not blk.is_null
+                                            )
+        return num_new_tokens + num_evictable_computed_tokens
