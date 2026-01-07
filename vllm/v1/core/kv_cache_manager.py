@@ -417,3 +417,7 @@ class KVCacheManager:
     ) -> KVCacheBlocks:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
+    
+    
+class SemanticKVCacheManager(KVCacheManager):  # Duck typing
+    pass

@@ -135,7 +135,7 @@ class SemanticSegments:
         """Remove and return the last segment."""
         return self.segments.pop()
 
-    def extend(self, segments: list[SemanticSegment]) -> None:
+    def extend(self, segments: Sequence[SemanticSegment]) -> None:
         """Extend the collection with multiple segments."""
         self.segments.extend(segments)
         
@@ -537,6 +537,112 @@ class SemanticSegmentManager:
                 matched.pop()
                 
         return matched_segments
+
+    @classmethod
+    def consolidate_segment_memory(
+        cls, segment: SemanticSegment, block_pool: BuddyBlockPool
+    ) -> Optional[tuple[list[BuddyTreeBlock], list[BuddyTreeBlock]]]:
+        """
+        Consolidate all blocks in a segment into fewer contiguous blocks.
+        This is useful for `FlashAttention` which requires contiguous KV cache.
+
+        Args:
+            segment: The `SemanticSegment` to consolidate.
+            block_pool: The `BuddyBlockPool` to allocate new blocks from.
+
+        Returns:
+            A tuple of (old_blocks, new_blocks) if consolidation occurred,
+            otherwise None. The caller should perform the memory copy.
+        """
+        if not isinstance(segment, SemanticSegment):
+            raise TypeError("segment must be a SemanticSegment")
+
+        if not segment.is_sealed:
+            # Segment not yet sealed is invalid for consolidation.
+            return None
+
+        old_blocks = segment.blocks
+        if len(old_blocks) <= 1:
+            # Already a single block (best possible) or empty.
+            if len(old_blocks) == 1 and old_blocks[0].size == block_pool.max_block_size:
+                return None
+            # If it's a small single block but could be bigger? 
+            # If capacity < max_size, and it's 1 block, it's already optimal for buddy system.
+            # If capacity > max_size, it can't be 1 block.
+            # So generally if len <= 1 no need to consolidate?
+            # User requirement: "If capacity > max_block_size ... combine into multiple".
+            # If we already have optimal blocks, we can skip?
+            # Let's simple check: if we allocate new blocks and the result is same count/structure, we abort?
+            # For now, let's proceed to try allocating.
+
+        capacity = segment.capacity
+        if capacity == 0:
+            return None
+
+        # Try to allocate new blocks greedily
+        new_blocks: list[BuddyTreeBlock] = []
+        remaining = capacity
+        
+        while remaining > 0:
+            allocated = False
+            for size in block_pool.supported_sizes:
+                if size <= remaining:
+                    block = block_pool._allocate_block(size)
+                    if block:
+                        new_blocks.append(block)
+                        remaining -= size
+                        allocated = True
+                        # Restart to try largest size again
+                        break
+            if not allocated:
+                # Allocation failed
+                for block in new_blocks:
+                    block.ref_cnt = 1
+                if new_blocks:
+                    block_pool.free_blocks(new_blocks)
+                return None
+        
+        # Optimization: If new solution is not better (not fewer blocks), abort?
+        # But maybe we want to move data for other reasons. 
+        # But "consolidate" usually means Reduce Fragmentation.
+        if len(new_blocks) >= len(old_blocks):
+             # Cleanup specific logic if we decide not to proceed
+             for block in new_blocks:
+                block.ref_cnt = 1
+             block_pool.free_blocks(new_blocks)
+             return None
+
+        # Replace segment metadata
+        # Link new blocks
+        for i in range(len(new_blocks)):
+            block = new_blocks[i]
+            block.segment = segment
+            block.is_sealed = True
+            block.ref_cnt = segment.ref_cnt
+            block.num_tokens = block.size
+            if i > 0:
+                block.prev_block = new_blocks[i-1]
+                new_blocks[i-1].next_block = block
+            else:
+                block.prev_block = None
+        new_blocks[-1].next_block = None
+
+        segment.head = new_blocks[0]
+        segment.tail = new_blocks[-1]
+        segment._length = len(new_blocks)
+        # capacity should match exactly
+
+        # Free old blocks
+        for block in old_blocks:
+            block.is_sealed = False
+            block.ref_cnt = 1
+            block.segment = None
+            block.prev_block = None
+            block.next_block = None
+
+        block_pool.free_blocks(reversed(old_blocks))
+
+        return old_blocks, new_blocks
     
     def get_num_tokens_to_allocate(
         self,
@@ -546,7 +652,7 @@ class SemanticSegmentManager:
     ) -> int:
         """
         Get the number of tokens needed to be allocated for the request.
-`
+
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
@@ -575,3 +681,19 @@ class SemanticSegmentManager:
         )
 
         return num_new_tokens + num_evictable_computed_tokens
+    
+    def save_new_computed_segments(
+        self, request_id: str, new_computed_segments: Sequence[SemanticSegment]
+    ) -> None:
+        """
+        Add the new computed segments to the request.
+        
+        Args:
+            request_id: The request ID.
+            new_computed_segments: The new computed segments just hitting the
+                prefix cache.
+        """
+        segments = self.req_to_segments[request_id]
+        segments.extend(new_computed_segments)
+        
+    
