@@ -542,16 +542,16 @@ class SemanticSegmentManager:
         self,
         request_id: str,
         num_tokens: int,
-        new_computed_blocks: Sequence[BuddyTreeBlock],
+        new_computed_segments: Sequence[SemanticSegment],
     ) -> int:
         """
         Get the number of tokens needed to be allocated for the request.
-
+`
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
-            new_computed_blocks: The new computed blocks just hitting the
+            new_computed_segments: The new computed segments just hitting the
                 prefix caching.
 
         Returns:
@@ -561,18 +561,17 @@ class SemanticSegmentManager:
         segments = self.req_to_segments.get(request_id, SemanticSegments())
         num_allocated_tokens = segments.capacity
 
-        num_new_tokens = (
-            num_tokens
-            - sum(blk.size for blk in new_computed_blocks)
-            - num_allocated_tokens
+        # Total tokens in the newly computed segments
+        num_computed_tokens = sum(seg.capacity for seg in new_computed_segments)
+
+        num_new_tokens = num_tokens - num_computed_tokens - num_allocated_tokens
+
+        # If a computed segment is an eviction candidate (present in the
+        # free queue with ref_cnt == 0), it will be converted from a free
+        # segment to a computed segment when the request is allocated, so
+        # we also count it as needing to be allocated.
+        num_evictable_computed_tokens = sum(
+            seg.capacity for seg in new_computed_segments if seg.ref_cnt == 0
         )
-        
-        # If a computed block of a request is an eviction candidate (in the
-        # free queue and ref_cnt == 0), it will be changed from a free block
-        # to a computed block when the request is allocated, so we also count
-        # it as needed to be allocated.
-        num_evictable_computed_tokens = sum(blk.size 
-                                            for blk in new_computed_blocks if
-                                            blk.ref_cnt == 0 and not blk.is_null
-                                            )
+
         return num_new_tokens + num_evictable_computed_tokens
