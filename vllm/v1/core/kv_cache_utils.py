@@ -222,6 +222,10 @@ class BuddyTreeBlock(KVCacheBlock):
                 else self.parent.left_child)
         
     @property
+    def is_free(self) -> bool:
+        return self.is_in_slab
+        
+    @property
     def is_in_slab(self) -> bool:
         # FreeKVCacheBlockQueue keeps blocks in a doubly-linked list.
         # When a block is removed/popped, its pointers are reset to None.

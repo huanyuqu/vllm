@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from vllm.logger import init_logger
-from vllm.v1.core.buddy_block_pool import BuddyBlockPool
+from vllm.v1.core.buddy_block_pool import BuddyBlockPool, calculate_address
 from vllm.v1.core.kv_cache_utils import (
     FreeKVCacheBlockQueue,
     SegmentHash,
@@ -543,106 +543,152 @@ class SemanticSegmentManager:
         cls, segment: SemanticSegment, block_pool: BuddyBlockPool
     ) -> Optional[tuple[list[BuddyTreeBlock], list[BuddyTreeBlock]]]:
         """
-        Consolidate all blocks in a segment into fewer contiguous blocks.
-        This is useful for `FlashAttention` which requires contiguous KV cache.
+        Consolidate all blocks in a segment into a contiguous region.
+        This includes swapping data with other allocated blocks or free blocks
+        to ensure physical contiguity starting from the segment head.
 
         Args:
             segment: The `SemanticSegment` to consolidate.
             block_pool: The `BuddyBlockPool` to allocate new blocks from.
 
         Returns:
-            A tuple of (old_blocks, new_blocks) if consolidation occurred,
-            otherwise None. The caller should perform the memory copy.
+            A tuple of (src_blocks, dst_blocks) representing memory moves.
+            The caller should perform the memory copy from src to dst.
+            Note that src and dst may be swapped (i.e. src moves to dst, 
+            dst moves to src) if the target blocks were occupied.
+            Returns None if no consolidation was performed.
         """
         if not isinstance(segment, SemanticSegment):
             raise TypeError("segment must be a SemanticSegment")
 
-        if not segment.is_sealed:
-            # Segment not yet sealed is invalid for consolidation.
+        if not segment.is_sealed or not segment.blocks:
             return None
 
-        old_blocks = segment.blocks
-        if len(old_blocks) <= 1:
-            # Already a single block (best possible) or empty.
-            if len(old_blocks) == 1 and old_blocks[0].size == block_pool.max_block_size:
-                return None
-            # If it's a small single block but could be bigger? 
-            # If capacity < max_size, and it's 1 block, it's already optimal for buddy system.
-            # If capacity > max_size, it can't be 1 block.
-            # So generally if len <= 1 no need to consolidate?
-            # User requirement: "If capacity > max_block_size ... combine into multiple".
-            # If we already have optimal blocks, we can skip?
-            # Let's simple check: if we allocate new blocks and the result is same count/structure, we abort?
-            # For now, let's proceed to try allocating.
-
-        capacity = segment.capacity
-        if capacity == 0:
-            return None
-
-        # Try to allocate new blocks greedily
-        new_blocks: list[BuddyTreeBlock] = []
-        remaining = capacity
+        start_address = calculate_address(
+            segment.head, block_pool.max_block_size)
         
-        while remaining > 0:
-            allocated = False
-            for size in block_pool.supported_sizes:
-                if size <= remaining:
-                    block = block_pool._allocate_block(size)
-                    if block:
-                        new_blocks.append(block)
-                        remaining -= size
-                        allocated = True
-                        # Restart to try largest size again
-                        break
-            if not allocated:
-                # Allocation failed
-                for block in new_blocks:
-                    block.ref_cnt = 1
-                if new_blocks:
-                    block_pool.free_blocks(new_blocks)
-                return None
-        
-        # Optimization: If new solution is not better (not fewer blocks), abort?
-        # But maybe we want to move data for other reasons. 
-        # But "consolidate" usually means Reduce Fragmentation.
-        if len(new_blocks) >= len(old_blocks):
-             # Cleanup specific logic if we decide not to proceed
-             for block in new_blocks:
-                block.ref_cnt = 1
-             block_pool.free_blocks(new_blocks)
-             return None
+        # Helper to find leaf block covering a physical address
+        def find_leaf_block(address: int) -> BuddyTreeBlock:
+            max_size = block_pool.max_block_size
+            block_id = address // max_size
+            offset = address % max_size
+            size = max_size
+            
+            while True:
+                rel_id = offset // size
+                block = block_pool._blocks.get((block_id, size, rel_id))
+                if not block:
+                    raise ValueError(f"Block not found for {address} at size {size}")
+                
+                if block_pool.is_allocated(block) or block.is_free:
+                    return block
+                    
+                size //= 2
+                
+                if size < block_pool.min_block_size:
+                    raise ValueError(f"No allocated or free block found for address {address}")
 
-        # Replace segment metadata
-        # Link new blocks
-        for i in range(len(new_blocks)):
-            block = new_blocks[i]
-            block.segment = segment
-            block.is_sealed = True
-            block.ref_cnt = segment.ref_cnt
-            block.num_tokens = block.size
-            if i > 0:
-                block.prev_block = new_blocks[i-1]
-                new_blocks[i-1].next_block = block
+        # Helper to split an allocated block (or allocate-then-split a free block)
+        def ensure_block_split(
+            block: BuddyTreeBlock, needed_size: int
+        ) -> BuddyTreeBlock:
+            while block.size > needed_size:
+                # If free, remove from slab
+                if block.is_free:
+                    block_pool.slabs[block.size].remove(block)
+                
+                # Split preference: we want the left child to match our physical order
+                needed_sizes = [block.size // 2] 
+                block_pool._split_block(block, needed_sizes)
+                
+                child = block_pool._blocks[(block.block_id, block.size // 2, block.relative_id * 2)]
+                block = child
+            return block
+
+        moves_src: list[BuddyTreeBlock] = []
+        moves_dst: list[BuddyTreeBlock] = []
+        
+        # We assume the user wants the segment to start at 'head' and be contiguous.
+        curr_expected_start = start_address + segment.head.size
+        curr_logical_node = segment.head.next_block
+        
+        while curr_logical_node:
+            src_block = curr_logical_node
+            
+            # 1. Identify Target Block at physical location
+            target_block = find_leaf_block(curr_expected_start)
+            
+            # 2. Check if already correct
+            if target_block == src_block:
+                curr_expected_start += src_block.size
+                curr_logical_node = curr_logical_node.next_block
+                continue
+                
+            # 3. Match sizes
+            if target_block.size > src_block.size:
+                target_block = ensure_block_split(target_block, src_block.size)
+            
+            if src_block.size > target_block.size:
+                src_block = ensure_block_split(src_block, target_block.size)
+            
+            # 4. Perform Swap
+            target_segment = target_block.segment
+            target_is_free = (target_segment is None)
+            
+            # Record move (My data moves S -> T)
+            moves_src.append(src_block)
+            moves_dst.append(target_block)
+            
+            if not target_is_free:
+                # His data moves T -> S
+                moves_src.append(target_block)
+                moves_dst.append(src_block)
+            
+            # Metadata Swap
+            prev_s = src_block.prev_block
+            next_s = src_block.next_block
+            seg_s = segment
+
+            # Update T -> S (Other Segment / Free)
+            if target_is_free:
+                # Remove T from free lists
+                if getattr(target_block, 'is_in_slab', False):
+                    block_pool.slabs[target_block.size].remove(target_block)
+                
+                # S becomes Free
+                block_pool.allocated_blocks[src_block.size].discard(src_block)
+                block_pool.slabs[src_block.size].append(src_block)
+                src_block.prev_block = None
+                src_block.next_block = None
+                src_block.segment = None
             else:
-                block.prev_block = None
-        new_blocks[-1].next_block = None
+                # S takes T's place
+                from vllm.v1.core.kv_cache_utils import replace_block_in_segment
+                replace_block_in_segment(target_block, [src_block])
+            
+            # Update S -> T (My Segment)
+            # T takes S's place (T becomes allocated)
+            block_pool.allocated_blocks[target_block.size].add(target_block)
+            
+            target_block.segment = seg_s
+            target_block.prev_block = prev_s
+            target_block.next_block = next_s
+            if prev_s: prev_s.next_block = target_block
+            if next_s: next_s.prev_block = target_block
+            if seg_s.head == src_block: seg_s.head = target_block
+            if seg_s.tail == src_block: seg_s.tail = target_block
+            
+            target_block.ref_cnt = seg_s.ref_cnt
+            target_block.is_sealed = True
+            
+            # 5. Advance
+            curr_expected_start += target_block.size
+            curr_logical_node = next_s
 
-        segment.head = new_blocks[0]
-        segment.tail = new_blocks[-1]
-        segment._length = len(new_blocks)
-        # capacity should match exactly
-
-        # Free old blocks
-        for block in old_blocks:
-            block.is_sealed = False
-            block.ref_cnt = 1
-            block.segment = None
-            block.prev_block = None
-            block.next_block = None
-
-        block_pool.free_blocks(reversed(old_blocks))
-
-        return old_blocks, new_blocks
+        if not moves_src:
+            return None
+            
+        return moves_src, moves_dst
     
     def get_num_tokens_to_allocate(
         self,

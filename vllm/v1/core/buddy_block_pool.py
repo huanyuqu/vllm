@@ -695,3 +695,32 @@ class BuddyBlockPool:
     
     def reset_prefix_cache(self):
         raise NotImplementedError
+    
+    def is_allocated(self, block: BuddyTreeBlock) -> bool:
+        """
+        Check if a block is currently allocated.
+
+        Args:
+            block: The BuddyTreeBlock to check.
+            
+        Returns:
+            True if the block is allocated, False otherwise.
+        """
+        return (block.size in self.allocated_blocks and 
+                block in self.allocated_blocks[block.size])
+
+
+def calculate_address(block: BuddyTreeBlock, max_block_size: int) -> int:
+    """
+    Calculate the starting address of a block in token units.
+
+    Args:
+        block: The BuddyTreeBlock to calculate the address for.
+        max_block_size: The maximum block size in the BuddyBlockPool.
+
+    Returns:
+        The starting address of the block in token units.
+    """
+    address = block.block_id * max_block_size
+    address += block.relative_id * block.size
+    return address
