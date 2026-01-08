@@ -427,6 +427,13 @@ def replace_block_in_segment(old_block: BuddyTreeBlock,
             new_blocks[i].next_block = new_blocks[i+1]
             new_blocks[i+1].prev_block = new_blocks[i]
             new_blocks[i].segment = segment
+            new_blocks[i].ref_cnt = segment.ref_cnt
+            new_blocks[i].is_sealed = segment.is_sealed
+            
+        # Handle the last block separately
+        new_blocks[-1].segment = segment
+        new_blocks[-1].ref_cnt = segment.ref_cnt
+        new_blocks[-1].is_sealed = segment.is_sealed
         
         # 2. Link first new block to prev
         first_block = new_blocks[0]

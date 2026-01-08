@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     SemanticSegment, 
     get_block_hash,
     make_segment_hash_with_group_id,
+    replace_block_in_segment,
 )
 
 logger = init_logger(__name__)
@@ -541,7 +542,8 @@ class SemanticSegmentManager:
     @classmethod
     def consolidate_segment_memory(
         cls, segment: SemanticSegment, block_pool: BuddyBlockPool
-    ) -> Optional[tuple[list[BuddyTreeBlock], list[BuddyTreeBlock]]]:
+    ) -> Optional[tuple[list[tuple[BuddyTreeBlock, BuddyTreeBlock]], 
+                         list[tuple[BuddyTreeBlock, BuddyTreeBlock]]]]:
         """
         Consolidate all blocks in a segment into a contiguous region.
         This includes swapping data with other allocated blocks or free blocks
@@ -552,10 +554,10 @@ class SemanticSegmentManager:
             block_pool: The `BuddyBlockPool` to allocate new blocks from.
 
         Returns:
-            A tuple of (src_blocks, dst_blocks) representing memory moves.
-            The caller should perform the memory copy from src to dst.
-            Note that src and dst may be swapped (i.e. src moves to dst, 
-            dst moves to src) if the target blocks were occupied.
+            A tuple of (moves, swaps).
+            - moves: list[(src, dst)] where data moves from src to an empty dst.
+            - swaps: list[(src, dst)] where data at src and dst are exchanged.
+            The caller should perform the actual memory copy/swap.
             Returns None if no consolidation was performed.
         """
         if not isinstance(segment, SemanticSegment):
@@ -588,107 +590,89 @@ class SemanticSegmentManager:
                 if size < block_pool.min_block_size:
                     raise ValueError(f"No allocated or free block found for address {address}")
 
-        # Helper to split an allocated block (or allocate-then-split a free block)
-        def ensure_block_split(
-            block: BuddyTreeBlock, needed_size: int
-        ) -> BuddyTreeBlock:
-            while block.size > needed_size:
-                # If free, remove from slab
-                if block.is_free:
-                    block_pool.slabs[block.size].remove(block)
-                
-                # Split preference: we want the left child to match our physical order
-                needed_sizes = [block.size // 2] 
-                block_pool._split_block(block, needed_sizes)
-                
-                child = block_pool._blocks[(block.block_id, block.size // 2, block.relative_id * 2)]
-                block = child
-            return block
-
-        moves_src: list[BuddyTreeBlock] = []
-        moves_dst: list[BuddyTreeBlock] = []
+        moves: list[tuple[BuddyTreeBlock, BuddyTreeBlock]] = []
+        swaps: list[tuple[BuddyTreeBlock, BuddyTreeBlock]] = []
         
         # We assume the user wants the segment to start at 'head' and be contiguous.
-        curr_expected_start = start_address + segment.head.size
-        curr_logical_node = segment.head.next_block
+        curr_start = start_address + segment.head.size
+        curr_logical_block = segment.head.next_block
         
-        while curr_logical_node:
-            src_block = curr_logical_node
+        while curr_logical_block:
+            src_block = curr_logical_block
+            next_logical_block = src_block.next_block # Save before metadata swap
             
             # 1. Identify Target Block at physical location
-            target_block = find_leaf_block(curr_expected_start)
+            target_block = find_leaf_block(curr_start)
             
             # 2. Check if already correct
             if target_block == src_block:
-                curr_expected_start += src_block.size
-                curr_logical_node = curr_logical_node.next_block
+                curr_start += src_block.size
+                curr_logical_block = next_logical_block
                 continue
                 
             # 3. Match sizes
             if target_block.size > src_block.size:
-                target_block = ensure_block_split(target_block, src_block.size)
+                target_block = block_pool.split_block(target_block, src_block.size)
             
             if src_block.size > target_block.size:
-                src_block = ensure_block_split(src_block, target_block.size)
+                src_block = block_pool.split_block(src_block, target_block.size)
+                # After split, src_block is the left child.
+                # The right child is now part of the segment and will be seen next.
+                next_logical_block = src_block.next_block
             
             # 4. Perform Swap
             target_segment = target_block.segment
-            target_is_free = (target_segment is None)
             
-            # Record move (My data moves S -> T)
-            moves_src.append(src_block)
-            moves_dst.append(target_block)
-            
-            if not target_is_free:
-                # His data moves T -> S
-                moves_src.append(target_block)
-                moves_dst.append(src_block)
-            
-            # Metadata Swap
-            prev_s = src_block.prev_block
-            next_s = src_block.next_block
-            seg_s = segment
-
-            # Update T -> S (Other Segment / Free)
-            if target_is_free:
-                # Remove T from free lists
-                if getattr(target_block, 'is_in_slab', False):
-                    block_pool.slabs[target_block.size].remove(target_block)
+            if target_segment is None:
+                moves.append((src_block, target_block))
                 
-                # S becomes Free
+                # Metadata: src (me) -> target (free)
+                # target becomes allocated (to me)
+                if target_block.is_free:
+                    block_pool.slabs[target_block.size].remove(target_block)
+                block_pool.allocated_blocks[target_block.size].add(target_block)
+                
+                # 1. Update segment mapping
+                target_block.num_tokens = src_block.num_tokens
+                replace_block_in_segment(src_block, [target_block])
+                
+                # 2. Release old block
+                src_block.reset()
                 block_pool.allocated_blocks[src_block.size].discard(src_block)
                 block_pool.slabs[src_block.size].append(src_block)
-                src_block.prev_block = None
-                src_block.next_block = None
-                src_block.segment = None
             else:
-                # S takes T's place
-                from vllm.v1.core.kv_cache_utils import replace_block_in_segment
+                swaps.append((src_block, target_block))
+                
+                # Metadata: Swap ownership/links using the helper
+                t_seg = target_block.segment
+                t_prev, t_next = target_block.prev_block, target_block.next_block
+                t_tokens = target_block.num_tokens
+                
+                s_tokens = src_block.num_tokens
+
+                # 1. Replace src_block with target_block in MY segment
+                replace_block_in_segment(src_block, [target_block])
+                target_block.num_tokens = s_tokens
+                
+                # 2. Replace target_block with src_block in HIS segment
+                # We temporarily restore target's metadata so the helper
+                # can identify the target's original position in t_seg.
+                target_block.segment = t_seg
+                target_block.prev_block = t_prev
+                target_block.next_block = t_next
+                
                 replace_block_in_segment(target_block, [src_block])
-            
-            # Update S -> T (My Segment)
-            # T takes S's place (T becomes allocated)
-            block_pool.allocated_blocks[target_block.size].add(target_block)
-            
-            target_block.segment = seg_s
-            target_block.prev_block = prev_s
-            target_block.next_block = next_s
-            if prev_s: prev_s.next_block = target_block
-            if next_s: next_s.prev_block = target_block
-            if seg_s.head == src_block: seg_s.head = target_block
-            if seg_s.tail == src_block: seg_s.tail = target_block
-            
-            target_block.ref_cnt = seg_s.ref_cnt
-            target_block.is_sealed = True
+                src_block.num_tokens = t_tokens
             
             # 5. Advance
-            curr_expected_start += target_block.size
-            curr_logical_node = next_s
+            curr_start += target_block.size
+            curr_logical_block = next_logical_block
 
-        if not moves_src:
+        if not moves and not swaps:
             return None
             
-        return moves_src, moves_dst
+        return moves, swaps
+
     
     def get_num_tokens_to_allocate(
         self,

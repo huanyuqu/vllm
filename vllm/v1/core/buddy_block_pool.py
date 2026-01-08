@@ -556,6 +556,72 @@ class BuddyBlockPool:
             self._split_block(reclaimed_block, needed_sizes)
             
             return num_tokens - needed_sizes[-1]
+
+    def split_block(self, block: BuddyTreeBlock, target_size: int) -> BuddyTreeBlock:
+        """
+        Split a block down to the target size.
+        If the block is free, the right remainder is returned to the free slab.
+        If the block is allocated, the right remainder remains allocated.
+        
+        Args:
+            block: The block to split.
+            target_size: The target size to split down to.
+            
+        Returns:
+            The left-most child block at the target size.
+        """
+        if block.size == target_size:
+            return block
+            
+        if block.size < target_size:
+            raise ValueError(f"Cannot split block of size {block.size} to {target_size}")
+            
+        # If free, verify it's in slab and remove it
+        if block.is_free:
+            self.slabs[block.size].remove(block)
+            
+        # We split step by step
+        while block.size > target_size:
+            child_size = block.size // 2
+            left_rel = block.relative_id * 2
+            right_rel = left_rel + 1
+            
+            left_child = self._blocks[(block.block_id, child_size, left_rel)]
+            right_child = self._blocks[(block.block_id, child_size, right_rel)]
+            
+            # If parent was allocated (has segment), children inherit it
+            seg = block.segment
+            if seg:
+                # Distribute tokens
+                if block.num_tokens > child_size:
+                    left_child.num_tokens = child_size
+                    right_child.num_tokens = block.num_tokens - child_size
+                else:
+                    left_child.num_tokens = block.num_tokens
+                    right_child.num_tokens = 0
+                
+                # Both remain allocated to the segment
+                self.allocated_blocks[child_size].add(left_child)
+                self.allocated_blocks[child_size].add(right_child)
+                replace_block_in_segment(block, [left_child, right_child])
+            else:
+                # Parent was free (we just removed it from slab)
+                # Left gets allocated (we are zooming in on it)
+                left_child.num_tokens = 0 
+                self.allocated_blocks[child_size].add(left_child)
+                
+                # Right goes to free slab
+                self.allocated_blocks[child_size].discard(right_child)
+                right_child.num_tokens = 0
+                self.slabs[child_size].append(right_child)
+            
+            block.reset()
+            if block.size in self.allocated_blocks:
+                self.allocated_blocks[block.size].discard(block)
+                
+            block = left_child
+            
+        return block
     
     def _split_block(
         self, 
@@ -610,6 +676,7 @@ class BuddyBlockPool:
                 self.slabs[child_size].append(right_child)
             else:
                 # Continue splitting the right child
+                right_child.ref_cnt = current_parent.ref_cnt
                 current_parent = right_child
 
         # Update segment if parent block belongs to one
