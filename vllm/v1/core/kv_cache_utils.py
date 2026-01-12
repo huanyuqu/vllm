@@ -520,6 +520,15 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
             
+    def __contains__(self, block: KVCacheBlock) -> bool:
+        """Check if a block is in the free list."""
+        current = self.fake_free_list_head.next_free_block
+        while current != self.fake_free_list_tail:
+            if current == block:
+                return True
+            current = current.next_free_block
+        return False
+            
     @property
     def num_free_elements(self) -> int:
         """Get the number of free elements in the queue."""

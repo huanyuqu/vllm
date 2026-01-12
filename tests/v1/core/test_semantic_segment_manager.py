@@ -454,7 +454,7 @@ def test_cache_blocks_seal_segment(segment_manager):
 def test_split_block(block_pool):
     # Get a free block from the largest slab (128)
     assert block_pool.slabs[128].num_free_blocks > 0
-    block = block_pool.slabs[128][0]
+    block = block_pool.slabs[128].fake_free_list_head.next_free_block
     initial_128_free = block_pool.slabs[128].num_free_blocks
     initial_64_free = block_pool.slabs[64].num_free_blocks
     initial_32_free = block_pool.slabs[32].num_free_blocks
@@ -465,7 +465,7 @@ def test_split_block(block_pool):
     assert result_block.size == 32
     assert result_block.block_id == block.block_id
     assert block_pool.calculate_address(result_block) == \
-        block_pool.calculate_address(block)
+           block_pool.calculate_address(block)
     
     # Verify slabs
     # split_block implementation currently adds BOTH children to the slab
@@ -473,16 +473,16 @@ def test_split_block(block_pool):
     # 1. 128 -> 64L, 64R. Both added to slabs[64].
     # 2. 64L -> 32L, 32R. Both added to slabs[32].
     assert block_pool.slabs[128].num_free_blocks == initial_128_free - 1
-    assert block_pool.slabs[64].num_free_blocks == initial_64_free + 2
+    assert block_pool.slabs[64].num_free_blocks == initial_64_free + 1
     assert block_pool.slabs[32].num_free_blocks == initial_32_free + 2
-    
+
     # Verify blocks are in slabs
     # result_block is 32L
     assert result_block in block_pool.slabs[32]
     assert result_block.buddy in block_pool.slabs[32]
     
     # Parent (64L) is also in slab, waiting to be used or just dangling
-    assert result_block.parent in block_pool.slabs[64]
+    assert result_block.parent not in block_pool.slabs[64]
     assert result_block.parent.buddy in block_pool.slabs[64]
 
 

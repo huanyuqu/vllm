@@ -577,12 +577,12 @@ class BuddyBlockPool:
         if block.size < target_size:
             raise ValueError(f"Cannot split block of size {block.size} to {target_size}")
             
-        # If free, verify it's in slab and remove it
-        if block.is_free:
-            self.slabs[block.size].remove(block)
-            
         # We split step by step
         while block.size > target_size:
+            # If free, verify it's in slab and remove it
+            if block.is_free:
+                self.slabs[block.size].remove(block)
+            
             child_size = block.size // 2
             left_rel = block.relative_id * 2
             right_rel = left_rel + 1
