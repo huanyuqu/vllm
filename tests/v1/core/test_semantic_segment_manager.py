@@ -735,4 +735,74 @@ def test_consolidate_segment_memory_swap():
     
     
 def test_consolidate_segment_memory_with_split():
-    pass
+    # Pool: supported sizes [64, 32]. 
+    pool = BuddyBlockPool(num_max_gpu_blocks=4, supported_sizes=[64, 32], 
+                          enable_caching=True)
+    manager = SemanticSegmentManager(pool)
+
+    # 1. Alloc req_main (64) -> Addr 0
+    blocks_m1 = manager.allocate_new_blocks("req_main", 64)
+    assert blocks_m1[0].size == 64
+    assert pool.calculate_address(blocks_m1[0]) == 0
+
+    # 2. Alloc req_gap (64) -> Addr 64
+    blocks_g1 = manager.allocate_new_blocks("req_gap", 64)
+    assert blocks_g1[0].size == 64
+    assert pool.calculate_address(blocks_g1[0]) == 64
+
+    # 3. Alloc req_main (32) -> Addr 128
+    # Allocator prefers largest blocks, so it gives a 64 block.
+    # We manually split it to simulate having a smaller block to test consolidation logic.
+    blocks_m2 = manager.allocate_new_blocks("req_main", 32)
+    if blocks_m2[0].size == 64:
+        pool.split_block(blocks_m2[0], 32)
+
+    segment = manager.req_to_segments["req_main"].last_segment
+    assert len(segment.blocks) == 3
+    assert pool.calculate_address(segment.blocks[-2]) == 128
+    assert pool.calculate_address(segment.blocks[-1]) == 160
+
+    # 4. Seal
+    group_id = 0
+    for i, b in enumerate(segment.blocks):
+        b.block_hash = make_block_hash_with_group_id(BlockHash(f"m{i}".encode()), group_id)
+    manager.seal_segment("req_main", group_id)
+    
+    for b in blocks_g1:
+        b.block_hash = make_block_hash_with_group_id(BlockHash(b"g"), group_id)
+    manager.seal_segment("req_gap", group_id)
+
+    seg_main = manager.req_to_segments["req_main"].last_segment
+    seg_gap = manager.req_to_segments["req_gap"].last_segment
+
+    # Initial State: Main [64(0), 32(128), 32(160)], Gap [64(64)]
+    assert len(seg_main.blocks) == 3
+    
+    # 5. Consolidate
+    # Expectation:
+    # - Process 64(0): OK. Next Start 64.
+    # - Process 32(128):
+    #   - Target at 64 is Gap(64).
+    #   - Target 64(64) > Src 32(128). Split Target -> 32L(64), 32R(96).
+    #   - Swap Src 32(128) with Gap 32L(64).
+    #   - Main has [64(0), 32(64)]. Contiguous.
+    #   - Gap has [32(128), 32(96)]. (Note: C split into C_L(64) and C_R(96). C_L swapped to 128. C_R stays at 96).
+    
+    moves, swaps = manager.consolidate_segment_memory(seg_main, pool)
+    
+    assert len(moves) == 0
+    assert len(swaps) == 2
+    
+    # 6. Validate
+    # seg_main should be contiguous 0, 64
+    blocks = seg_main.blocks
+    assert len(blocks) == 3
+    assert blocks[0].size == 64 and pool.calculate_address(blocks[0]) == 0
+    assert blocks[1].size == 32 and pool.calculate_address(blocks[1]) == 64
+    assert blocks[2].size == 32 and pool.calculate_address(blocks[2]) == 96
+    
+    # GAP should be split and moved
+    # Gap originally had 1 block of 64. Now logically it should have 2 blocks of 32
+    assert len(seg_gap.blocks) == 2
+    addrs = [pool.calculate_address(b) for b in seg_gap.blocks]
+    assert addrs == [128, 160]
