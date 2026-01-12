@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_block_hash,
     make_segment_hash_with_group_id,
     replace_block_in_segment,
+    swap_blocks,
 )
 
 logger = init_logger(__name__)
@@ -540,6 +541,8 @@ class SemanticSegmentManager:
         return matched_segments
 
     @classmethod
+    # TODO(huanyu): consolidating one segment may affect the memory layout of 
+    # already consolidated segments
     def consolidate_segment_memory(
         cls, segment: SemanticSegment, block_pool: BuddyBlockPool
     ) -> Optional[tuple[list[tuple[BuddyTreeBlock, BuddyTreeBlock]], 
@@ -594,7 +597,7 @@ class SemanticSegmentManager:
         
         while curr_logical_block:
             src_block = curr_logical_block
-            next_logical_block = src_block.next_block # Save before metadata swap
+            next_logical_block = src_block.next_block
             
             # 1. Identify Target Block at physical location
             target_block = find_leaf_block(curr_start)
@@ -640,25 +643,7 @@ class SemanticSegmentManager:
                 swaps.append((src_block, target_block))
                 
                 # Metadata: Swap ownership/links using the helper
-                t_seg = target_block.segment
-                t_prev, t_next = target_block.prev_block, target_block.next_block
-                t_tokens = target_block.num_tokens
-                
-                s_tokens = src_block.num_tokens
-
-                # 1. Replace src_block with target_block in MY segment
-                replace_block_in_segment(src_block, [target_block])
-                target_block.num_tokens = s_tokens
-                
-                # 2. Replace target_block with src_block in HIS segment
-                # We temporarily restore target's metadata so the helper
-                # can identify the target's original position in t_seg.
-                target_block.segment = t_seg
-                target_block.prev_block = t_prev
-                target_block.next_block = t_next
-                
-                replace_block_in_segment(target_block, [src_block])
-                src_block.num_tokens = t_tokens
+                swap_blocks(src_block, target_block)
             
             # 5. Advance
             curr_start += target_block.size

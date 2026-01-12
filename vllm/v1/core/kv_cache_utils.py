@@ -412,8 +412,10 @@ class SemanticSegment:
                 f"_segment_hash={self._segment_hash!r})")
         
         
-def replace_block_in_segment(old_block: BuddyTreeBlock, 
-                             new_blocks: list[BuddyTreeBlock]) -> None:
+def replace_block_in_segment(
+    old_block: BuddyTreeBlock, 
+    new_blocks: list[BuddyTreeBlock] | BuddyTreeBlock
+) -> None:
     """Replace a block in its segment with new blocks.
     Args:
         block: The block to be replaced.
@@ -421,6 +423,9 @@ def replace_block_in_segment(old_block: BuddyTreeBlock,
     """
     if old_block.segment:
         segment = old_block.segment
+        
+        if isinstance(new_blocks, BuddyTreeBlock):
+            new_blocks = [new_blocks]
         
         # 1. Link new blocks together and update segment pointers
         for i in range(len(new_blocks) - 1):
@@ -458,6 +463,113 @@ def replace_block_in_segment(old_block: BuddyTreeBlock,
         segment._capacity += sum(b.size for b in new_blocks) - old_block.size
     else:
         raise RuntimeError("Block to replace is not in a segment")
+    
+    
+def swap_blocks(
+    block1: BuddyTreeBlock, 
+    block2: BuddyTreeBlock
+) -> None:
+    """Swap two blocks in their respective segments.
+
+    If the blocks are in the same segment, this effectively swaps their positions.
+    If they are in different segments, they also swap segment membership.
+    """
+    if block1 == block2:
+        return
+
+    seg1 = block1.segment
+    seg2 = block2.segment
+
+    if not seg1 or not seg2:
+        raise RuntimeError("Both blocks must be in a segment to swap")
+
+    # 1. Update links for swap
+    if block1.next_block == block2:
+        # Case: block1 -> block2 (adjacent)
+        prev1 = block1.prev_block
+        next2 = block2.next_block
+
+        block2.prev_block = prev1
+        block2.next_block = block1
+        block1.prev_block = block2
+        block1.next_block = next2
+
+        if prev1:
+            prev1.next_block = block2
+        if next2:
+            next2.prev_block = block1
+
+    elif block2.next_block == block1:
+        # Case: block2 -> block1 (adjacent)
+        prev2 = block2.prev_block
+        next1 = block1.next_block
+
+        block1.prev_block = prev2
+        block1.next_block = block2
+        block2.prev_block = block1
+        block2.next_block = next1
+
+        if prev2:
+            prev2.next_block = block1
+        if next1:
+            next1.prev_block = block2
+
+    else:
+        # Case: Non-adjacent
+        prev1 = block1.prev_block
+        next1 = block1.next_block
+        prev2 = block2.prev_block
+        next2 = block2.next_block
+
+        block1.prev_block = prev2
+        block1.next_block = next2
+        block2.prev_block = prev1
+        block2.next_block = next1
+
+        if prev1:
+            prev1.next_block = block2
+        if next1:
+            next1.prev_block = block2
+
+        if prev2:
+            prev2.next_block = block1
+        if next2:
+            next2.prev_block = block1
+
+    # 2. Update segment head/tail pointers
+    # Use flags because updates might affect subsequent checks if seg1 == seg2
+    is_seg1_head = (seg1.head == block1)
+    is_seg1_tail = (seg1.tail == block1)
+    is_seg2_head = (seg2.head == block2)
+    is_seg2_tail = (seg2.tail == block2)
+
+    if is_seg1_head:
+        seg1.head = block2
+    if is_seg1_tail:
+        seg1.tail = block2
+
+    if is_seg2_head:
+        seg2.head = block1
+    if is_seg2_tail:
+        seg2.tail = block1
+
+    # 3. Swap num_tokens
+    block1.num_tokens, block2.num_tokens = block2.num_tokens, block1.num_tokens
+
+    # 4. Handle segment membership change if needed
+    if seg1 != seg2:
+        block1.segment = seg2
+        block2.segment = seg1
+
+        block1.ref_cnt = seg2.ref_cnt
+        block1.is_sealed = seg2.is_sealed
+
+        block2.ref_cnt = seg1.ref_cnt
+        block2.is_sealed = seg1.is_sealed
+
+        diff_size = block1.size - block2.size
+        seg1._capacity -= diff_size
+        seg2._capacity += diff_size
 
 
 # TODO(huanyu): Implement a heap-based free block management strategy.
