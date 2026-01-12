@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from vllm.logger import init_logger
-from vllm.v1.core.buddy_block_pool import BuddyBlockPool, calculate_address
+from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.kv_cache_utils import (
     FreeKVCacheBlockQueue,
     SegmentHash,
@@ -543,7 +543,7 @@ class SemanticSegmentManager:
     def consolidate_segment_memory(
         cls, segment: SemanticSegment, block_pool: BuddyBlockPool
     ) -> Optional[tuple[list[tuple[BuddyTreeBlock, BuddyTreeBlock]], 
-                         list[tuple[BuddyTreeBlock, BuddyTreeBlock]]]]:
+                        list[tuple[BuddyTreeBlock, BuddyTreeBlock]]]]:
         """
         Consolidate all blocks in a segment into a contiguous region.
         This includes swapping data with other allocated blocks or free blocks
@@ -563,20 +563,18 @@ class SemanticSegmentManager:
         if not isinstance(segment, SemanticSegment):
             raise TypeError("segment must be a SemanticSegment")
 
-        if not segment.is_sealed or not segment.blocks:
-            return None
+        if not segment.is_sealed or not segment.head or not segment.tail:
+            raise ValueError("Can only consolidate sealed and non-empty segments.")
 
-        start_address = calculate_address(
-            segment.head, block_pool.max_block_size)
+        start_address = block_pool.calculate_address(segment.head)
         
         # Helper to find leaf block covering a physical address
         def find_leaf_block(address: int) -> BuddyTreeBlock:
             max_size = block_pool.max_block_size
             block_id = address // max_size
             offset = address % max_size
-            size = max_size
             
-            while True:
+            for size in block_pool.supported_sizes:
                 rel_id = offset // size
                 block = block_pool._blocks.get((block_id, size, rel_id))
                 if not block:
@@ -585,15 +583,12 @@ class SemanticSegmentManager:
                 if block_pool.is_allocated(block) or block.is_free:
                     return block
                     
-                size //= 2
-                
-                if size < block_pool.min_block_size:
-                    raise ValueError(f"No allocated or free block found for address {address}")
+            raise ValueError(f"No allocated or free block found for address {address}")
 
         moves: list[tuple[BuddyTreeBlock, BuddyTreeBlock]] = []
         swaps: list[tuple[BuddyTreeBlock, BuddyTreeBlock]] = []
         
-        # We assume the user wants the segment to start at 'head' and be contiguous.
+        # The segment starts at 'head' and is contiguous.
         curr_start = start_address + segment.head.size
         curr_logical_block = segment.head.next_block
         
@@ -612,7 +607,8 @@ class SemanticSegmentManager:
                 
             # 3. Match sizes
             if target_block.size > src_block.size:
-                target_block = block_pool.split_block(target_block, src_block.size)
+                target_block = block_pool.split_block(
+                    target_block, src_block.size)
             
             if src_block.size > target_block.size:
                 src_block = block_pool.split_block(src_block, target_block.size)

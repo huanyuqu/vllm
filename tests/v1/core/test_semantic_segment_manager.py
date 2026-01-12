@@ -449,3 +449,130 @@ def test_cache_blocks_seal_segment(segment_manager):
     
     # Verify segment hash matches last block hash
     assert sealed.segment_hash == blocks[-1].block_hash
+    
+
+def test_split_block(block_pool):
+    # Get a free block from the largest slab (128)
+    assert block_pool.slabs[128].num_free_blocks > 0
+    block = block_pool.slabs[128][0]
+    initial_128_free = block_pool.slabs[128].num_free_blocks
+    initial_64_free = block_pool.slabs[64].num_free_blocks
+    initial_32_free = block_pool.slabs[32].num_free_blocks
+    
+    # Split the block of size 128 into a block of size 32
+    result_block = block_pool.split_block(block, 32)
+    
+    assert result_block.size == 32
+    assert result_block.block_id == block.block_id
+    assert block_pool.calculate_address(result_block) == \
+        block_pool.calculate_address(block)
+    
+    # Verify slabs
+    # split_block implementation currently adds BOTH children to the slab
+    # when splitting a free block.
+    # 1. 128 -> 64L, 64R. Both added to slabs[64].
+    # 2. 64L -> 32L, 32R. Both added to slabs[32].
+    assert block_pool.slabs[128].num_free_blocks == initial_128_free - 1
+    assert block_pool.slabs[64].num_free_blocks == initial_64_free + 2
+    assert block_pool.slabs[32].num_free_blocks == initial_32_free + 2
+    
+    # Verify blocks are in slabs
+    # result_block is 32L
+    assert result_block in block_pool.slabs[32]
+    assert result_block.buddy in block_pool.slabs[32]
+    
+    # Parent (64L) is also in slab, waiting to be used or just dangling
+    assert result_block.parent in block_pool.slabs[64]
+    assert result_block.parent.buddy in block_pool.slabs[64]
+
+
+def test_consolidate_segment_memory(segment_manager):
+    # Setup a small pool to control physical addresses easily
+    pool = BuddyBlockPool(num_max_gpu_blocks=4,
+                          supported_sizes=[128],
+                          enable_caching=True)
+    manager = SemanticSegmentManager(pool)
+
+    # 1. Allocate block A for req_main (address 0)
+    blocks_a = manager.allocate_new_blocks("req_main", 128)
+    block_a = blocks_a[0]
+
+    # 2. Allocate block B for req_gap (address 128)
+    blocks_b = manager.allocate_new_blocks("req_gap", 128)
+    block_b = blocks_b[0]
+
+    # 3. Allocate block C for req_main (address 256)
+    blocks_c = manager.allocate_new_blocks("req_main", 128)
+    block_c = blocks_c[0]
+
+    # Physical addresses
+    addr_a = block_a.block_id * pool.max_block_size
+    addr_b = block_b.block_id * pool.max_block_size
+    addr_c = block_c.block_id * pool.max_block_size
+
+    assert addr_b == addr_a + 128
+    assert addr_c == addr_b + 128
+
+    # Seal req_main
+    group_id = 0
+    block_a.block_hash = make_block_hash_with_group_id(BlockHash(b"a"),
+                                                      group_id)
+    block_c.block_hash = make_block_hash_with_group_id(BlockHash(b"c"),
+                                                      group_id)
+    manager.seal_segment("req_main", group_id)
+
+    segment = manager.req_to_segments["req_main"].last_segment
+    assert segment.blocks == [block_a, block_c]
+
+    # req_gap unsealed segment
+    gap_unsealed = manager.req_to_segments["req_gap"].unsealed_segment
+    assert gap_unsealed.blocks == [block_b]
+
+    # 4. Consolidate
+    result = manager.consolidate_segment_memory(segment, pool)
+
+    assert result is not None
+    moves, swaps = result
+
+    # It should swap block_c (src) with block_b (dst)
+    # block_b is at addr_a + 128, which is where block_c should be to be
+    # contiguous with block_a.
+    assert len(swaps) == 1
+    assert swaps[0] == (block_c, block_b)
+
+    # Verify metadata updates
+    # segment.blocks should now be [block_a, block_b]
+    new_blocks = segment.blocks
+    assert new_blocks == [block_a, block_b]
+    assert block_b.segment == segment
+    assert block_b.prev_block == block_a
+    assert block_a.next_block == block_b
+
+    # req_gap's unsealed segment should now contain block_c
+    assert gap_unsealed.blocks == [block_c]
+    assert block_c.segment == gap_unsealed
+    assert block_c.prev_block is None
+    assert block_c.next_block is None
+
+
+def test_consolidate_segment_memory_no_change(segment_manager):
+    pool = BuddyBlockPool(num_max_gpu_blocks=4,
+                          supported_sizes=[128],
+                          enable_caching=True)
+    manager = SemanticSegmentManager(pool)
+
+    # Allocate contiguous blocks
+    # Returns [block0, block1]
+    blocks = manager.allocate_new_blocks("req", 256)
+
+    group_id = 0
+    blocks[0].block_hash = make_block_hash_with_group_id(BlockHash(b"0"),
+                                                        group_id)
+    blocks[1].block_hash = make_block_hash_with_group_id(BlockHash(b"1"),
+                                                        group_id)
+    manager.seal_segment("req", group_id)
+
+    segment = manager.req_to_segments["req"].last_segment
+
+    result = manager.consolidate_segment_memory(segment, pool)
+    assert result is None

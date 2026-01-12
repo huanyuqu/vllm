@@ -557,7 +557,8 @@ class BuddyBlockPool:
             
             return num_tokens - needed_sizes[-1]
 
-    def split_block(self, block: BuddyTreeBlock, target_size: int) -> BuddyTreeBlock:
+    def split_block(self, block: BuddyTreeBlock, 
+                    target_size: int) -> BuddyTreeBlock:
         """
         Split a block down to the target size.
         If the block is free, the right remainder is returned to the free slab.
@@ -605,14 +606,7 @@ class BuddyBlockPool:
                 self.allocated_blocks[child_size].add(right_child)
                 replace_block_in_segment(block, [left_child, right_child])
             else:
-                # Parent was free (we just removed it from slab)
-                # Left gets allocated (we are zooming in on it)
-                left_child.num_tokens = 0 
-                self.allocated_blocks[child_size].add(left_child)
-                
-                # Right goes to free slab
-                self.allocated_blocks[child_size].discard(right_child)
-                right_child.num_tokens = 0
+                self.slabs[child_size].append(left_child)
                 self.slabs[child_size].append(right_child)
             
             block.reset()
@@ -777,17 +771,17 @@ class BuddyBlockPool:
                 block in self.allocated_blocks[block.size])
 
 
-def calculate_address(block: BuddyTreeBlock, max_block_size: int) -> int:
-    """
-    Calculate the starting address of a block in token units.
+    def calculate_address(self, block: BuddyTreeBlock) -> int:
+        """
+        Calculate the starting address of a block in token units.
 
-    Args:
-        block: The BuddyTreeBlock to calculate the address for.
-        max_block_size: The maximum block size in the BuddyBlockPool.
+        Args:
+            block: The BuddyTreeBlock to calculate the address for.
+            max_block_size: The maximum block size in the BuddyBlockPool.
 
-    Returns:
-        The starting address of the block in token units.
-    """
-    address = block.block_id * max_block_size
-    address += block.relative_id * block.size
-    return address
+        Returns:
+            The starting address of the block in token units.
+        """
+        address = block.block_id * self.max_block_size
+        address += block.relative_id * block.size
+        return address
