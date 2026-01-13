@@ -754,10 +754,15 @@ def test_consolidate_segment_memory_with_split():
     # Allocator prefers largest blocks, so it gives a 64 block.
     # We manually split it to simulate having a smaller block to test consolidation logic.
     blocks_m2 = manager.allocate_new_blocks("req_main", 32)
-    if blocks_m2[0].size == 64:
-        pool.split_block(blocks_m2[0], 32)
+    assert blocks_m2[0].size == 64
+    split_block = pool.split_block(blocks_m2[0], 32)
+    assert not blocks_m2[0].is_free
+    assert not pool.is_allocated(blocks_m2[0])
+    assert split_block.size == 32
+    assert split_block.buddy.size == 32
 
     segment = manager.req_to_segments["req_main"].last_segment
+    # Initial State: Main [64(0), 32(128), 32(160)], Gap [64(64)]
     assert len(segment.blocks) == 3
     assert pool.calculate_address(segment.blocks[-2]) == 128
     assert pool.calculate_address(segment.blocks[-1]) == 160
@@ -774,9 +779,6 @@ def test_consolidate_segment_memory_with_split():
 
     seg_main = manager.req_to_segments["req_main"].last_segment
     seg_gap = manager.req_to_segments["req_gap"].last_segment
-
-    # Initial State: Main [64(0), 32(128), 32(160)], Gap [64(64)]
-    assert len(seg_main.blocks) == 3
     
     # 5. Consolidate
     # Expectation:
@@ -785,18 +787,26 @@ def test_consolidate_segment_memory_with_split():
     #   - Target at 64 is Gap(64).
     #   - Target 64(64) > Src 32(128). Split Target -> 32L(64), 32R(96).
     #   - Swap Src 32(128) with Gap 32L(64).
-    #   - Main has [64(0), 32(64)]. Contiguous.
-    #   - Gap has [32(128), 32(96)]. (Note: C split into C_L(64) and C_R(96). C_L swapped to 128. C_R stays at 96).
+    #   - Main has [64(0), 32(64), 32(160)]. 
+    #   - Gap has [32(128), 32(96)].
+    # - Process 32(160):
+    #   - Target at 96 is Gap 32R(96).
+    #   - Swap Src 32(160) with Gap 32R(96).
+    #   - Main has [64(0), 32(64), 32(96)]. Contiguous.
+    #   - Gap has [32(128), 32(160)].
     
     moves, swaps = manager.consolidate_segment_memory(seg_main, pool)
     
+    # 6. Validate
     assert len(moves) == 0
     assert len(swaps) == 2
+    # Because the metadata has already been swapped
+    # The order is the opposite of what was expected
+    assert swaps[0] == (seg_gap.blocks[0], segment.blocks[1])  # 32(128) <-> 32(64)
+    assert swaps[1] == (seg_gap.blocks[1], segment.blocks[2])  # 32(160) <-> 32(96)
     
-    # 6. Validate
-    # seg_main should be contiguous 0, 64
+    # seg_main should be contiguous 0, 64, 96
     blocks = seg_main.blocks
-    assert len(blocks) == 3
     assert blocks[0].size == 64 and pool.calculate_address(blocks[0]) == 0
     assert blocks[1].size == 32 and pool.calculate_address(blocks[1]) == 64
     assert blocks[2].size == 32 and pool.calculate_address(blocks[2]) == 96
