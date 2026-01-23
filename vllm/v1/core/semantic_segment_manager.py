@@ -198,6 +198,12 @@ class SemanticSegments:
         """Support in operator: if segment in semantic_segments:"""
         return segment in self.segments
     
+    def __add__(self, other: "SemanticSegments") -> "SemanticSegments":
+        """Concatenate two SemanticSegments objects."""
+        if not isinstance(other, SemanticSegments):
+            raise TypeError("Can only add SemanticSegments to SemanticSegments")
+        return SemanticSegments(self.segments + other.segments)
+    
     
 class EvictionPolicy(Enum):
     TIGHT = 0
@@ -518,6 +524,7 @@ class SemanticSegmentManager:
     def find_longest_cache_hit(
         self,
         segment_hashes: list[SegmentHash],
+        max_length: int,
         kv_cache_group_ids: list[int],
         use_eagle: bool
     ) -> tuple[list[SemanticSegment], ...]:
@@ -525,14 +532,22 @@ class SemanticSegmentManager:
             [] for _ in range(len(kv_cache_group_ids))
         )
         
+        current_length = 0
         for segment_hash in segment_hashes:
             cached_segments = self.get_cached_segment(segment_hash, kv_cache_group_ids)
             if not cached_segments:
                 break
-                
+            
+            # Assuming all segments in the group have the same capacity
+            segment_length = cached_segments[0].capacity
+            if current_length + segment_length > max_length:
+                break
+
             # Add segments to matched_segments
             for matched, segment in zip(matched_segments, cached_segments):
                 matched.append(segment)
+            
+            current_length += segment_length
                 
         if use_eagle and matched_segments[0]:
             for matched in matched_segments:
