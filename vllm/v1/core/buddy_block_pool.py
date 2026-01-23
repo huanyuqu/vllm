@@ -208,7 +208,7 @@ class BuddyBlockPool:
         return slabs
     
     def get_usage(self):
-        raise 1.0 - (self.get_num_free_tokens() / self.num_total_tokens)
+        return 1.0 - (self.get_num_free_tokens() / self.num_total_tokens)
     
     def get_num_free_tokens(self):
         return self.num_free_tokens
