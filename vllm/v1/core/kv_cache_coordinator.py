@@ -654,6 +654,13 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         )
             
         return hit_segments, sum(seg.capacity for seg in hit_segments[0])
+    
+    def reset_prefix_cache(self) -> None:
+        """
+        Reset the prefix cache in all single type managers.
+        """
+        for manager in self.single_type_managers:
+            manager.reset_prefix_cache()
 
 def get_kv_cache_coordinator(
     kv_cache_config: KVCacheConfig,

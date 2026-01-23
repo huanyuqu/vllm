@@ -490,9 +490,36 @@ class SemanticSegmentManager:
                     self.free_segment_queue.remove(segment)  # type: ignore
                 segment.ref_cnt += 1
                 
-    # TODO(huanyu): This method is not expected to be used during serving; it is primarily for RL.
-    def reset(self) -> None:
-        raise NotImplementedError("SemanticSegmentManager.reset is not implemented yet.")
+    def reset_prefix_cache(self) -> bool:
+        """Reset prefix cache. This function may be used in RLHF
+        flows to invalid prefix caching after the weights are updated,
+        or used for resetting prefix caching status for benchmarking.
+
+        Returns:
+            bool: True if the prefix cache is successfully reset,
+            False otherwise.
+        """
+        if self.req_to_segments:
+            logger.warning(
+                "Failed to reset prefix cache because some requests are active."
+            )
+            return False
+
+        # Free all evictable segments to return blocks to the pool
+        while self.free_segment_queue.num_free_segments > 0:
+            segment = self.free_segment_queue.popleft()
+            self._maybe_evict_cached_segment(segment)
+            self.block_pool.free_blocks(reversed(segment.blocks))
+
+        # Reset the hash map
+        self.cached_segments = SegmentHashToSegmentMap()
+
+        logger.info("Successfully reset prefix cache")
+        
+        # if self.enable_kv_cache_events:
+        #     self.kv_event_queue.append(AllBlocksCleared())
+
+        return True
                 
     def get_cached_segment(
         self, segment_hash: SegmentHash,

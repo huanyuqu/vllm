@@ -8,6 +8,8 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.buddy_block_pool import BuddyBlockPool
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     SemanticSegmentCoordinator,
     get_kv_cache_coordinator
@@ -213,20 +215,35 @@ class KVCacheManager:
                 assert len(kv_cache_config.kv_cache_groups) == 1
                 self.block_size *= dcp_world_size * pcp_world_size
 
-        self.coordinator = get_kv_cache_coordinator(
-            kv_cache_config=kv_cache_config,
-            max_model_len=self.max_model_len,
-            use_eagle=self.use_eagle,
-            enable_caching=self.enable_caching,
-            enable_kv_cache_events=enable_kv_cache_events,
-            dcp_world_size=dcp_world_size,
-            pcp_world_size=pcp_world_size,
-            enable_semantic_segment=enable_semantic_segment,
-            supported_block_sizes=supported_block_sizes,
-            eviction_policy=eviction_policy,
-        )
+        self.enable_semantic_segment = enable_semantic_segment
+        
+        if self.enable_semantic_segment:
+            self.coordinator: SemanticSegmentCoordinator = get_kv_cache_coordinator(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                use_eagle=self.use_eagle,
+                enable_caching=self.enable_caching,
+                enable_kv_cache_events=enable_kv_cache_events,
+                dcp_world_size=dcp_world_size,
+                pcp_world_size=pcp_world_size,
+                enable_semantic_segment=enable_semantic_segment,
+                supported_block_sizes=supported_block_sizes,
+                eviction_policy=eviction_policy,
+            )
+            self.block_pool: BuddyBlockPool = self.coordinator.block_pool
+        else:
+            self.coordinator = get_kv_cache_coordinator(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                use_eagle=self.use_eagle,
+                enable_caching=self.enable_caching,
+                enable_kv_cache_events=enable_kv_cache_events,
+                dcp_world_size=dcp_world_size,
+                pcp_world_size=pcp_world_size,
+                enable_semantic_segment=enable_semantic_segment,
+            )
+            self.block_pool: BlockPool = self.coordinator.block_pool
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
-        self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
@@ -238,7 +255,7 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
-        if enable_semantic_segment:
+        if self.enable_semantic_segment:
             # Pre-constructed empty segments, callers should use this to avoid
             # GC overhead.
             self.empty_kv_cache_segments = MultiGroupSemanticSegments(
@@ -478,8 +495,12 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
-            return False
+        if self.enable_semantic_segment:
+            if not self.coordinator.reset_prefix_cache():
+                return False
+        else:
+            if not self.block_pool.reset_prefix_cache():
+                return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
