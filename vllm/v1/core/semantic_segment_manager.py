@@ -748,5 +748,18 @@ class SemanticSegmentManager:
         """
         segments = self.req_to_segments[request_id]
         segments.extend(new_computed_segments)
-        
     
+    def touch(self, segments: tuple[Sequence[SemanticSegment], ...]) -> None:
+        """
+        Touch the given segments to update their reference counts.
+
+        Args:
+            segments: A tuple of lists of segments to touch.
+        """
+        for segments_per_group in segments:
+            for segment in segments_per_group:
+                # ref_cnt=0 means this segment is in the free list (i.e. 
+                # eviction candidate), so remove it.
+                if segment.ref_cnt == 0:
+                    self.free_segment_queue.remove(segment)
+                segment.ref_cnt += 1
