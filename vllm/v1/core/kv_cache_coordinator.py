@@ -629,7 +629,10 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         are managed as atomic units.
         """
         # Not supported for segment-based caching
-        pass
+        raise NotImplementedError(
+            "remove_skipped_blocks is not supported for "
+            "SemanticSegmentCoordinator."
+        )
 
     def find_longest_cache_hit(
         self,
@@ -661,6 +664,26 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         """
         for manager in self.single_type_managers:
             manager.reset_prefix_cache()
+            
+    def touch(self, segments: tuple[Sequence[SemanticSegment], ...]) -> None:
+        """
+        Touch segments to update their recency in the cache.
+
+        Args:
+            request_id: The request ID.
+            segment_hashes: The hashes of the segments to touch.
+        """
+        for i, manager in enumerate(self.single_type_managers):
+            manager.touch(segments[i])
+            
+    def get_num_free_tokens(self) -> int:
+        """
+        Get the number of free tokens available.
+
+        Returns:
+            The number of free tokens.
+        """
+        return self.single_type_managers[0].get_num_free_tokens()
 
 def get_kv_cache_coordinator(
     kv_cache_config: KVCacheConfig,

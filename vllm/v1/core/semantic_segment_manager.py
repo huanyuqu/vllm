@@ -477,18 +477,19 @@ class SemanticSegmentManager:
             if segment.ref_cnt == 0:
                 self.free_segment_queue.append(segment)  # type: ignore
                 
-    def touch(self, segments: tuple[list[SemanticSegment], ...]) -> None:
+    def touch(self, segments: SemanticSegments) -> None:
         """
         Touch segments to increase their reference count and prevent eviction.
 
         Args:
-            segments: A tuple of lists of segments to touch.
+            segments: A sequence of segments to touch.
         """
-        for segments_per_group in segments:
-            for segment in segments_per_group:
-                if segment.ref_cnt == 0:
-                    self.free_segment_queue.remove(segment)  # type: ignore
-                segment.ref_cnt += 1
+        for segment in segments:
+            # ref_cnt=0 means this segment is in the free list (i.e. 
+            # eviction candidate), so remove it.
+            if segment.ref_cnt == 0:
+                self.free_segment_queue.remove(segment)
+            segment.ref_cnt += 1
                 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -748,18 +749,7 @@ class SemanticSegmentManager:
         """
         segments = self.req_to_segments[request_id]
         segments.extend(new_computed_segments)
-    
-    def touch(self, segments: tuple[Sequence[SemanticSegment], ...]) -> None:
-        """
-        Touch the given segments to update their reference counts.
 
-        Args:
-            segments: A tuple of lists of segments to touch.
-        """
-        for segments_per_group in segments:
-            for segment in segments_per_group:
-                # ref_cnt=0 means this segment is in the free list (i.e. 
-                # eviction candidate), so remove it.
-                if segment.ref_cnt == 0:
-                    self.free_segment_queue.remove(segment)
-                segment.ref_cnt += 1
+
+    def get_num_free_tokens(self) -> int:
+        pass

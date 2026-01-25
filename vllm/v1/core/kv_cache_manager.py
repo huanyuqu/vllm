@@ -12,7 +12,8 @@ from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     SemanticSegmentCoordinator,
-    get_kv_cache_coordinator
+    get_kv_cache_coordinator,
+    KVCacheCoordinator
     )
 from vllm.v1.core.kv_cache_utils import (
     BuddyTreeBlock,
@@ -232,7 +233,7 @@ class KVCacheManager:
             )
             self.block_pool: BuddyBlockPool = self.coordinator.block_pool
         else:
-            self.coordinator = get_kv_cache_coordinator(
+            self.coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
                 kv_cache_config=kv_cache_config,
                 max_model_len=self.max_model_len,
                 use_eagle=self.use_eagle,
@@ -476,6 +477,96 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def allocate_segments(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_computed_tokens: int = 0,
+        new_computed_segments: MultiGroupSemanticSegments | None = None,
+        num_lookahead_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+        num_encoder_tokens: int = 0,
+    ) -> MultiGroupSemanticSegments | None:
+        """Add slots for a request with new tokens to append (using semantic segments).
+
+        Args:
+            request: The request to allocate slots.
+            num_new_tokens: The number of tokens to allocate.
+            num_new_computed_tokens: The number of new computed tokens just
+                hitting the prefix caching.
+            new_computed_segments: The cached segments for the above new computed tokens.
+            num_lookahead_tokens: The number of speculative tokens to allocate.
+            delay_cache_blocks: Whether to skip caching the blocks.
+            num_encoder_tokens: The number of encoder tokens.
+        """
+        if not isinstance(self.coordinator, SemanticSegmentCoordinator):
+             raise RuntimeError("allocate_segments called without SemanticSegmentCoordinator")
+
+        if num_new_tokens == 0:
+            raise ValueError("num_new_tokens must be greater than 0")
+
+        if new_computed_segments is not None:
+            new_computed_segments_list = new_computed_segments.multi_group_segments
+        else:
+            new_computed_segments_list = self.empty_kv_cache_segments.multi_group_segments
+
+        # Free the blocks that are skipped during the attention computation.
+        # self.coordinator.remove_skipped_blocks(
+        #     request.request_id, request.num_computed_tokens
+        # )
+        
+        # Calculate needed tokens
+        num_computed_tokens = (request.num_computed_tokens +
+                               num_new_computed_tokens)
+        num_tokens_need_slot = min(
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            self.max_model_len,
+        )
+
+        num_tokens_to_allocate = self.coordinator.get_num_tokens_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_segments=new_computed_segments_list,
+        )
+        
+        if num_tokens_to_allocate > self.coordinator.get_num_free_tokens():
+            # Cannot allocate enough new tokens
+            return None
+
+        # Touch the computed segments to make sure they won't be evicted.
+        if self.enable_caching:
+            self.coordinator.touch(new_computed_segments_list)
+        else:
+            assert not any(len(g) for g in new_computed_segments_list), (
+                "Computed segments should be empty when prefix caching is disabled"
+            )
+
+        if new_computed_segments_list is not self.empty_kv_cache_segments.multi_group_segments:
+            # Append the new computed segments to the request segments
+            self.coordinator.save_new_computed_segments(
+                request.request_id, new_computed_segments_list
+            )
+
+        # Allocate new blocks
+        new_blocks = self.coordinator.allocate_new_blocks(
+            request.request_id, num_tokens_need_slot
+        )
+
+        if not self.enable_caching or delay_cache_blocks:
+             return self.create_kv_cache_segments(
+                 self.coordinator.get_segments(request.request_id)
+             )
+
+        # Cache segments (Seal segments if applicable)
+        num_tokens_to_cache = min(
+            num_computed_tokens + num_new_tokens, request.num_tokens
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+
+        return self.create_kv_cache_segments(
+             self.coordinator.get_segments(request.request_id)
+        )
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -559,6 +650,15 @@ class KVCacheManager:
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
         if self.enable_caching:
+            self.coordinator.cache_blocks(request, num_computed_tokens)
+            
+    def cache_segments(self, request: Request, num_computed_tokens: int) -> None:
+        """Cache the segments for the request, if enabled."""
+        if self.enable_caching:
+            if not isinstance(self.coordinator, SemanticSegmentCoordinator):
+                raise RuntimeError(
+                    "cache_segments can only be called when "
+                    "semantic segment caching is enabled.")
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
