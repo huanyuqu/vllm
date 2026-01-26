@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.request import Request
 
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
-from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegmentManager
+from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegmentManager, SemanticSegments
 
 
 class KVCacheCoordinator(ABC):
@@ -519,15 +519,15 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
 
         # Initialize SemanticSegmentManagers for each kv cache group
         self.single_type_managers: tuple[SemanticSegmentManager, ...] = tuple(
-            SemanticSegmentManager(self.block_pool, eviction_policy)
-            for _ in self.kv_cache_config.kv_cache_groups
+            SemanticSegmentManager(self.block_pool, i, eviction_policy)
+            for i in range(len(self.kv_cache_config.kv_cache_groups))
         )
 
     def get_num_tokens_to_allocate(
         self,
         request_id: str,
         num_tokens: int,
-        new_computed_segments: tuple[Sequence[SemanticSegment], ...],
+        new_computed_segments: tuple[SemanticSegments, ...],
     ) -> int:
         """
         Get the number of tokens needed to be allocated for the request.
@@ -551,7 +551,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
 
     def save_new_computed_segments(
         self, request_id: str, 
-        new_computed_segments: tuple[Sequence[SemanticSegment], ...]
+        new_computed_segments: tuple[SemanticSegments, ...]
     ) -> None:
         """
         Add the new computed segments to the request.
@@ -568,7 +568,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_encoder_tokens: int = 0
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[list[BuddyTreeBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
         token slots.
@@ -581,18 +581,22 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
             for manager in self.single_type_managers
         )
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    def cache_segments(self, request: Request, 
+                       num_segments: int) -> None:
         """
         Cache for the request.
 
-        For semantic-segment caching, the unit of caching is a *segment* rather
-        than a fixed-size KV cache block. We keep this method for compatibility
-        with the v1 scheduler/KVCacheManager interface, and delegate to
-        `cache_segments()`.
+        Args:
+            request: The request.
+            num_sealed_segments: The total number of segments that are sealed and should be cached after this function.
         """
-        self.cache_segments(request)
+        assert len(self.single_type_managers) == 1, (
+            "Currently only support one kv cache group."
+        )
+        for manager in self.single_type_managers:
+            manager.cache_segments(request, num_segments)
 
-    def cache_segments(self, request: Request) -> None:
+    def seal_segment(self, request: Request) -> None:
         """Seal the current unsealed segment(s) and make them cacheable."""
         for i, manager in enumerate(self.single_type_managers):
             manager.seal_segment(request.request_id, i)
@@ -638,7 +642,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[SemanticSegment], ...], int]:
+    ) -> tuple[tuple[SemanticSegments, ...], int]:
         """
         Find the longest cache hit for the request.
 
@@ -665,7 +669,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         for manager in self.single_type_managers:
             manager.reset_prefix_cache()
             
-    def touch(self, segments: tuple[Sequence[SemanticSegment], ...]) -> None:
+    def touch(self, segments: tuple[SemanticSegments, ...]) -> None:
         """
         Touch segments to update their recency in the cache.
 

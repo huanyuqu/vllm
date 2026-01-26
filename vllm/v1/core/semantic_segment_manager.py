@@ -230,7 +230,8 @@ class SemanticSegmentManager:
     4. Managing reference counts for segments.
     """
 
-    def __init__(self, block_pool: BuddyBlockPool, 
+    def __init__(self, block_pool: BuddyBlockPool,
+                 kv_cache_group_id: int, 
                  eviction_policy: EvictionPolicy = EvictionPolicy.TIGHT):
         self.block_pool = block_pool
         
@@ -246,6 +247,9 @@ class SemanticSegmentManager:
         # This queue records the segments with ref_cnt = 0
         # All segments in this queue must in self.cached_segments
         self.free_segment_queue = FreeKVCacheBlockQueue([])
+
+        self.kv_cache_group_id = kv_cache_group_id
+        self.num_cached_segments: dict[str, int] = {}
         
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int
@@ -467,10 +471,7 @@ class SemanticSegmentManager:
     def cache_segments(
         self,
         request: Request,
-        segments: SemanticSegments,
-        num_cached_segments: int,
-        num_sealed_segments: int,
-        kv_cache_group_id: int,
+        num_sealed_segments: int
     ) -> None:
         """Cache full segments for prefix caching.
 
@@ -480,13 +481,13 @@ class SemanticSegmentManager:
 
         Args:
             request: The request to cache the segments.
-            segments: All segments in the request.
-            num_cached_segments: The number of segments that are already cached.
             num_sealed_segments: The number of segments that are sealed and should be cached after this function.
-            kv_cache_group_id: The id of the KV cache group.
         """
+        num_cached_segments = self.num_cached_segments.get(
+            request.request_id, 0)
         if num_cached_segments >= num_sealed_segments:
             return
+        segments = self.req_to_segments[request.request_id]
         new_sealed_segments = segments[num_cached_segments:num_sealed_segments]
         assert len(request.segment_hashes) >= num_sealed_segments
         new_segment_hashes = request.segment_hashes[num_cached_segments:]
@@ -499,14 +500,14 @@ class SemanticSegmentManager:
             segment_hash = new_segment_hashes[i]
 
             segment_hash_with_group_id = make_segment_hash_with_group_id(
-                segment_hash, kv_cache_group_id
+                segment_hash, self.kv_cache_group_id
             )
             segment.segment_hash = segment_hash_with_group_id
             self.cached_segments.insert(segment_hash_with_group_id, segment)
 
         # TODO(huanyu): record KV cache events
 
-    def free(self, request_id: str, kv_cache_group_id: int) -> None:
+    def free(self, request_id: str) -> None:
         """
         Release resources for a request.
 
@@ -519,8 +520,9 @@ class SemanticSegmentManager:
         actual eviction is handled separately by cache policy.
         """
         # Default to empty SemanticSegments in case request is freed before allocation
-        self.seal_segment(request_id, kv_cache_group_id)
+        self.seal_segment(request_id, self.kv_cache_group_id)
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
+        self.num_cached_segments.pop(request_id, None)
         
         for segment in reversed(segments):
             segment.ref_cnt -= 1
@@ -558,7 +560,7 @@ class SemanticSegmentManager:
 
         # Free all evictable segments to return blocks to the pool
         while self.free_segment_queue.num_free_segments > 0:
-            segment = self.free_segment_queue.popleft()
+            segment: SemanticSegment = self.free_segment_queue.popleft()  # type: ignore
             self._maybe_evict_cached_segment(segment)
             self.block_pool.free_blocks(reversed(segment.blocks))
 
@@ -605,9 +607,9 @@ class SemanticSegmentManager:
         max_length: int,
         kv_cache_group_ids: list[int],
         use_eagle: bool
-    ) -> tuple[list[SemanticSegment], ...]:
-        matched_segments: tuple[list[SemanticSegment], ...] = tuple(
-            [] for _ in range(len(kv_cache_group_ids))
+    ) -> tuple[SemanticSegments, ...]:
+        matched_segments: tuple[SemanticSegments, ...] = tuple(
+            SemanticSegments() for _ in range(len(kv_cache_group_ids))
         )
         
         current_length = 0

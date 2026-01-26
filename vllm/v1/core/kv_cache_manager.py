@@ -18,7 +18,6 @@ from vllm.v1.core.kv_cache_coordinator import (
 from vllm.v1.core.kv_cache_utils import (
     BuddyTreeBlock,
     KVCacheBlock,
-    SemanticSegment
 )
 from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegments
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -36,7 +35,7 @@ class KVCacheBlocks:
     structure from the Scheduler.
     """
 
-    blocks: tuple[Sequence[KVCacheBlock], ...]
+    blocks: tuple[Sequence[KVCacheBlock | BuddyTreeBlock], ...]
     """
     `blocks[i][j]` refers to the i-th kv_cache_group
     and the j-th block of tokens.We don't use block of
@@ -46,7 +45,7 @@ class KVCacheBlocks:
     kv_cache_groups in the future.
 
     Each single type KVCacheBlocks could be represented as:
-    - list[KVCacheBlock] for more than one KVCacheBlock
+    - list[KVCacheBlock | BuddyTreeBlock] for more than one KVCacheBlock
     - an empty tuple for requests without KVCacheBlock
       (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
     """
@@ -135,6 +134,8 @@ class MultiGroupSemanticSegments:
     @overload
     def get_block_ids(
         self,
+        min_block_size: int,
+        max_block_size: int,
         allow_none: Literal[True] = True,
     ) -> tuple[list[int], ...] | None: ...
 
@@ -217,33 +218,21 @@ class KVCacheManager:
                 self.block_size *= dcp_world_size * pcp_world_size
 
         self.enable_semantic_segment = enable_semantic_segment
+
+        self.coordinator = get_kv_cache_coordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.max_model_len,
+            use_eagle=self.use_eagle,
+            enable_caching=self.enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            enable_semantic_segment=enable_semantic_segment,
+            supported_block_sizes=supported_block_sizes,
+            eviction_policy=eviction_policy,
+        )
+        self.block_pool = self.coordinator.block_pool
         
-        if self.enable_semantic_segment:
-            self.coordinator: SemanticSegmentCoordinator = get_kv_cache_coordinator(
-                kv_cache_config=kv_cache_config,
-                max_model_len=self.max_model_len,
-                use_eagle=self.use_eagle,
-                enable_caching=self.enable_caching,
-                enable_kv_cache_events=enable_kv_cache_events,
-                dcp_world_size=dcp_world_size,
-                pcp_world_size=pcp_world_size,
-                enable_semantic_segment=enable_semantic_segment,
-                supported_block_sizes=supported_block_sizes,
-                eviction_policy=eviction_policy,
-            )
-            self.block_pool: BuddyBlockPool = self.coordinator.block_pool
-        else:
-            self.coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
-                kv_cache_config=kv_cache_config,
-                max_model_len=self.max_model_len,
-                use_eagle=self.use_eagle,
-                enable_caching=self.enable_caching,
-                enable_kv_cache_events=enable_kv_cache_events,
-                dcp_world_size=dcp_world_size,
-                pcp_world_size=pcp_world_size,
-                enable_semantic_segment=enable_semantic_segment,
-            )
-            self.block_pool: BlockPool = self.coordinator.block_pool
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.kv_cache_config = kv_cache_config
 
@@ -260,7 +249,7 @@ class KVCacheManager:
             # Pre-constructed empty segments, callers should use this to avoid
             # GC overhead.
             self.empty_kv_cache_segments = MultiGroupSemanticSegments(
-                tuple(() for _ in range(self.num_kv_cache_groups)))
+                tuple(SemanticSegments() for _ in range(self.num_kv_cache_groups)))
 
     @property
     def usage(self) -> float:
@@ -477,7 +466,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
-    def allocate_segments(
+    def allocate_segment(
         self,
         request: Request,
         num_new_tokens: int,
@@ -486,7 +475,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
-    ) -> MultiGroupSemanticSegments | None:
+    ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append (using semantic segments).
 
         Args:
@@ -500,7 +489,7 @@ class KVCacheManager:
             num_encoder_tokens: The number of encoder tokens.
         """
         if not isinstance(self.coordinator, SemanticSegmentCoordinator):
-             raise RuntimeError("allocate_segments called without SemanticSegmentCoordinator")
+             raise RuntimeError("allocate_segment called without SemanticSegmentCoordinator")
 
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
@@ -553,19 +542,13 @@ class KVCacheManager:
         )
 
         if not self.enable_caching or delay_cache_blocks:
-             return self.create_kv_cache_segments(
-                 self.coordinator.get_segments(request.request_id)
-             )
-
-        # Cache segments (Seal segments if applicable)
-        num_tokens_to_cache = min(
-            num_computed_tokens + num_new_tokens, request.num_tokens
+            return self.create_kv_cache_blocks(new_blocks)
+        
+        self.coordinator.cache_segments(
+            request, len(new_computed_segments_list[0])
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_segments(
-             self.coordinator.get_segments(request.request_id)
-        )
+        return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -587,7 +570,7 @@ class KVCacheManager:
             False otherwise.
         """
         if self.enable_semantic_segment:
-            if not self.coordinator.reset_prefix_cache():
+            if not self.coordinator.reset_prefix_cache():  # type: ignore
                 return False
         else:
             if not self.block_pool.reset_prefix_cache():
@@ -652,17 +635,20 @@ class KVCacheManager:
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
             
-    def cache_segments(self, request: Request, num_computed_tokens: int) -> None:
+    def cache_segments(self, request: Request, 
+                       num_computed_segments: int) -> None:
         """Cache the segments for the request, if enabled."""
         if self.enable_caching:
             if not isinstance(self.coordinator, SemanticSegmentCoordinator):
                 raise RuntimeError(
                     "cache_segments can only be called when "
                     "semantic segment caching is enabled.")
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+            self.coordinator.cache_segments(
+                request, num_computed_segments
+            )
 
     def create_kv_cache_blocks(
-        self, blocks: tuple[list[KVCacheBlock], ...]
+        self, blocks: tuple[Sequence[KVCacheBlock | BuddyTreeBlock], ...]
     ) -> KVCacheBlocks:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
