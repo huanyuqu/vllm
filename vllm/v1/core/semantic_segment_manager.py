@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, overload
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     replace_block_in_segment,
     swap_blocks,
 )
+from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -137,16 +138,18 @@ class SemanticSegments:
         """Remove and return the last segment."""
         return self.segments.pop()
 
-    def extend(self, segments: Sequence[SemanticSegment]) -> None:
+    def __iadd__(
+        self, other: "SemanticSegments | Sequence[SemanticSegment]"
+    ) -> "SemanticSegments":
         """Extend the collection with multiple segments."""
-        self.segments.extend(segments)
-        
-    def __getitem__(self, key):
-        """Support indexing and slicing: segment = semantic_segments[0] or segments = semantic_segments[1:3]"""
-        if isinstance(key, slice):
-            return SemanticSegments(self.segments[key])
+        if self.unsealed_segment is not None:
+             raise ValueError("Cannot extend segments when the last segment is unsealed.")
+
+        if isinstance(other, SemanticSegments):
+            self.segments.extend(other.segments)
         else:
-            return self.segments[key]
+            self.segments.extend(other)
+        return self
     
     @property
     def last_segment(self) -> Optional[SemanticSegment]:
@@ -175,7 +178,12 @@ class SemanticSegments:
     def __len__(self) -> int:
         return len(self.segments)
     
-    def __getitem__(self, key: slice | int):
+    @overload
+    def __getitem__(self, key: int) -> SemanticSegment: ...
+    @overload
+    def __getitem__(self, key: slice) -> "SemanticSegments": ...
+
+    def __getitem__(self, key: slice | int) -> "SemanticSegment | SemanticSegments":
         """
         Support indexing and slicing: 
         - segment = semantic_segments[0]
@@ -455,6 +463,48 @@ class SemanticSegmentManager:
         unsealed_segment.segment_hash = segment_hash_with_group_id
         self.cached_segments.insert(segment_hash_with_group_id, unsealed_segment)
         return
+    
+    def cache_segments(
+        self,
+        request: Request,
+        segments: SemanticSegments,
+        num_cached_segments: int,
+        num_sealed_segments: int,
+        kv_cache_group_id: int,
+    ) -> None:
+        """Cache full segments for prefix caching.
+
+        This method iterates through the segments of a request. For any sealed segment
+        that falls fully within the range of [num_cached_segments, num_sealed_segments], it ensures
+        the segment is inserted into the prefix cache.
+
+        Args:
+            request: The request to cache the segments.
+            segments: All segments in the request.
+            num_cached_segments: The number of segments that are already cached.
+            num_sealed_segments: The number of segments that are sealed and should be cached after this function.
+            kv_cache_group_id: The id of the KV cache group.
+        """
+        if num_cached_segments >= num_sealed_segments:
+            return
+        new_sealed_segments = segments[num_cached_segments:num_sealed_segments]
+        assert len(request.segment_hashes) >= num_sealed_segments
+        new_segment_hashes = request.segment_hashes[num_cached_segments:]
+
+        for i, segment in enumerate(new_sealed_segments):
+            assert segment.is_sealed, (
+                f"Segment {num_cached_segments + i} is not sealed."
+            )
+            assert segment.segment_hash is None
+            segment_hash = new_segment_hashes[i]
+
+            segment_hash_with_group_id = make_segment_hash_with_group_id(
+                segment_hash, kv_cache_group_id
+            )
+            segment.segment_hash = segment_hash_with_group_id
+            self.cached_segments.insert(segment_hash_with_group_id, segment)
+
+        # TODO(huanyu): record KV cache events
 
     def free(self, request_id: str, kv_cache_group_id: int) -> None:
         """
@@ -488,7 +538,7 @@ class SemanticSegmentManager:
             # ref_cnt=0 means this segment is in the free list (i.e. 
             # eviction candidate), so remove it.
             if segment.ref_cnt == 0:
-                self.free_segment_queue.remove(segment)
+                self.free_segment_queue.remove(segment)  # type: ignore
             segment.ref_cnt += 1
                 
     def reset_prefix_cache(self) -> bool:
@@ -702,7 +752,7 @@ class SemanticSegmentManager:
         self,
         request_id: str,
         num_tokens: int,
-        new_computed_segments: Sequence[SemanticSegment],
+        new_computed_segments: SemanticSegments,
     ) -> int:
         """
         Get the number of tokens needed to be allocated for the request.
@@ -737,7 +787,7 @@ class SemanticSegmentManager:
         return num_new_tokens + num_evictable_computed_tokens
     
     def save_new_computed_segments(
-        self, request_id: str, new_computed_segments: Sequence[SemanticSegment]
+        self, request_id: str, new_computed_segments: SemanticSegments
     ) -> None:
         """
         Add the new computed segments to the request.
@@ -748,8 +798,8 @@ class SemanticSegmentManager:
                 prefix cache.
         """
         segments = self.req_to_segments[request_id]
-        segments.extend(new_computed_segments)
+        segments += new_computed_segments
 
 
     def get_num_free_tokens(self) -> int:
-        pass
+        return 0
