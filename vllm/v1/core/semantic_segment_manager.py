@@ -247,6 +247,7 @@ class SemanticSegmentManager:
         # This queue records the segments with ref_cnt = 0
         # All segments in this queue must in self.cached_segments
         self.free_segment_queue = FreeKVCacheBlockQueue([])
+        self.num_free_segment_tokens = 0
 
         self.kv_cache_group_id = kv_cache_group_id
         self.num_cached_segments: dict[str, int] = {}
@@ -274,6 +275,7 @@ class SemanticSegmentManager:
             while (remaining > freed_capacity and 
                 self.free_segment_queue.num_free_segments > 0):
                 segment: SemanticSegment = self.free_segment_queue.popleft()
+                self.num_free_segment_tokens -= segment.capacity
                 self._maybe_evict_cached_segment(segment)
                 segment.unseal()
                 freed_capacity += segment.capacity
@@ -528,6 +530,7 @@ class SemanticSegmentManager:
             segment.ref_cnt -= 1
             if segment.ref_cnt == 0:
                 self.free_segment_queue.append(segment)  # type: ignore
+                self.num_free_segment_tokens += segment.capacity
                 
     def touch(self, segments: SemanticSegments) -> None:
         """
@@ -541,6 +544,7 @@ class SemanticSegmentManager:
             # eviction candidate), so remove it.
             if segment.ref_cnt == 0:
                 self.free_segment_queue.remove(segment)  # type: ignore
+                self.num_free_segment_tokens -= segment.capacity
             segment.ref_cnt += 1
                 
     def reset_prefix_cache(self) -> bool:
@@ -561,6 +565,7 @@ class SemanticSegmentManager:
         # Free all evictable segments to return blocks to the pool
         while self.free_segment_queue.num_free_segments > 0:
             segment: SemanticSegment = self.free_segment_queue.popleft()  # type: ignore
+            self.num_free_segment_tokens -= segment.capacity
             self._maybe_evict_cached_segment(segment)
             self.block_pool.free_blocks(reversed(segment.blocks))
 
@@ -769,7 +774,7 @@ class SemanticSegmentManager:
         Returns:
             The number of tokens.
         """
-        # Calculate total existing blocks for the request
+        # Calculate total existing tokens for the request
         segments = self.req_to_segments.get(request_id, SemanticSegments())
         num_allocated_tokens = segments.capacity
 
@@ -802,6 +807,6 @@ class SemanticSegmentManager:
         segments = self.req_to_segments[request_id]
         segments += new_computed_segments
 
-
     def get_num_free_tokens(self) -> int:
-        return 0
+        return (self.block_pool.get_num_free_tokens() + 
+                self.num_free_segment_tokens)

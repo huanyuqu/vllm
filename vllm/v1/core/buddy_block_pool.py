@@ -395,10 +395,30 @@ class BuddyBlockPool:
         """
         coord = (block_id, size, relative_id)
         if coord in self._blocks:
-            self._blocks[coord].num_tokens = num_tokens_used
-            self.num_free_tokens -= ((num_tokens_used + self.min_block_size - 1) // self.min_block_size) * self.min_block_size
+            block = self._blocks[coord]
+            old_cost = self._get_block_cost(block)
+            block.num_tokens = num_tokens_used
+            new_cost = self._get_block_cost(block)
+            self.num_free_tokens -= (new_cost - old_cost)
         else:
             raise KeyError(f"Block {coord} not found")
+
+    def _get_block_cost(self, block: BuddyTreeBlock) -> int:
+        """
+        Calculate the cost of an allocated block in terms of tokens.
+        
+        The cost is the aligned usage of the block, with a minimum of one atomic unit.
+        We assume that any allocated block consumes at least min_block_size tokens.
+        """
+        if block.num_tokens == 0:
+            return self.min_block_size
+        
+        # Calculate aligned usage
+        # e.g. if min_block_size=16, num_tokens=1 -> 16
+        # num_tokens=17 -> 32
+        aligned_usage = ((block.num_tokens + self.min_block_size - 1) // 
+                        self.min_block_size) * self.min_block_size
+        return max(aligned_usage, self.min_block_size)
 
     def _allocate_largest_blocks(self, num_tokens: int):
         """
@@ -462,6 +482,10 @@ class BuddyBlockPool:
         slab = self.slabs[size]
         if slab.num_free_blocks > 0:
             block: BuddyTreeBlock = slab.popleft()  # type: ignore
+            # When we allocate a block, we only subtract the minimum necessary capacity
+            # (atomic unit) from free tokens. The remaining capacity in the block
+            # is considered "potentially reclaimable" and thus conceptually free.
+            self.num_free_tokens -= self.min_block_size
             block = self._try_merge(block)
             self.allocated_blocks[block.size].add(block)
             return block
@@ -698,6 +722,8 @@ class BuddyBlockPool:
                 # If ref_cnt is 0, the block is in the free list
                 if block.ref_cnt == 0:
                     self.slabs[block.size].remove(block)
+                    # Block moves from free to allocated
+                    self.num_free_tokens -= block.size
                 block.ref_cnt += 1
     
     def free_blocks(self, ordered_blocks: Iterable[BuddyTreeBlock]) -> None:
@@ -724,6 +750,7 @@ class BuddyBlockPool:
                 continue
 
             self.allocated_blocks[size].discard(block)
+            self.num_free_tokens += block.size            
             block.num_tokens = 0
             self.slabs[block.size].append(block)
     
