@@ -15,6 +15,9 @@ from vllm.v1.kv_cache_interface import (
 from tests.v1.core.utils import create_requests
 from vllm.v1.structured_output import StructuredOutputManager
 
+pytestmark = pytest.mark.cpu_test
+
+
 def test_schedule_semantic_segments():
     block_size = 16
     supported_block_sizes = [16, 32, 64]
@@ -42,7 +45,7 @@ def test_schedule_semantic_segments():
         cache_dtype="auto",
         enable_semantic_segment=True,
         semantic_supported_block_sizes=supported_block_sizes,
-        semantic_eviction_policy="lru",
+        semantic_eviction_policy="tight",
     )
     cache_config.num_gpu_blocks = 1000
 
@@ -71,17 +74,9 @@ def test_schedule_semantic_segments():
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
-
-    # Create a request that requires multiple blocks
-    # Length=100. supported_sizes=[16, 32, 64].
-    # Decomposition depends on allocator implementation, but likely 64 + 32 + 4 (round up to 16) -> 64+32+16?
-    # Or 64 + 16 + 16 + 4?
-    # Regardless, we expect `block_ids` to be fully populated with atomic IDs.
-    # 100 tokens. min block size 16. ceil(100/16) * 16 = 7 * 16 = 112 tokens capacity minimum.
-    # So we expect 7 atomic blocks (IDs).
     
     num_tokens = 100
-    expected_num_atomic_blocks = (num_tokens + block_size - 1) // block_size # 7
+    expected_num_atomic_blocks = (num_tokens + block_size - 1) // block_size  # 7
     
     reqs = create_requests(num_requests=1, num_tokens=num_tokens, block_size=block_size)
     for req in reqs:
