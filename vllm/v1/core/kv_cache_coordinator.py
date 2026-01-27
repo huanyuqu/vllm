@@ -588,6 +588,20 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
             for manager in self.single_type_managers
         )
 
+    def get_blocks(self, request_id: str) -> tuple[list[BuddyTreeBlock], ...]:
+        """
+        Get the blocks for the request.
+        """
+        blocks_list = []
+        for manager in self.single_type_managers:
+            segments = manager.req_to_segments.get(request_id)
+            manager_blocks = []
+            if segments:
+                for segment in segments:
+                    manager_blocks.extend(segment.blocks)
+            blocks_list.append(manager_blocks)
+        return tuple(blocks_list)
+
     def cache_segments(self, request: Request, 
                        num_segments: int) -> None:
         """
