@@ -375,6 +375,12 @@ class KVCacheManager:
 
         return self.create_kv_cache_segments(computed), num_new_computed_tokens
 
+    def update_block_usage(self, request: Request, num_computed_tokens: int) -> None:
+        """Update the block usage for the request."""
+        if self.enable_semantic_segment:
+            assert isinstance(self.coordinator, SemanticSegmentCoordinator)
+            self.coordinator.update_block_usage(request.request_id, num_computed_tokens)
+
     def allocate_slots(
         self,
         request: Request,

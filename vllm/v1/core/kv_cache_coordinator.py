@@ -566,6 +566,13 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
                 request_id, new_computed_segments[i]
             )
 
+    def update_block_usage(self, request_id: str, num_computed_tokens: int) -> None:
+        """
+        Update the block usage for the request.
+        """
+        for manager in self.single_type_managers:
+            manager.update_block_usage(request_id, num_computed_tokens)
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_encoder_tokens: int = 0
     ) -> tuple[list[BuddyTreeBlock], ...]:

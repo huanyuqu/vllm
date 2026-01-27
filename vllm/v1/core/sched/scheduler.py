@@ -1238,6 +1238,10 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+        
+        # Update KV cache block usage to reflect actual tokens stored
+        self.kv_cache_manager.update_block_usage(request, request.num_computed_tokens)
+
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:

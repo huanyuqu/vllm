@@ -218,6 +218,18 @@ class EvictionPolicy(Enum):
     OVERPROVISION = 1
 
 
+@dataclass
+class ActiveBlockCursor:
+    """
+    Cursor to track the active block being filled in a segment.
+    """
+    segment_id: int
+    block: BuddyTreeBlock
+    block_offset_in_segment: int
+    # The total number of tokens computed in previous segments.
+    # This helps avoid iterating over previous segments to calculate offset.
+    computed_tokens_base: int
+
 # TODO(huanyu): record KV events
 class SemanticSegmentManager:
     """
@@ -241,6 +253,9 @@ class SemanticSegmentManager:
         # The last segment might be unsealed (is_sealed=False)
         self.req_to_segments: dict[str, SemanticSegments] = defaultdict(SemanticSegments)
         
+        # request_id -> active block cursor for O(1) update
+        self.req_cursors: dict[str, ActiveBlockCursor] = {}
+        
         # Prefix cache: hash -> SemanticSegment
         self.cached_segments = SegmentHashToSegmentMap()
         
@@ -252,6 +267,79 @@ class SemanticSegmentManager:
         self.kv_cache_group_id = kv_cache_group_id
         self.num_cached_segments: dict[str, int] = {}
         
+    def update_block_usage(
+        self, request_id: str, 
+        num_computed_tokens: int
+    ) -> None:
+        """
+        Update the block usage for the request.
+        
+        Args:
+            request_id: The request ID.
+            num_computed_tokens: The total number of tokens computed for the request.
+        """
+        segments = self.req_to_segments[request_id]
+        unsealed_segment = segments.unsealed_segment
+        if not unsealed_segment:
+            return
+
+        # Find the active block
+        cursor = self.req_cursors.get(request_id)
+        
+        # Check if cursor is valid for current unsealed segment
+        if cursor is not None and cursor.segment_id == unsealed_segment.segment_id:
+             current_offset = cursor.computed_tokens_base
+             current_block = cursor.block
+             current_block_offset = cursor.block_offset_in_segment
+        else:
+             # Initialize cursor or re-calculate base offset if segment changed
+             current_offset = 0
+             for segment in segments:
+                 if segment is unsealed_segment:
+                     break
+                 current_offset += segment.capacity
+             
+             current_block = unsealed_segment.head
+             current_block_offset = 0
+
+        tokens_remaining = num_computed_tokens - current_offset
+        if tokens_remaining < 0:
+            # Should not happen
+            return
+            
+        # Traverse forward to find the block containing tokens_remaining
+        while current_block:
+            block_end = current_block_offset + current_block.size
+            
+            # Check if this block is the one being filled or just filled
+            if tokens_remaining <= block_end:
+                usage = max(0, tokens_remaining - current_block_offset)
+                
+                if current_block.num_tokens != usage:
+                    self.block_pool.update_block_usage(
+                        current_block.block_id, current_block.size, 
+                        current_block.relative_id, usage
+                    )
+                
+                # Update cursor
+                self.req_cursors[request_id] = ActiveBlockCursor(
+                    unsealed_segment.segment_id, 
+                    current_block, 
+                    current_block_offset,
+                    current_offset
+                )
+                return
+            
+            # This block is fully used, mark it as full if needed
+            if current_block.num_tokens != current_block.size:
+                self.block_pool.update_block_usage(
+                    current_block.block_id, current_block.size, 
+                    current_block.relative_id, current_block.size
+                )
+            
+            current_block_offset += current_block.size
+            current_block = current_block.next_block
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int
     ) -> list[BuddyTreeBlock]:
@@ -524,6 +612,7 @@ class SemanticSegmentManager:
         # Default to empty SemanticSegments in case request is freed before allocation
         self.seal_segment(request_id, self.kv_cache_group_id)
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
+        self.req_cursors.pop(request_id, None)
         self.num_cached_segments.pop(request_id, None)
         
         for segment in reversed(segments):
