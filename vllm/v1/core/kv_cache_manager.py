@@ -63,17 +63,23 @@ class KVCacheBlocks:
     def get_block_ids(
         self,
         allow_none: Literal[False] = False,
+        min_block_size: int | None = None,
+        max_block_size: int | None = None,
     ) -> tuple[list[int], ...]: ...
 
     @overload
     def get_block_ids(
         self,
         allow_none: Literal[True] = True,
+        min_block_size: int | None = None,
+        max_block_size: int | None = None,
     ) -> tuple[list[int], ...] | None: ...
 
     def get_block_ids(
         self,
         allow_none: bool = False,
+        min_block_size: int | None = None,
+        max_block_size: int | None = None,
     ) -> tuple[list[int], ...] | None:
         """
         Converts the KVCacheBlocks instance to block_ids.
@@ -86,6 +92,26 @@ class KVCacheBlocks:
         """
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
+        
+        if min_block_size is not None and max_block_size is not None:
+            block_ids: list[list[int]] = []
+            for group in self.blocks:
+                ids = []
+                for blk in group:
+                    if isinstance(blk, BuddyTreeBlock):
+                        # Convert variable-sized block to atomic block IDs
+                        start_addr = (blk.block_id * max_block_size + 
+                                      blk.relative_id * blk.size)
+                        start_id = start_addr // min_block_size
+                        num_atoms = blk.size // min_block_size
+                        ids.extend(
+                            [start_id + i for i in range(num_atoms)]
+                        )
+                    else:
+                        ids.append(blk.block_id)
+                block_ids.append(ids)
+            return tuple(block_ids)
+
         return tuple([blk.block_id for blk in group] for group in self.blocks)
 
     def get_unhashed_block_ids(self) -> list[int]:

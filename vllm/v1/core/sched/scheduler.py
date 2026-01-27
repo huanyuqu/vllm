@@ -28,6 +28,7 @@ from vllm.v1.core.encoder_cache_manager import (
     compute_encoder_budget,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.semantic_segment_manager import EvictionPolicy
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -185,6 +186,10 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
+            enable_semantic_segment=self.cache_config.enable_semantic_segment,
+            supported_block_sizes=self.cache_config.semantic_supported_block_sizes,
+            eviction_policy=EvictionPolicy[
+                self.cache_config.semantic_eviction_policy.upper()],
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
@@ -277,11 +282,18 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
+                    if self.cache_config.enable_semantic_segment:
+                        new_blocks = self.kv_cache_manager.allocate_segment(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
+                    else:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
@@ -448,9 +460,16 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    if self.cache_config.enable_semantic_segment:
+                        new_computed_segments, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_segments(request)
+                        )
+                        new_computed_blocks = None
+                    else:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(request)
+                        )
+                        new_computed_segments = None
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -477,7 +496,12 @@ class Scheduler(SchedulerInterface):
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
-                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    if self.cache_config.enable_semantic_segment:
+                        new_computed_segments = self.kv_cache_manager.empty_kv_cache_segments
+                        new_computed_blocks = None
+                    else:
+                        new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                        new_computed_segments = None
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
@@ -550,15 +574,26 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                if self.cache_config.enable_semantic_segment:
+                    new_blocks = self.kv_cache_manager.allocate_segment(
+                        request,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_segments,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
+                else: 
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -569,11 +604,15 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
-                    self.connector.update_state_after_alloc(
-                        request,
-                        new_computed_blocks + new_blocks,
-                        num_external_computed_tokens,
-                    )
+                    if self.cache_config.enable_semantic_segment:
+                         # TODO(huanyu): Support KVTransfer with Semantic Segments
+                         raise NotImplementedError("KVTransfer with Semantic Segments is not supported yet.")
+                    else:
+                        self.connector.update_state_after_alloc(
+                            request,
+                            new_computed_blocks + new_blocks,
+                            num_external_computed_tokens,
+                        )
                     self._update_connector_prefix_cache_stats(
                         request, num_external_computed_tokens
                     )
@@ -784,9 +823,20 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if self.cache_config.enable_semantic_segment:
+                min_block_size = min(self.cache_config.semantic_supported_block_sizes)
+                max_block_size = max(self.cache_config.semantic_supported_block_sizes)
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(
+                        allow_none=True,
+                        min_block_size=min_block_size,
+                        max_block_size=max_block_size
+                    )
+                )
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
