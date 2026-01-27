@@ -32,6 +32,7 @@ CacheDType = Literal[
 MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+SemanticEvictionPolicy = Literal["tight", "overprovision"]
 
 
 @config
@@ -75,6 +76,13 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool | None = None
     """Whether to enable prefix caching. Enabled by default for V1."""
+    enable_semantic_segment: bool = False
+    """Whether to enable semantic segment based caching. This is an experimental
+    feature and disabled by default."""
+    semantic_eviction_policy: SemanticEvictionPolicy = "tight"
+    """The eviction policy for semantic segment caching."""
+    semantic_supported_block_sizes: list[int] | None = None
+    """The supported block sizes for semantic segment caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
     - "sha256" uses Pickle for object serialization before hashing.\n
