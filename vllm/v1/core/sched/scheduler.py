@@ -697,12 +697,25 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Construct the scheduler output.
-        new_reqs_data = [
-            NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
-            )
-            for req in scheduled_new_reqs
-        ]
+        if self.cache_config.enable_semantic_segment:
+            min_block_size = min(self.cache_config.semantic_supported_block_sizes)
+            max_block_size = max(self.cache_config.semantic_supported_block_sizes)
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req, req_to_new_blocks[req.request_id].get_block_ids(
+                        min_block_size=min_block_size,
+                        max_block_size=max_block_size,
+                    )
+                )
+                for req in scheduled_new_reqs
+            ]
+        else:
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                )
+                for req in scheduled_new_reqs
+            ]
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
