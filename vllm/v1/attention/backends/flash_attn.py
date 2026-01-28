@@ -191,6 +191,11 @@ class FlashAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
 
+    # For semantic segment attention
+    segment_pointers: torch.Tensor | None = None
+    segment_lens: torch.Tensor | None = None
+    num_segments: torch.Tensor | None = None
+
     causal: bool = True
 
 
@@ -465,6 +470,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
+            segment_pointers=common_attn_metadata.segment_pointers,
+            segment_lens=common_attn_metadata.segment_lens,
+            num_segments=common_attn_metadata.num_segments,
             causal=causal,
         )
         return attn_metadata
@@ -635,6 +643,187 @@ class FlashAttentionImpl(AttentionImpl):
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+
+        if attn_metadata.num_segments is not None:
+            # Segmented attention logic
+            # 1. Initialize accumulators
+            # output is already allocated, we use it as accumulator.
+            # But we need to initialize it to 0 if we are summing, but merge_attn_states
+            # essentially does a weighted sum based on softmax.
+            # We need an LSE accumulator.
+            # Shape: [num_actual_tokens, num_heads]
+            accum_lse = torch.empty(
+                (num_actual_tokens, self.num_heads),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            accum_lse.fill_(float("-inf"))
+            
+            # We also need a temp buffer for intermediate output to merge
+            temp_output = torch.empty_like(output)
+            
+            # 2. Iterate over sealed segments
+            # We need to map linear segment index to request index
+            num_segments_cpu = attn_metadata.num_segments.cpu()
+            segment_pointers = attn_metadata.segment_pointers
+            segment_lens = attn_metadata.segment_lens
+            
+            # Prepare flattened KV cache for slicing
+            # kv_cache: [2, num_blocks, block_size, num_kv_heads, head_size]
+            # Flatten to [total_elements, num_kv_heads, head_size]
+            # stride of block_id is block_size * num_kv_heads * head_size
+            # We flatten the first 3 dims (2 is separate, handled by key_cache/value_cache split)
+            
+            # key_cache and value_cache are already split from kv_cache(0)
+            # key_cache: [num_blocks, block_size, num_kv_heads, head_size]
+            # flatten to [-1, num_kv_heads, head_size]
+            k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
+            v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
+            
+            seg_idx = 0
+            for req_idx in range(attn_metadata.num_reqs):
+                num_segs = num_segments_cpu[req_idx].item()
+                if num_segs == 0:
+                    continue
+                    
+                # Get query for this request
+                q_start = attn_metadata.query_start_loc[req_idx].item()
+                q_end = attn_metadata.query_start_loc[req_idx + 1].item()
+                q_len = q_end - q_start
+                q_sub = query[q_start:q_end]
+                
+                # Prepare cu_seqlens_q for this single request
+                cu_seqlens_q_sub = torch.tensor([0, q_len], dtype=torch.int32, device=self.device)
+                max_seqlen_q_sub = q_len
+                
+                # Slice accumulators
+                out_sub = output[q_start:q_end]
+                lse_sub = accum_lse[q_start:q_end]
+                temp_out_sub = temp_output[q_start:q_end]
+                
+                for _ in range(num_segs):
+                    start_idx = segment_pointers[seg_idx].item()
+                    seg_len = segment_lens[seg_idx].item()
+                    seg_idx += 1
+                    
+                    k_seg = k_flat[start_idx : start_idx + seg_len]
+                    v_seg = v_flat[start_idx : start_idx + seg_len]
+                    
+                    # Run FA on this segment
+                    # cu_seqlens_k is [0, seg_len]
+                    # We can pass None for cu_seqlens_k if we use flash_attn_func? 
+                    # No, we use varlen.
+                    cu_seqlens_k_sub = torch.tensor([0, seg_len], dtype=torch.int32, device=self.device)
+                    
+                    cur_out, cur_lse = flash_attn_varlen_func(
+                        q=q_sub,
+                        k=k_seg,
+                        v=v_seg,
+                        out=temp_out_sub, # Write to temp
+                        cu_seqlens_q=cu_seqlens_q_sub,
+                        max_seqlen_q=max_seqlen_q_sub,
+                        cu_seqlens_k=cu_seqlens_k_sub,
+                        max_seqlen_k=seg_len,
+                        softmax_scale=self.scale,
+                        causal=False, # Sealed segments are fully visible prefix
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=(-1, -1), # Full attention on segment
+                        softcap=self.logits_soft_cap,
+                        return_softmax_lse=True,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand((1, self.num_kv_heads)) if layer._q_scale is not None else None, # Simplified
+                        k_descale=layer._k_scale.expand((1, self.num_kv_heads)) if layer._k_scale is not None else None,
+                        v_descale=layer._v_scale.expand((1, self.num_kv_heads)) if layer._v_scale is not None else None,
+                    )
+                    
+                    # Merge into accumulator
+                    # FA returns LSE [heads, batch], merge needs [batch, heads]
+                    # Since batch=1 (tokens), shape is [heads, q_len] -> [q_len, heads]
+                    cur_lse = cur_lse.transpose(0, 1).contiguous()
+                    
+                    # On first merge, we need to handle -inf in accumulator?
+                    # merge_attn_states handles it correctly.
+                    merge_attn_states(
+                        out_sub, # Accumulator
+                        out_sub,
+                        lse_sub,
+                        cur_out,
+                        cur_lse,
+                        lse_sub # Output LSE
+                    )
+
+            # 3. Paged Attention for Unsealed
+            # We need to mask out sealed blocks from block_table
+            # block_table: [num_reqs, max_blocks]
+            # For each req, compute num_sealed_blocks
+            # Mask them to -1
+            
+            # Need to copy block_table to avoid modifying original
+            block_table_mod = attn_metadata.block_table.clone()
+            
+            # How many tokens are sealed?
+            # We can compute cumulative length of sealed segments per request
+            # But calculating this on GPU/CPU sync might be slow.
+            # Optimization: Pre-calculate this in MetadataBuilder?
+            # For now, do it here.
+            
+            # Reset seg_idx to iterate again
+            seg_idx = 0
+            for req_idx in range(attn_metadata.num_reqs):
+                num_segs = num_segments_cpu[req_idx].item()
+                sealed_tokens = 0
+                for _ in range(num_segs):
+                    sealed_tokens += segment_lens[seg_idx].item()
+                    seg_idx += 1
+                
+                if sealed_tokens > 0:
+                    # Assuming block alignment
+                    # block_size = self.block_size? No, use k_cache shape
+                    blk_size = key_cache.shape[1] 
+                    num_sealed_blocks = sealed_tokens // blk_size
+                    if num_sealed_blocks > 0:
+                        block_table_mod[req_idx, :num_sealed_blocks] = -1
+
+            # Run Paged Attention with modified block table
+            paged_out, paged_lse = flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=temp_output[:num_actual_tokens], # Use temp
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens, # This includes all tokens? Yes.
+                # But we masked blocks, so effective K is reduced.
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=self.sliding_window,
+                block_table=block_table_mod,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
+            
+            paged_lse = paged_lse.transpose(0, 1).contiguous()
+            
+            # Merge Paged result into Accumulator
+            merge_attn_states(
+                output[:num_actual_tokens],
+                output[:num_actual_tokens],
+                accum_lse,
+                paged_out,
+                paged_lse,
+                accum_lse # Update LSE? Not needed anymore as this is final
+            )
+            
+            return output
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

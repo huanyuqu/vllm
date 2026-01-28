@@ -111,6 +111,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.core.kv_cache_manager import MultiGroupSemanticSegments
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -669,6 +670,36 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _apply_semantic_segment_memory_ops(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        # Execute semantic segment memory moves and swaps
+        if scheduler_output.semantic_segment_moves:
+            for (
+                group_id,
+                src_addr,
+                dst_addr,
+                size,
+            ) in scheduler_output.semantic_segment_moves:
+                if group_id < len(self.kv_caches):
+                    kv_cache = self.kv_caches[group_id]
+                    # View as flat buffer [total_tokens, num_heads, head_size]
+                    flat_cache = kv_cache.view(-1, *kv_cache.shape[2:])
+                    flat_cache[dst_addr : dst_addr + size].copy_(
+                        flat_cache[src_addr : src_addr + size]
+                    )
+
+        if scheduler_output.semantic_segment_swaps:
+            for group_id, addr1, addr2, size in scheduler_output.semantic_segment_swaps:
+                if group_id < len(self.kv_caches):
+                    kv_cache = self.kv_caches[group_id]
+                    flat_cache = kv_cache.view(-1, *kv_cache.shape[2:])
+                    temp = flat_cache[addr1 : addr1 + size].clone()
+                    flat_cache[addr1 : addr1 + size].copy_(
+                        flat_cache[addr2 : addr2 + size]
+                    )
+                    flat_cache[addr2 : addr2 + size].copy_(temp)
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -747,6 +778,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                semantic_segments=new_req_data.semantic_segments,
             )
             self.requests[req_id] = req_state
 
@@ -825,6 +857,10 @@ class GPUModelRunner(
                     )
                     self.input_batch.num_tokens[req_index] = end_idx
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+
+            # Update semantic segments
+            if req_data.semantic_segments is not None:
+                req_state.semantic_segments = req_data.semantic_segments.get(req_id)
 
             # Update the block IDs.
             if not resumed_from_preemption:
@@ -1480,6 +1516,52 @@ class GPUModelRunner(
         for kv_cache_gid, kv_cache_group in enumerate(
             self.kv_cache_config.kv_cache_groups
         ):
+            segment_pointers: torch.Tensor | None = None
+            segment_lens: torch.Tensor | None = None
+            num_segments: torch.Tensor | None = None
+
+            if self.cache_config.enable_semantic_segment:
+                segment_pointers_list = []
+                segment_lens_list = []
+                num_segments_list = []
+                
+                for i in range(num_reqs):
+                    req_id = self.input_batch.req_ids[i]
+                    req_state = self.requests[req_id]
+                    
+                    segments_obj = req_state.semantic_segments
+                    num_segs = 0
+                    
+                    if segments_obj is not None and kv_cache_gid < len(segments_obj.multi_group_segments):
+                        group_segments = segments_obj.multi_group_segments[kv_cache_gid]
+                        for segment in group_segments:
+                            if segment.is_sealed and segment.is_consolidated:
+                                # Optimized path for consolidated segments:
+                                # They are contiguous in memory, so we can directly calculate
+                                # the start address and length without iterating over blocks.
+                                if segment.head is not None:
+                                    max_block_size = max(self.cache_config.semantic_supported_block_sizes)
+                                    
+                                    start_token_idx = segment.head.block_id * max_block_size
+                                    start_token_idx += segment.head.relative_id * segment.head.size
+                                    
+                                    # Use segment.length to get the number of valid tokens.
+                                    length = segment.capacity
+                                    
+                                    segment_pointers_list.append(start_token_idx)
+                                    segment_lens_list.append(length)
+                                    num_segs += 1
+                            # If not sealed or not consolidated, we skip adding it to segment_pointers.
+                            # These segments will be handled by the paged attention mechanism
+                            # using the block table, which already contains all blocks for the request.
+                    
+                    num_segments_list.append(num_segs)
+
+                if segment_pointers_list:
+                    segment_pointers = torch.tensor(segment_pointers_list, dtype=torch.int64, device=self.device)
+                    segment_lens = torch.tensor(segment_lens_list, dtype=torch.int32, device=self.device)
+                    num_segments = torch.tensor(num_segments_list, dtype=torch.int32, device=self.device)
+
             encoder_seq_lens = self._get_encoder_seq_lens(
                 scheduled_encoder_inputs or {},
                 kv_cache_group.kv_cache_spec,
@@ -1526,6 +1608,9 @@ class GPUModelRunner(
                 encoder_seq_lens=encoder_seq_lens,
                 dcp_local_seq_lens=dcp_local_seq_lens,
                 dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
+                segment_pointers=segment_pointers,
+                segment_lens=segment_lens,
+                num_segments=num_segments,
             )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
@@ -2677,6 +2762,7 @@ class GPUModelRunner(
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                self._apply_semantic_segment_memory_ops(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(

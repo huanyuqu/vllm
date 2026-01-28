@@ -293,6 +293,14 @@ class EngineCore:
 
         self.scheduler.add_request(request)
 
+    def seal(self, request_id: str) -> None:
+        """Seal the current semantic segment."""
+        self.scheduler.seal_segment(request_id)
+
+    def consolidate_memory(self, request_id: str) -> None:
+        """Consolidate the memory of the sealed segments for the request."""
+        self.scheduler.consolidate_segment_memory(request_id)
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -527,6 +535,12 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+
+    def seal(self, request_id: str) -> None:
+        self.scheduler.seal_segment(request_id)
+
+    def consolidate_memory(self, request_id: str) -> None:
+        self.scheduler.consolidate_segment_memory(request_id)
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.

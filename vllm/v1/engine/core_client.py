@@ -190,6 +190,12 @@ class EngineCoreClient(ABC):
         running state."""
         raise NotImplementedError
 
+    def seal(self, request_id: str) -> None:
+        raise NotImplementedError
+
+    def consolidate_memory(self, request_id: str) -> None:
+        raise NotImplementedError
+
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         raise NotImplementedError
 
@@ -277,6 +283,12 @@ class InprocClient(EngineCoreClient):
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def seal(self, request_id: str) -> None:
+        self.engine_core.seal(request_id)
+
+    def consolidate_memory(self, request_id: str) -> None:
+        self.engine_core.consolidate_memory(request_id)
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()

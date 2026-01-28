@@ -242,11 +242,13 @@ class SemanticSegmentManager:
     4. Managing reference counts for segments.
     """
 
-    def __init__(self, block_pool: BuddyBlockPool,
-                 kv_cache_group_id: int, 
-                 eviction_policy: EvictionPolicy = EvictionPolicy.TIGHT):
+    def __init__(
+        self,
+        block_pool: BuddyBlockPool,
+        kv_cache_group_id: int,
+        eviction_policy: EvictionPolicy = EvictionPolicy.TIGHT,
+    ):
         self.block_pool = block_pool
-        
         self.eviction_policy = eviction_policy
         
         # request_id -> semantic segments used by this request
@@ -267,6 +269,56 @@ class SemanticSegmentManager:
         self.kv_cache_group_id = kv_cache_group_id
         self.num_cached_segments: dict[str, int] = {}
         
+        self.pending_moves: list[tuple[int, int, int, int]] = [] # list of (group_id, src_addr, dst_addr, size)
+        self.pending_swaps: list[tuple[int, int, int, int]] = [] # list of (group_id, addr1, addr2, size)
+        self.blocks_to_free_later: list[BuddyTreeBlock] = [] # blocks to be freed after current moves are executed
+        self.blocks_being_moved: list[BuddyTreeBlock] = [] # blocks currently being moved by the worker
+
+    def get_pending_moves(self) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+        """Get and clear pending moves."""
+        moves = self.pending_moves
+        swaps = self.pending_swaps
+        self.pending_moves = []
+        self.pending_swaps = []
+        
+        # Free blocks that were pending free from PREVIOUS step
+        # These blocks have been moved by the worker in the previous step,
+        # so it is safe to free them now.
+        if self.blocks_being_moved:
+            self.block_pool.free_blocks(self.blocks_being_moved)
+            self.blocks_being_moved = []
+            
+        # Move current blocks to be freed to the next step
+        self.blocks_being_moved = self.blocks_to_free_later
+        self.blocks_to_free_later = []
+            
+        return moves, swaps
+
+    def consolidate_segment_memory(self, request_id: str) -> None:
+        """Consolidate the memory of the sealed segments for the request."""
+        segments = self.req_to_segments[request_id]
+        
+        for segment in segments:
+            if segment.is_sealed and len(segment.blocks) > 1 and not segment.is_consolidated:
+                result = SemanticSegmentManager._consolidate_segment_memory(segment, self.block_pool)
+                if result:
+                    moves, swaps = result
+                    
+                    # Process moves
+                    for src_block, dst_block in moves:
+                        src_addr = self.block_pool.calculate_address(src_block)
+                        dst_addr = self.block_pool.calculate_address(dst_block)
+                        self.pending_moves.append((self.kv_cache_group_id, src_addr, dst_addr, src_block.size))
+                        self.blocks_to_free_later.append(src_block)
+                        
+                    # Process swaps
+                    for block1, block2 in swaps:
+                        addr1 = self.block_pool.calculate_address(block1)
+                        addr2 = self.block_pool.calculate_address(block2)
+                        self.pending_swaps.append((self.kv_cache_group_id, addr1, addr2, block1.size))
+                
+                segment.is_consolidated = True
+
     def update_block_usage(
         self, request_id: str, 
         num_computed_tokens: int
@@ -414,100 +466,8 @@ class SemanticSegmentManager:
 
         return True
 
-    # def seal_segment(
-    #     self, request: Request, kv_cache_group_id: int
-    # ) -> None:
-    #     """
-    #     Seal the unsealed segment for a request by processing its blocks.
-        
-    #     For each block in the unsealed segment:
-    #     - If the block is sealed, reuse the existing sealed segment and increment its ref_cnt.
-    #     - If the block is unsealed, group consecutive blocks with the same ref_cnt into a new segment,
-    #       seal it, compute its hash, and insert it into the cache.
-        
-    #     Extend the request's segment list with the processed segments.
-    #     """
-    #     request_id = request.request_id
-    #     segments = self.req_to_segments[request_id]
-    #     unsealed_segment = segments.unsealed_segment
-    #     if not unsealed_segment:
-    #         logger.debug(f"Request {request_id} has no unsealed segment to seal.")
-    #         return
-        
-    #     blocks = unsealed_segment.blocks
-    #     if not blocks:
-    #         raise ValueError(f"Cannot seal segment for request {request_id}: "
-    #                          f"no blocks in unsealed segment.")
-
-
-    #     new_segments_list = []
-    #     current_idx = 0
-        
-    #     while current_idx < len(blocks):
-    #         current_block = blocks[current_idx]
-            
-    #         if current_block.is_sealed:
-    #             sealed_segment = current_block.segment
-                
-    #             # Find prefix length
-    #             end_idx = current_idx + 1
-    #             while end_idx < len(blocks):
-    #                 blk = blocks[end_idx]
-    #                 if blk.is_sealed and blk.segment == sealed_segment:
-    #                     end_idx += 1
-    #                 else:
-    #                     break
-                
-    #             # Reuse sealed_segment
-    #             sealed_segment.ref_cnt += 1
-    #             new_segments_list.append(sealed_segment)
-    #             current_idx = end_idx
-    #         else:
-    #             # Unsealed sequence
-    #             # Since we cannot have sealed blocks after unsealed blocks,
-    #             # the rest of the blocks must be unsealed.
-    #             # We group consecutive blocks with the same ref_cnt into one segment.
-    #             while current_idx < len(blocks):
-    #                 start_idx = current_idx
-    #                 current_ref_cnt = blocks[start_idx].ref_cnt
-    #                 end_idx = start_idx + 1
-                    
-    #                 while end_idx < len(blocks):
-    #                     if blocks[end_idx].ref_cnt == current_ref_cnt:
-    #                         end_idx += 1
-    #                     else:
-    #                         break
-                    
-    #                 sub_blocks = blocks[start_idx:end_idx]
-    #                 last_block_hash_with_group_id = sub_blocks[-1].block_hash
-    #                 if last_block_hash_with_group_id is None:
-    #                     raise ValueError(
-    #                         f"Cannot seal segment for request {request_id}: "
-    #                         "last block has no block_hash."
-    #                     )
-
-    #                 # SegmentHash is group-agnostic; we pack group id only when
-    #                 # forming the cache key.
-    #                 segment_hash = SegmentHash(get_block_hash(last_block_hash_with_group_id))
-    #                 segment_hash_with_group_id = make_segment_hash_with_group_id(
-    #                     segment_hash, kv_cache_group_id
-    #                 )
-    #                 new_segment = SemanticSegment(
-    #                     segment_id=SegmentIdGenerator().generate(),
-    #                     blocks=sub_blocks
-    #                 )
-    #                 new_segment.seal(current_ref_cnt)
-    #                 new_segment.segment_hash = segment_hash_with_group_id
-    #                 self.cached_segments.insert(
-    #                     segment_hash_with_group_id, new_segment
-    #                 )
-    #                 new_segments_list.append(new_segment)
-    #                 current_idx = end_idx
-    #     segments.segments[-1:] = new_segments_list
-    #     return
-    
     def seal_segment(
-        self, request_id: str, kv_cache_group_id: int
+        self, request_id: str
     ) -> None:
         """
         Seal the unsealed segment for a request.
@@ -519,7 +479,6 @@ class SemanticSegmentManager:
         
         Args:
             request_id: The request whose unsealed segment is to be sealed.
-            kv_cache_group_id: The KV cache group ID for hashing.
             
         Raises:
             ValueError: If there are no blocks in the unsealed segment or if the last block
@@ -550,7 +509,7 @@ class SemanticSegmentManager:
         # SegmentHash is group-agnostic; we pack group id only when forming the cache key.
         segment_hash = SegmentHash(get_block_hash(last_block_hash_with_group_id))
         segment_hash_with_group_id = make_segment_hash_with_group_id(
-            segment_hash, kv_cache_group_id
+            segment_hash, self.kv_cache_group_id
         )
 
         unsealed_segment.seal()
@@ -610,7 +569,7 @@ class SemanticSegmentManager:
         actual eviction is handled separately by cache policy.
         """
         # Default to empty SemanticSegments in case request is freed before allocation
-        self.seal_segment(request_id, self.kv_cache_group_id)
+        self.seal_segment(request_id)
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
         self.req_cursors.pop(request_id, None)
         self.num_cached_segments.pop(request_id, None)
@@ -732,7 +691,7 @@ class SemanticSegmentManager:
     @classmethod
     # TODO(huanyu): consolidating one segment may affect the memory layout of 
     # already consolidated segments
-    def consolidate_segment_memory(
+    def _consolidate_segment_memory(
         cls, segment: SemanticSegment, block_pool: BuddyBlockPool
     ) -> Optional[tuple[list[tuple[BuddyTreeBlock, BuddyTreeBlock]], 
                         list[tuple[BuddyTreeBlock, BuddyTreeBlock]]]]:
@@ -825,9 +784,10 @@ class SemanticSegmentManager:
                 replace_block_in_segment(src_block, [target_block])
                 
                 # 2. Release old block
-                src_block.reset()
-                block_pool.allocated_blocks[src_block.size].discard(src_block)
-                block_pool.slabs[src_block.size].append(src_block)
+                # The src_block will be freed later after the move is completed
+                # src_block.reset()
+                # block_pool.allocated_blocks[src_block.size].discard(src_block)
+                # block_pool.slabs[src_block.size].append(src_block)
             else:
                 swaps.append((src_block, target_block))
                 

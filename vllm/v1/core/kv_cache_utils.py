@@ -299,6 +299,7 @@ class SemanticSegment:
     _segment_hash: Optional[SegmentHashWithGroupId] = field(init=False, default=None)
     ref_cnt: int = 0
     is_sealed: bool = field(init=False, default=False)
+    is_consolidated: bool = field(init=False, default=False)
     
     def __len__(self) -> int:
         return self._length
@@ -388,6 +389,7 @@ class SemanticSegment:
         if the segment's own ref count is 0.
         """
         self.is_sealed = False
+        self.is_consolidated = False
         current = self.head
         while current:
             current.is_sealed = False

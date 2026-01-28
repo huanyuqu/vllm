@@ -179,3 +179,11 @@ class SchedulerInterface(ABC):
 
     def get_kv_connector(self) -> Optional["KVConnectorBase_V1"]:
         return None
+
+    def seal_segment(self, request_id: str) -> None:
+        """Seal the current semantic segment."""
+        raise NotImplementedError
+
+    def consolidate_segment_memory(self, request_id: str) -> None:
+        """Consolidate the memory of the sealed segments for the request."""
+        raise NotImplementedError

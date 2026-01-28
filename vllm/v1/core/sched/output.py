@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import MultiGroupSemanticSegments
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
@@ -28,6 +29,7 @@ else:
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
+    MultiGroupSemanticSegments = object
     Request = object
 
 
@@ -43,12 +45,14 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    semantic_segments: "MultiGroupSemanticSegments | None" = None
 
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
+        semantic_segments: "MultiGroupSemanticSegments | None" = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -60,6 +64,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            semantic_segments=semantic_segments,
         )
 
     def __repr__(self) -> str:
@@ -73,7 +78,8 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
-            f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"prompt_embeds_shape={prompt_embeds_shape},"
+            f"semantic_segments={self.semantic_segments}"
             ")"
         )
 
@@ -92,7 +98,8 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
-            f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"prompt_embeds_shape={prompt_embeds_shape},"
+            f"semantic_segments={self.semantic_segments}"
             ")"
         )
 
@@ -114,6 +121,7 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    semantic_segments: dict[str, "MultiGroupSemanticSegments"] | None = None
 
     @property
     def num_reqs(self) -> int:
@@ -142,6 +150,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            semantic_segments={},
         )
 
 
@@ -182,6 +191,11 @@ class SchedulerOutput:
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
+    
+    # List of memory moves (group_id, src_addr, dst_addr, size)
+    semantic_segment_moves: list[tuple[int, int, int, int]] = field(default_factory=list)
+    # List of memory swaps (group_id, addr1, addr2, size)
+    semantic_segment_swaps: list[tuple[int, int, int, int]] = field(default_factory=list)
 
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.

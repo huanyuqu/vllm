@@ -95,6 +95,11 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    # For semantic segment attention
+    segment_pointers: torch.Tensor | None = None
+    segment_lens: torch.Tensor | None = None
+    num_segments: torch.Tensor | None = None
+
 
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,

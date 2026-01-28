@@ -27,7 +27,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     compute_encoder_budget,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, MultiGroupSemanticSegments
 from vllm.v1.core.semantic_segment_manager import EvictionPolicy
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -702,10 +702,12 @@ class Scheduler(SchedulerInterface):
             max_block_size = max(self.cache_config.semantic_supported_block_sizes)
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(
                         min_block_size=min_block_size,
                         max_block_size=max_block_size,
-                    )
+                    ),
+                    semantic_segments=self.kv_cache_manager.get_segments(req.request_id),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -728,6 +730,12 @@ class Scheduler(SchedulerInterface):
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        
+        # Get pending moves
+        semantic_segment_moves = []
+        semantic_segment_swaps = []
+        if self.cache_config.enable_semantic_segment:
+            semantic_segment_moves, semantic_segment_swaps = self.kv_cache_manager.get_pending_moves()
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -743,6 +751,8 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            semantic_segment_moves=semantic_segment_moves,
+            semantic_segment_swaps=semantic_segment_swaps,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -811,6 +821,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        semantic_segments: dict[str, MultiGroupSemanticSegments] = {}
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -846,6 +857,7 @@ class Scheduler(SchedulerInterface):
                         max_block_size=max_block_size
                     )
                 )
+                semantic_segments[req_id] = self.kv_cache_manager.get_segments(req_id)
             else:
                 new_block_ids.append(
                     req_to_new_blocks[req_id].get_block_ids(allow_none=True)
@@ -863,6 +875,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            semantic_segments=semantic_segments,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1385,6 +1398,21 @@ class Scheduler(SchedulerInterface):
 
     def reset_prefix_cache(self) -> bool:
         return self.kv_cache_manager.reset_prefix_cache()
+
+    def seal_segment(self, request_id: str) -> None:
+        """Seal the current unsealed segment of the request."""
+        if request_id not in self.requests:
+            # Request might be finished or not found
+            return
+        request = self.requests[request_id]
+        self.kv_cache_manager.seal_segment(request)
+
+    def consolidate_segment_memory(self, request_id: str) -> None:
+        """Consolidate the memory of the sealed segments of the request."""
+        if request_id not in self.requests:
+            return
+        request = self.requests[request_id]
+        self.kv_cache_manager.consolidate_segment_memory(request)
 
     def make_stats(
         self,

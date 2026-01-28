@@ -381,6 +381,18 @@ class KVCacheManager:
             assert isinstance(self.coordinator, SemanticSegmentCoordinator)
             self.coordinator.update_block_usage(request.request_id, num_computed_tokens)
 
+    def seal_segment(self, request_id: str) -> None:
+        """Seal the current semantic segment."""
+        if self.enable_semantic_segment:
+            assert isinstance(self.coordinator, SemanticSegmentCoordinator)
+            self.coordinator.seal_segment(request_id)
+
+    def consolidate_segment_memory(self, request_id: str) -> None:
+        """Consolidate the memory of the sealed segments for the request."""
+        if self.enable_semantic_segment:
+            assert isinstance(self.coordinator, SemanticSegmentCoordinator)
+            self.coordinator.consolidate_segment_memory(request_id)
+
     def allocate_slots(
         self,
         request: Request,
@@ -657,6 +669,35 @@ class KVCacheManager:
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
+
+    def get_segments(self, request_id: str) -> MultiGroupSemanticSegments:
+        """Get the segments of a request."""
+        if not isinstance(self.coordinator, SemanticSegmentCoordinator):
+             raise RuntimeError("get_segment called without SemanticSegmentCoordinator")
+        return self.create_kv_cache_segments(self.coordinator.get_segments(request_id))
+
+    def seal_segment(self, request: Request) -> None:
+        """Seal the current unsealed segment."""
+        if not isinstance(self.coordinator, SemanticSegmentCoordinator):
+             raise RuntimeError("seal_segment called without SemanticSegmentCoordinator")
+        self.coordinator.seal_segment(request)
+
+    def consolidate_segment_memory(self, request: Request) -> None:
+        """Consolidate the memory of the sealed segments."""
+        if not isinstance(self.coordinator, SemanticSegmentCoordinator):
+             raise RuntimeError("consolidate_segment_memory called without SemanticSegmentCoordinator")
+        self.coordinator.consolidate_segment_memory(request)
+
+    def get_pending_moves(self) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+        """Get and clear pending moves from all managers."""
+        moves = []
+        swaps = []
+        if isinstance(self.coordinator, SemanticSegmentCoordinator):
+            for manager in self.coordinator.single_type_managers:
+                m, s = manager.get_pending_moves()
+                moves.extend(m)
+                swaps.extend(s)
+        return moves, swaps
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""

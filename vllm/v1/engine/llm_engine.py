@@ -323,6 +323,12 @@ class LLMEngine:
     def reset_prefix_cache(self):
         self.engine_core.reset_prefix_cache()
 
+    def seal(self, request_id: str) -> None:
+        self.engine_core.seal(request_id)
+
+    def consolidate_memory(self, request_id: str) -> None:
+        self.engine_core.consolidate_memory(request_id)
+
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 

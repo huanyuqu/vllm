@@ -567,11 +567,19 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
             )
 
     def update_block_usage(self, request_id: str, num_computed_tokens: int) -> None:
-        """
-        Update the block usage for the request.
-        """
+        """Update the block usage for the request."""
         for manager in self.single_type_managers:
             manager.update_block_usage(request_id, num_computed_tokens)
+
+    def seal_segment(self, request_id: str) -> None:
+        """Seal the current semantic segment."""
+        for manager in self.single_type_managers:
+            manager.seal_segment(request_id)
+
+    def consolidate_segment_memory(self, request_id: str) -> None:
+        """Consolidate the memory of the sealed segments for the request."""
+        for manager in self.single_type_managers:
+            manager.consolidate_segment_memory(request_id)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_encoder_tokens: int = 0
@@ -602,6 +610,15 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
             blocks_list.append(manager_blocks)
         return tuple(blocks_list)
 
+    def get_segments(self, request_id: str) -> tuple[SemanticSegments, ...]:
+        """
+        Get the segments for the request.
+        """
+        return tuple(
+            manager.req_to_segments.get(request_id) or SemanticSegments()
+            for manager in self.single_type_managers
+        )
+
     def cache_segments(self, request: Request, 
                        num_segments: int) -> None:
         """
@@ -617,10 +634,6 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         for manager in self.single_type_managers:
             manager.cache_segments(request, num_segments)
 
-    def seal_segment(self, request: Request) -> None:
-        """Seal the current unsealed segment(s) and make them cacheable."""
-        for i, manager in enumerate(self.single_type_managers):
-            manager.seal_segment(request.request_id, i)
 
     def free(self, request_id: str) -> None:
         """
