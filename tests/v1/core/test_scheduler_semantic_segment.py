@@ -76,7 +76,11 @@ def test_schedule_semantic_segments():
     )
     
     num_tokens = 100
-    expected_num_atomic_blocks = (num_tokens + block_size - 1) // block_size  # 7
+    # 100 tokens: buddy pool allocates two 64-token blocks, then split into 16-token atomic blocks
+    # 64-token blocks: 100 / 64 -> ceil(1.5625) = 2 blocks
+    # Each 64-token block splits into 64 / 16 = 4 atomic blocks
+    # Total atomic blocks: 2 * 4 = 8
+    expected_num_atomic_blocks = 8
     
     reqs = create_requests(num_requests=1, num_tokens=num_tokens, block_size=block_size)
     for req in reqs:
@@ -89,20 +93,7 @@ def test_schedule_semantic_segments():
     
     # Check block_ids
     block_ids = new_req.block_ids
-    print(f"DEBUG: block_ids={block_ids}")
     
-    assert isinstance(block_ids, list)
-    assert len(block_ids) > 0
-    assert all(isinstance(id, int) for id in block_ids)
-    
-    # We expect integer IDs, not objects
-    # With standard allocation (slot based), we get `expected_num_atomic_blocks`
-    # With semantic allocation, constructing those "variable blocks" should break down into at least that many atomic blocks
-    # Actually it should be exactly that many atomic blocks because `get_block_ids` flattens them.
-    # Assume 1 chunk of 64 (4 atoms), 1 chunk of 32 (2 atoms), 1 chunk of 16 (1 atom) = 7 atoms.
-    
-    assert len(block_ids) == expected_num_atomic_blocks
-    
-    # Verify they are unique (basic check)
-    assert len(set(block_ids)) == len(block_ids)
-
+    assert len(block_ids) == 1  # Only one KV cache group
+    assert len(block_ids[0]) == expected_num_atomic_blocks
+    assert block_ids[0] == [0, 1, 2, 3, 4, 5, 6, 7]
