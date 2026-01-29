@@ -681,7 +681,7 @@ class FlashAttentionImpl(AttentionImpl):
             v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
             
             seg_idx = 0
-            for req_idx in range(attn_metadata.num_reqs):
+            for req_idx in range(len(num_segments_cpu)):
                 num_segs = num_segments_cpu[req_idx].item()
                 if num_segs == 0:
                     continue
@@ -760,6 +760,7 @@ class FlashAttentionImpl(AttentionImpl):
             
             # Need to copy block_table to avoid modifying original
             block_table_mod = attn_metadata.block_table.clone()
+            seq_lens_mod = attn_metadata.seq_lens.clone()
             
             # How many tokens are sealed?
             # We can compute cumulative length of sealed segments per request
@@ -769,7 +770,7 @@ class FlashAttentionImpl(AttentionImpl):
             
             # Reset seg_idx to iterate again
             seg_idx = 0
-            for req_idx in range(attn_metadata.num_reqs):
+            for req_idx in range(len(num_segments_cpu)):
                 num_segs = num_segments_cpu[req_idx].item()
                 sealed_tokens = 0
                 for _ in range(num_segs):
@@ -782,9 +783,18 @@ class FlashAttentionImpl(AttentionImpl):
                     blk_size = key_cache.shape[1] 
                     num_sealed_blocks = sealed_tokens // blk_size
                     if num_sealed_blocks > 0:
-                        block_table_mod[req_idx, :num_sealed_blocks] = -1
+                        max_blocks = block_table_mod.shape[1]
+                        # Shift block table left to skip sealed blocks
+                        valid_blocks = block_table_mod[req_idx, num_sealed_blocks:].clone()
+                        block_table_mod[req_idx, :max_blocks - num_sealed_blocks] = valid_blocks
+                        block_table_mod[req_idx, max_blocks - num_sealed_blocks:] = -1
+                        
+                        # Reduce sequence length
+                        seq_lens_mod[req_idx] -= sealed_tokens
 
             # Run Paged Attention with modified block table
+            descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+            
             paged_out, paged_lse = flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
                 k=key_cache,
@@ -792,8 +802,7 @@ class FlashAttentionImpl(AttentionImpl):
                 out=temp_output[:num_actual_tokens], # Use temp
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 max_seqlen_q=attn_metadata.max_query_len,
-                seqused_k=attn_metadata.seq_lens, # This includes all tokens? Yes.
-                # But we masked blocks, so effective K is reduced.
+                seqused_k=seq_lens_mod,
                 max_seqlen_k=attn_metadata.max_seq_len,
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
@@ -804,9 +813,9 @@ class FlashAttentionImpl(AttentionImpl):
                 return_softmax_lse=True,
                 scheduler_metadata=attn_metadata.scheduler_metadata,
                 fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale.expand(descale_shape),
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
+                q_descale=layer._q_scale.expand(descale_shape) if layer._q_scale is not None else None,
+                k_descale=layer._k_scale.expand(descale_shape) if layer._k_scale is not None else None,
+                v_descale=layer._v_scale.expand(descale_shape) if layer._v_scale is not None else None,
                 num_splits=attn_metadata.max_num_splits,
                 s_aux=self.sinks,
             )
