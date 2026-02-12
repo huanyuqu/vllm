@@ -125,6 +125,12 @@ class KVCacheBlocks:
         """
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
     
+    def __len__(self) -> int:
+        for group in self.blocks:
+            assert (len(group) == len(self.blocks[0]), 
+                    "All groups should have the same number of blocks")
+        return len(self.blocks[0]) if self.blocks else 0
+    
     
 @dataclass
 class MultiGroupSemanticSegments:
