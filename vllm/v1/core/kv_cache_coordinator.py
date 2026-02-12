@@ -642,8 +642,8 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         This releases all segments associated with the request and decrements
         their reference counts.
         """
-        for i, manager in enumerate(self.single_type_managers):
-            manager.free(request_id, i)
+        for manager in self.single_type_managers:
+            manager.free(request_id)
 
     def get_num_common_prefix_blocks(
         self, running_request_id: str

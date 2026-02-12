@@ -299,25 +299,97 @@ class SemanticSegmentManager:
         segments = self.req_to_segments[request_id]
         
         for segment in segments:
-            if segment.is_sealed and len(segment.blocks) > 1 and not segment.is_consolidated:
-                result = SemanticSegmentManager._consolidate_segment_memory(segment, self.block_pool)
+            if segment.is_sealed and segment.capacity > 0 and not segment.is_consolidated:
+                result = SemanticSegmentManager._consolidate_segment_memory(
+                    segment, self.block_pool)
                 if result:
                     moves, swaps = result
+
+                    # Order moves so we never overwrite a later move's source.
+                    # This enables single-round consolidation without relying
+                    # on multi-step async frees.
+                    # if moves:
+                    #     moves = SemanticSegmentManager._order_moves_safely(
+                    #         moves, self.block_pool)
+
+                    # Some destinations may be previous move sources (i.e., an
+                    # in-flight source location reused as a destination). Only
+                    # free sources that are not reused as destinations.
+                    dst_blocks = {dst for _, dst in moves}
                     
                     # Process moves
                     for src_block, dst_block in moves:
                         src_addr = self.block_pool.calculate_address(src_block)
                         dst_addr = self.block_pool.calculate_address(dst_block)
                         self.pending_moves.append((self.kv_cache_group_id, src_addr, dst_addr, src_block.size))
-                        self.blocks_to_free_later.append(src_block)
+                        if src_block not in dst_blocks:
+                            self.blocks_to_free_later.append(src_block)
                         
                     # Process swaps
                     for block1, block2 in swaps:
                         addr1 = self.block_pool.calculate_address(block1)
                         addr2 = self.block_pool.calculate_address(block2)
                         self.pending_swaps.append((self.kv_cache_group_id, addr1, addr2, block1.size))
-                
+
+                # Single-round planner: if we produced any ops, we treat the
+                # segment as consolidated for subsequent attention metadata.
                 segment.is_consolidated = True
+
+    @staticmethod
+    def _order_moves_safely(
+        moves: list[tuple[BuddyTreeBlock, BuddyTreeBlock]],
+        block_pool: BuddyBlockPool,
+    ) -> list[tuple[BuddyTreeBlock, BuddyTreeBlock]]:
+        """Order moves to avoid overwriting any move's source before it is read.
+
+        Each move is a copy from src_addr->dst_addr for a contiguous token range.
+        If move A writes into a range that overlaps move B's source range, then
+        B must be executed before A.
+
+        This returns a topologically-sorted order. If a cycle is detected, 
+        we raise a ValueError as it should not happen.
+        """
+
+        def interval(addr: int, size: int) -> tuple[int, int]:
+            return addr, addr + size
+
+        src_addrs: list[int] = [block_pool.calculate_address(s) for s, _ in moves]
+        dst_addrs: list[int] = [block_pool.calculate_address(d) for _, d in moves]
+        sizes: list[int] = [s.size for s, _ in moves]
+
+        src_intervals = [interval(a, sz) for a, sz in zip(src_addrs, sizes)]
+        dst_intervals = [interval(a, sz) for a, sz in zip(dst_addrs, sizes)]
+
+        n = len(moves)
+        adj: list[list[int]] = [[] for _ in range(n)]
+        indeg = [0] * n
+
+        def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
+            return a[0] < b[1] and b[0] < a[1]
+
+        # Edge j->i if i's dst overlaps j's src (j must run before i).
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                if overlaps(dst_intervals[i], src_intervals[j]):
+                    adj[j].append(i)
+                    indeg[i] += 1
+
+        queue = [i for i in range(n) if indeg[i] == 0]
+        ordered: list[int] = []
+        while queue:
+            idx = queue.pop()
+            ordered.append(idx)
+            for nxt in adj[idx]:
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    queue.append(nxt)
+
+        if len(ordered) != n:
+            raise ValueError(
+                "Cycle detected in memory moves, cannot order safely.")
+        return [moves[i] for i in ordered]
 
     def update_block_usage(
         self, request_id: str, 
@@ -513,6 +585,11 @@ class SemanticSegmentManager:
         )
 
         unsealed_segment.seal()
+
+        # If prefix caching is disabled, do not insert segments into the cache.
+        if not self.block_pool.enable_caching:
+            return
+
         unsealed_segment.segment_hash = segment_hash_with_group_id
         self.cached_segments.insert(segment_hash_with_group_id, unsealed_segment)
         return
@@ -577,8 +654,15 @@ class SemanticSegmentManager:
         for segment in reversed(segments):
             segment.ref_cnt -= 1
             if segment.ref_cnt == 0:
-                self.free_segment_queue.append(segment)  # type: ignore
-                self.num_free_segment_tokens += segment.capacity
+                # If prefix caching is disabled, return blocks to the pool
+                # immediately (behave like a normal allocator).
+                if not self.block_pool.enable_caching:
+                    segment.unseal()
+                    self._maybe_evict_cached_segment(segment)
+                    self.block_pool.free_blocks(reversed(segment.blocks))
+                else:
+                    self.free_segment_queue.append(segment)  # type: ignore
+                    self.num_free_segment_tokens += segment.capacity
                 
     def touch(self, segments: SemanticSegments) -> None:
         """
@@ -693,7 +777,7 @@ class SemanticSegmentManager:
     # already consolidated segments
     def _consolidate_segment_memory(
         cls, segment: SemanticSegment, block_pool: BuddyBlockPool
-    ) -> Optional[tuple[list[tuple[BuddyTreeBlock, BuddyTreeBlock]], 
+    ) -> Optional[tuple[list[tuple[BuddyTreeBlock, BuddyTreeBlock]],
                         list[tuple[BuddyTreeBlock, BuddyTreeBlock]]]]:
         """
         Consolidate all blocks in a segment into a contiguous region.
@@ -714,7 +798,7 @@ class SemanticSegmentManager:
         if not isinstance(segment, SemanticSegment):
             raise TypeError("segment must be a SemanticSegment")
 
-        if not segment.is_sealed or not segment.head or not segment.tail:
+        if not segment.is_sealed or segment.capacity <= 0:
             raise ValueError("Can only consolidate sealed and non-empty segments.")
 
         start_address = block_pool.calculate_address(segment.head)
@@ -738,6 +822,11 @@ class SemanticSegmentManager:
 
         moves: list[tuple[BuddyTreeBlock, BuddyTreeBlock]] = []
         swaps: list[tuple[BuddyTreeBlock, BuddyTreeBlock]] = []
+
+        # Addresses of blocks that are sources of already-planned moves.
+        # When a target lands on one of these addresses, it is safe to reuse it
+        # as a destination as long as moves are executed in a safe order.
+        planned_src_addrs: set[int] = set()
         
         # The segment starts at 'head' and is contiguous.
         curr_start = start_address + segment.head.size
@@ -769,15 +858,28 @@ class SemanticSegmentManager:
             
             # 4. Perform Swap
             target_segment = target_block.segment
+
+            # If the target block is allocated but not part of any segment, it
+            # can be an in-flight move source location. We can still complete
+            # consolidation in one round iff this location is known to be a
+            # source of an already-planned move in this same plan.
+            if target_segment is None and not target_block.is_free:
+                target_addr = block_pool.calculate_address(target_block)
+                if target_addr not in planned_src_addrs:
+                    # Cannot safely overwrite an unknown allocated block.
+                    # Leave for the next scheduling step.
+                    return None
             
             if target_segment is None:
                 moves.append((src_block, target_block))
+
+                planned_src_addrs.add(block_pool.calculate_address(src_block))
                 
                 # Metadata: src (me) -> target (free)
                 # target becomes allocated (to me)
                 if target_block.is_free:
                     block_pool.slabs[target_block.size].remove(target_block)
-                block_pool.allocated_blocks[target_block.size].add(target_block)
+                    block_pool.allocated_blocks[target_block.size].add(target_block)
                 
                 # 1. Update segment mapping
                 target_block.num_tokens = src_block.num_tokens
@@ -800,7 +902,7 @@ class SemanticSegmentManager:
 
         if not moves and not swaps:
             return None
-            
+
         return moves, swaps
 
     

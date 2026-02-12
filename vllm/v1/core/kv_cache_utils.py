@@ -463,6 +463,17 @@ def replace_block_in_segment(
         # 5. Update segment length and capacity
         segment._length += len(new_blocks) - 1
         segment._capacity += sum(b.size for b in new_blocks) - old_block.size
+
+        # 6. Detach the replaced block from the segment.
+        # Callers may defer freeing (e.g. after an async move). Keeping the
+        # old block linked/sealed can break segment traversal and violate
+        # allocator invariants during deferred free.
+        old_block.prev_block = None
+        old_block.next_block = None
+        old_block.segment = None
+        old_block.is_sealed = False
+        # Keep ref_cnt at 1 so a single free_blocks() reclaims it.
+        old_block.ref_cnt = 1
     else:
         raise RuntimeError("Block to replace is not in a segment")
     
