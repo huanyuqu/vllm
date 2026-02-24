@@ -1062,6 +1062,10 @@ def get_request_block_hasher(
 
         return new_block_hashes
 
+    # Expose hasher metadata for downstream consumers that may need to
+    # compute a tail/partial hash consistently (e.g. semantic segment sealing).
+    request_block_hasher.block_size = block_size  # type: ignore[attr-defined]
+    request_block_hasher.caching_hash_fn = caching_hash_fn  # type: ignore[attr-defined]
     return request_block_hasher
 
 

@@ -571,10 +571,10 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         for manager in self.single_type_managers:
             manager.update_block_usage(request_id, num_computed_tokens)
 
-    def seal_segment(self, request_id: str) -> None:
+    def seal_segment(self, request: Request | str) -> None:
         """Seal the current semantic segment."""
         for manager in self.single_type_managers:
-            manager.seal_segment(request_id)
+            manager.seal_segment(request)
 
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments for the request."""
@@ -635,7 +635,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
             manager.cache_segments(request, num_segments)
 
 
-    def free(self, request_id: str) -> None:
+    def free(self, request: Request | str) -> None:
         """
         Free the blocks for the request.
         
@@ -643,7 +643,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         their reference counts.
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.free(request)
 
     def get_num_common_prefix_blocks(
         self, running_request_id: str

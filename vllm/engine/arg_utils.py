@@ -426,6 +426,11 @@ class EngineArgs:
     )
     block_size: BlockSize | None = CacheConfig.block_size
     enable_prefix_caching: bool | None = CacheConfig.enable_prefix_caching
+    enable_semantic_segment: bool = CacheConfig.enable_semantic_segment
+    semantic_eviction_policy: str = CacheConfig.semantic_eviction_policy
+    semantic_supported_block_sizes: list[int] | None = (
+        CacheConfig.semantic_supported_block_sizes
+    )
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -923,6 +928,16 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--enable-prefix-caching", **cache_kwargs["enable_prefix_caching"]
+        )
+        cache_group.add_argument(
+            "--enable-semantic-segment", **cache_kwargs["enable_semantic_segment"]
+        )
+        cache_group.add_argument(
+            "--semantic-eviction-policy", **cache_kwargs["semantic_eviction_policy"]
+        )
+        cache_group.add_argument(
+            "--semantic-supported-block-sizes",
+            **cache_kwargs["semantic_supported_block_sizes"],
         )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
@@ -1426,6 +1441,9 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            enable_semantic_segment=self.enable_semantic_segment,
+            semantic_eviction_policy=self.semantic_eviction_policy,
+            semantic_supported_block_sizes=self.semantic_supported_block_sizes,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,

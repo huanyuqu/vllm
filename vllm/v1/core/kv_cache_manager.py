@@ -608,7 +608,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        self.coordinator.free(request)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -687,7 +687,7 @@ class KVCacheManager:
         if not isinstance(self.coordinator, SemanticSegmentCoordinator):
             raise RuntimeError(
                 "seal_segment called without SemanticSegmentCoordinator")
-        self.coordinator.seal_segment(request.request_id)
+        self.coordinator.seal_segment(request)
 
     def consolidate_segment_memory(self, request: Request) -> None:
         """Consolidate the memory of the sealed segments."""

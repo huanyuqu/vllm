@@ -6,12 +6,15 @@ from enum import Enum
 from vllm.logger import init_logger
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     FreeKVCacheBlockQueue,
     SegmentHash,
     SegmentHashWithGroupId, 
     BuddyTreeBlock, 
     SemanticSegment, 
+    generate_block_hash_extra_keys,
     get_block_hash,
+    hash_block_tokens,
     make_segment_hash_with_group_id,
     replace_block_in_segment,
     swap_blocks,
@@ -538,8 +541,45 @@ class SemanticSegmentManager:
 
         return True
 
+    def _compute_partial_tail_hash(self, request: Request) -> Optional[BlockHash]:
+        """Compute hash for a partial tail block of a request.
+
+        Returns None if there is no partial tail to hash.
+        """
+        hasher = request.get_hash_new_full_blocks
+        if hasher is not None and hasattr(hasher, "func"):
+            hasher_func = hasher.func
+            block_size = getattr(hasher_func, "block_size", self.block_pool.min_block_size)
+            caching_hash_fn = getattr(hasher_func, "caching_hash_fn", None)
+        else:
+            block_size = self.block_pool.min_block_size
+            caching_hash_fn = None
+
+        if caching_hash_fn is None:
+            return None
+
+        start_token_idx = len(request.block_hashes) * block_size
+        if start_token_idx >= request.num_tokens:
+            # No partial tail.
+            return None
+
+        end_token_idx = request.num_tokens
+        curr_mm_idx = -1 if start_token_idx > 0 else 0
+        extra_keys, _ = generate_block_hash_extra_keys(
+            request, start_token_idx, end_token_idx, curr_mm_idx
+        )
+
+        parent_block_hash = request.block_hashes[-1] if request.block_hashes else None
+        block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
+        return hash_block_tokens(
+            caching_hash_fn,
+            parent_block_hash,
+            block_tokens,
+            extra_keys,
+        )
+
     def seal_segment(
-        self, request_id: str
+        self, request: Request | str
     ) -> None:
         """
         Seal the unsealed segment for a request.
@@ -550,12 +590,23 @@ class SemanticSegmentManager:
         Note: blocks within a segment cannot be shared by other requests before sealing.
         
         Args:
-            request_id: The request whose unsealed segment is to be sealed.
+            request: The request or request ID whose unsealed segment is to be sealed.
             
         Raises:
-            ValueError: If there are no blocks in the unsealed segment or if the last block
-                        lacks a block_hash.
+            ValueError: If there are no blocks in the unsealed segment.
+
+        Notes:
+            If the tail block has no block hash (e.g. request teardown before
+            cache hashes are populated), the segment is still sealed but will
+            not be inserted into prefix cache.
         """
+        if isinstance(request, Request):
+            request_obj: Optional[Request] = request
+            request_id = request.request_id
+        else:
+            request_obj = None
+            request_id = request
+
         segments = self.req_to_segments[request_id]
         unsealed_segment = segments.unsealed_segment
         if not unsealed_segment:
@@ -573,13 +624,31 @@ class SemanticSegmentManager:
         # ensuring all blocks have a block_hash.
         last_block_hash_with_group_id = unsealed_segment.tail.block_hash
         if last_block_hash_with_group_id is None:
-            raise ValueError(
-                f"Cannot seal segment for request {request_id}: "
-                "last block has no block_hash."
+            # If the tail block is partial and request context is available,
+            # force a tail hash computation so the sealed segment still has a
+            # stable prefix-cache key.
+            partial_tail_hash = (
+                self._compute_partial_tail_hash(request_obj)
+                if request_obj is not None
+                else None
             )
 
-        # SegmentHash is group-agnostic; we pack group id only when forming the cache key.
-        segment_hash = SegmentHash(get_block_hash(last_block_hash_with_group_id))
+            if partial_tail_hash is None:
+                # Keep lifecycle invariants even when no stable hash is available.
+                unsealed_segment.seal()
+                logger.debug(
+                    "Seal segment for request %s without block hash; skipping cache insertion.",
+                    request_id,
+                )
+                return
+
+            segment_hash = SegmentHash(partial_tail_hash)
+        else:
+            # Fast path: a full tail block already has a block hash.
+            segment_hash = SegmentHash(get_block_hash(last_block_hash_with_group_id))
+
+        # SegmentHash is group-agnostic; we pack group id only when forming
+        # the cache key.
         segment_hash_with_group_id = make_segment_hash_with_group_id(
             segment_hash, self.kv_cache_group_id
         )
@@ -633,7 +702,7 @@ class SemanticSegmentManager:
 
         # TODO(huanyu): record KV cache events
 
-    def free(self, request_id: str) -> None:
+    def free(self, request: Request | str) -> None:
         """
         Release resources for a request.
 
@@ -646,7 +715,14 @@ class SemanticSegmentManager:
         actual eviction is handled separately by cache policy.
         """
         # Default to empty SemanticSegments in case request is freed before allocation
-        self.seal_segment(request_id)
+        if isinstance(request, Request):
+            request_id = request.request_id
+            request_obj: Request | str = request
+        else:
+            request_id = request
+            request_obj = request_id
+
+        self.seal_segment(request_obj)
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
         self.req_cursors.pop(request_id, None)
         self.num_cached_segments.pop(request_id, None)

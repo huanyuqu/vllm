@@ -766,6 +766,12 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
 
+    def seal(self, request_id: str) -> None:
+        self.call_utility("seal", request_id)
+
+    def consolidate_memory(self, request_id: str) -> None:
+        self.call_utility("consolidate_memory", request_id)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -969,6 +975,12 @@ class AsyncMPClient(MPClient):
 
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
+
+    async def seal_async(self, request_id: str) -> None:
+        await self.call_utility_async("seal", request_id)
+
+    async def consolidate_memory_async(self, request_id: str) -> None:
+        await self.call_utility_async("consolidate_memory", request_id)
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

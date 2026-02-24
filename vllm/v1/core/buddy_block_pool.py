@@ -780,6 +780,18 @@ class BuddyBlockPool:
             current = current.parent
 
         return current
+
+    def take_events(self) -> list[KVCacheEvent]:
+        """Atomically takes all events and clears the queue.
+
+        Returns:
+            A list of KV cache events.
+        """
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
     
     def reset_prefix_cache(self):
         raise NotImplementedError
