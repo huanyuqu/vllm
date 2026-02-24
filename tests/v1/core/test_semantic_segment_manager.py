@@ -1,12 +1,18 @@
 import pytest
 from unittest.mock import MagicMock
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegmentManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     SemanticSegment,
+    generate_block_hash_extra_keys,
     get_block_hash,
+    get_request_block_hasher,
     get_segment_hash,
+    hash_block_tokens,
+    init_none_hash,
     make_block_hash_with_group_id,
     swap_blocks,
 )
@@ -24,7 +30,7 @@ def block_pool():
 
 @pytest.fixture
 def segment_manager(block_pool):
-    return SemanticSegmentManager(block_pool)
+    return SemanticSegmentManager(block_pool=block_pool, kv_cache_group_id=0)
 
 
 def test_supported_sizes_completion(block_pool):
@@ -69,7 +75,7 @@ def test_seal_segment(segment_manager):
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         
     # Seal
-    segment_manager.seal_segment(request_id, group_id)
+    segment_manager.seal_segment(request_id)
     
     segments = segment_manager.req_to_segments[request_id]
     assert len(segments) == 1
@@ -123,7 +129,7 @@ def test_seal_multiple_segments(segment_manager):
         block_hash = BlockHash(f"hash1_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
     
-    segment_manager.seal_segment(request_id, group_id)
+    segment_manager.seal_segment(request_id)
     
     # Second allocation and seal
     blocks2 = segment_manager.allocate_new_blocks(request_id, 64)
@@ -131,7 +137,7 @@ def test_seal_multiple_segments(segment_manager):
         block_hash = BlockHash(f"hash2_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
     
-    segment_manager.seal_segment(request_id, group_id)
+    segment_manager.seal_segment(request_id)
     
     segments = segment_manager.req_to_segments[request_id]
     assert len(segments) == 2
@@ -194,7 +200,7 @@ def test_seal_multiple_segments(segment_manager):
 def test_allocate_free_eviction():
     # Create a small pool: 2 blocks of size 64
     pool = BuddyBlockPool(num_max_gpu_blocks=2, supported_sizes=[64], enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
     
     # Allocate all memory for req1 (128 tokens)
     manager.allocate_new_blocks("req1", 128)
@@ -206,7 +212,7 @@ def test_allocate_free_eviction():
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         
-    manager.free("req1", group_id)
+    manager.free("req1")
     
     # Check that segments are in free queue
     assert manager.free_segment_queue.num_free_segments == 1
@@ -225,7 +231,7 @@ def test_reclaim_from_allocated_blocks():
     # Pool: 1 block of 64.
     pool = BuddyBlockPool(num_max_gpu_blocks=1, supported_sizes=[64, 32], 
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
     
     blocks = manager.allocate_new_blocks("req1", 32)
     assert len(blocks) == 1
@@ -256,7 +262,11 @@ def test_automatic_merge(request_size, eviction_policy):
     # 1. Create pool with 1 block of size 64
     pool = BuddyBlockPool(num_max_gpu_blocks=1, supported_sizes=[64, 32], 
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool, eviction_policy=eviction_policy)
+    manager = SemanticSegmentManager(
+        block_pool=pool,
+        kv_cache_group_id=0,
+        eviction_policy=eviction_policy,
+    )
     
     # 2. Allocate two 32-token requests to split the 64 block
     # req1 takes 32 tokens (half of the 64 block)
@@ -298,8 +308,8 @@ def test_automatic_merge(request_size, eviction_policy):
         block_hash = BlockHash(f"hash2_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
         
-    manager.free("req1", group_id)
-    manager.free("req2", group_id)
+    manager.free("req1")
+    manager.free("req2")
     
     # Verify segments are in free queue
     assert manager.free_segment_queue.num_free_segments == 2
@@ -347,13 +357,13 @@ def test_touch(segment_manager):
     assert segment.ref_cnt == 1
     
     # Free request to put segment in free queue
-    segment_manager.free(request_id, group_id)
+    segment_manager.free(request_id)
     
     assert segment.ref_cnt == 0
     assert segment_manager.free_segment_queue.num_free_segments == 1
     
     # Touch the segment
-    segment_manager.touch(([segment],))
+    segment_manager.touch([segment])
     
     assert segment.ref_cnt == 1
     assert segment_manager.free_segment_queue.num_free_segments == 0
@@ -369,7 +379,7 @@ def test_get_cached_segment_hit(segment_manager):
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
 
-    segment_manager.seal_segment(request_id, group_id)
+    segment_manager.seal_segment(request_id)
     segments = segment_manager.req_to_segments[request_id]
     sealed = segments.last_segment
     assert sealed is not None
@@ -394,7 +404,7 @@ def test_find_longest_cache_hit(segment_manager):
         block_hash = BlockHash(f"hash_{i}".encode())
         block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
 
-    segment_manager.seal_segment(request_id, group_id)
+    segment_manager.seal_segment(request_id)
     sealed = segment_manager.req_to_segments[request_id].last_segment
     assert sealed is not None
     assert sealed.is_sealed
@@ -404,6 +414,7 @@ def test_find_longest_cache_hit(segment_manager):
 
     hit_segments = segment_manager.find_longest_cache_hit(
         segment_hashes=[get_block_hash(sealed.tail.block_hash)],
+        max_length=sealed.capacity,
         kv_cache_group_ids=[group_id],
         use_eagle=False,
     )
@@ -441,7 +452,7 @@ def test_cache_blocks_seal_segment(segment_manager):
         assert block.block_hash == expected
 
     # Seal segment
-    segment_manager.seal_segment(request_id, group_id)
+    segment_manager.seal_segment(request_id)
     
     # Verify segment
     segments = segment_manager.req_to_segments[request_id]
@@ -492,7 +503,7 @@ def test_consolidate_segment_memory_no_change():
     pool = BuddyBlockPool(num_max_gpu_blocks=4,
                           supported_sizes=[128],
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
 
     # Allocate contiguous blocks
     # Returns [block0, block1]
@@ -503,11 +514,11 @@ def test_consolidate_segment_memory_no_change():
                                                         group_id)
     blocks[1].block_hash = make_block_hash_with_group_id(BlockHash(b"1"),
                                                         group_id)
-    manager.seal_segment("req", group_id)
+    manager.seal_segment("req")
 
     segment = manager.req_to_segments["req"].last_segment
 
-    result = manager.consolidate_segment_memory(segment, pool)
+    result = SemanticSegmentManager._consolidate_segment_memory(segment, pool)
     assert result is None
     
     
@@ -516,7 +527,7 @@ def test_consolidate_segment_memory_move():
     pool = BuddyBlockPool(num_max_gpu_blocks=4,
                           supported_sizes=[128],
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
 
     # 1. Allocate block A for req_main (address 0)
     blocks_a = manager.allocate_new_blocks("req_main", 128)
@@ -542,7 +553,7 @@ def test_consolidate_segment_memory_move():
     group_id = 0
     block_b.block_hash = make_block_hash_with_group_id(BlockHash(b"b"),
                                                        group_id)
-    manager.free("req_gap", group_id)
+    manager.free("req_gap")
 
     # Finalize the release to make it a MOVE test
     segment_b: SemanticSegment = manager.free_segment_queue.popleft()
@@ -556,13 +567,13 @@ def test_consolidate_segment_memory_move():
                                                        group_id)
     block_c.block_hash = make_block_hash_with_group_id(BlockHash(b"c"),
                                                        group_id)
-    manager.seal_segment("req_main", group_id)
+    manager.seal_segment("req_main")
 
     segment = manager.req_to_segments["req_main"].last_segment
     assert segment.blocks == [block_a, block_c]
 
     # 4. Consolidate
-    result = manager.consolidate_segment_memory(segment, pool)
+    result = SemanticSegmentManager._consolidate_segment_memory(segment, pool)
 
     assert result is not None
     moves, swaps = result
@@ -584,9 +595,11 @@ def test_consolidate_segment_memory_move():
     assert dst.prev_block == block_a
     assert block_a.next_block == dst
 
-    # Old block_c should be free in the pool
-    assert block_c.is_free
-    assert block_c in pool.slabs[128]
+    # Old block_c is detached and scheduled for deferred free by caller.
+    assert not block_c.is_free
+    assert block_c.segment is None
+    assert block_c.prev_block is None
+    assert block_c.next_block is None
     
     
 def test_swap_blocks(segment_manager):
@@ -669,7 +682,7 @@ def test_consolidate_segment_memory_swap():
     pool = BuddyBlockPool(num_max_gpu_blocks=4,
                           supported_sizes=[128],
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
 
     # 1. Allocate block A for req_main (address 0)
     blocks_a = manager.allocate_new_blocks("req_main", 128)
@@ -697,7 +710,7 @@ def test_consolidate_segment_memory_swap():
                                                        group_id)
     block_c.block_hash = make_block_hash_with_group_id(BlockHash(b"c"),
                                                        group_id)
-    manager.seal_segment("req_main", group_id)
+    manager.seal_segment("req_main")
 
     segment = manager.req_to_segments["req_main"].last_segment
     assert segment.blocks == [block_a, block_c]
@@ -707,7 +720,7 @@ def test_consolidate_segment_memory_swap():
     assert gap_unsealed.blocks == [block_b]
 
     # 4. Consolidate
-    result = manager.consolidate_segment_memory(segment, pool)
+    result = SemanticSegmentManager._consolidate_segment_memory(segment, pool)
 
     assert result is not None
     moves, swaps = result
@@ -738,7 +751,7 @@ def test_consolidate_segment_memory_with_split():
     # Pool: supported sizes [64, 32]. 
     pool = BuddyBlockPool(num_max_gpu_blocks=4, supported_sizes=[64, 32], 
                           enable_caching=True)
-    manager = SemanticSegmentManager(pool)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
 
     # 1. Alloc req_main (64) -> Addr 0
     blocks_m1 = manager.allocate_new_blocks("req_main", 64)
@@ -771,15 +784,15 @@ def test_consolidate_segment_memory_with_split():
     group_id = 0
     for i, b in enumerate(segment.blocks):
         b.block_hash = make_block_hash_with_group_id(BlockHash(f"m{i}".encode()), group_id)
-    manager.seal_segment("req_main", group_id)
+    manager.seal_segment("req_main")
     
     for b in blocks_g1:
         b.block_hash = make_block_hash_with_group_id(BlockHash(b"g"), group_id)
-    manager.seal_segment("req_gap", group_id)
+    manager.seal_segment("req_gap")
 
     seg_main = manager.req_to_segments["req_main"].last_segment
     seg_gap = manager.req_to_segments["req_gap"].last_segment
-    
+
     # 5. Consolidate
     # Expectation:
     # - Process 64(0): OK. Next Start 64.
@@ -787,16 +800,16 @@ def test_consolidate_segment_memory_with_split():
     #   - Target at 64 is Gap(64).
     #   - Target 64(64) > Src 32(128). Split Target -> 32L(64), 32R(96).
     #   - Swap Src 32(128) with Gap 32L(64).
-    #   - Main has [64(0), 32(64), 32(160)]. 
+    #   - Main has [64(0), 32(64), 32(160)].
     #   - Gap has [32(128), 32(96)].
     # - Process 32(160):
     #   - Target at 96 is Gap 32R(96).
     #   - Swap Src 32(160) with Gap 32R(96).
     #   - Main has [64(0), 32(64), 32(96)]. Contiguous.
     #   - Gap has [32(128), 32(160)].
-    
-    moves, swaps = manager.consolidate_segment_memory(seg_main, pool)
-    
+
+    moves, swaps = SemanticSegmentManager._consolidate_segment_memory(seg_main, pool)
+
     # 6. Validate
     assert len(moves) == 0
     assert len(swaps) == 2
@@ -804,15 +817,80 @@ def test_consolidate_segment_memory_with_split():
     # The order is the opposite of what was expected
     assert swaps[0] == (seg_gap.blocks[0], segment.blocks[1])  # 32(128) <-> 32(64)
     assert swaps[1] == (seg_gap.blocks[1], segment.blocks[2])  # 32(160) <-> 32(96)
-    
+
     # seg_main should be contiguous 0, 64, 96
     blocks = seg_main.blocks
     assert blocks[0].size == 64 and pool.calculate_address(blocks[0]) == 0
     assert blocks[1].size == 32 and pool.calculate_address(blocks[1]) == 64
     assert blocks[2].size == 32 and pool.calculate_address(blocks[2]) == 96
-    
+
     # GAP should be split and moved
     # Gap originally had 1 block of 64. Now logically it should have 2 blocks of 32
     assert len(seg_gap.blocks) == 2
     addrs = [pool.calculate_address(b) for b in seg_gap.blocks]
     assert addrs == [128, 160]
+
+
+def test_seal_segment_without_tail_hash_does_not_crash_or_cache():
+    pool = BuddyBlockPool(
+        num_max_gpu_blocks=4,
+        supported_sizes=[16, 32],
+        enable_caching=True,
+    )
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
+
+    manager.allocate_new_blocks(request_id="req", num_tokens=8)
+    segment = manager.req_to_segments["req"].unsealed_segment
+    assert segment is not None
+    assert segment.tail is not None
+    assert segment.tail.block_hash is None
+
+    # Regression: this used to raise when tail.block_hash is None.
+    manager.seal_segment("req")
+
+    sealed = manager.req_to_segments["req"].last_segment
+    assert sealed is not None
+    assert sealed.is_sealed
+    assert sealed.segment_hash is None
+    assert len(manager.cached_segments) == 0
+
+    # Free path should also be robust when sealed segment has no segment_hash.
+    manager.free("req")
+
+
+def test_seal_segment_partial_tail_computes_hash_and_caches():
+    init_none_hash(sha256)
+
+    pool = BuddyBlockPool(
+        num_max_gpu_blocks=4,
+        supported_sizes=[16, 32],
+        enable_caching=True,
+    )
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
+
+    request = Request(
+        request_id="req_partial",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        eos_token_id=0,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+    manager.allocate_new_blocks(request_id=request.request_id, num_tokens=8)
+    manager.seal_segment(request)
+
+    sealed = manager.req_to_segments[request.request_id].last_segment
+    assert sealed is not None
+    assert sealed.is_sealed
+    assert sealed.segment_hash is not None
+    assert len(manager.cached_segments) == 1
+
+    extra_keys, _ = generate_block_hash_extra_keys(request, 0, request.num_tokens, 0)
+    expected = hash_block_tokens(
+        sha256,
+        None,
+        request.all_token_ids[:request.num_tokens],
+        extra_keys,
+    )
+    assert get_block_hash(sealed.segment_hash) == expected
