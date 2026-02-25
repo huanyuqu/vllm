@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+from contextlib import nullcontext
+from typing import NamedTuple
+import os
+
 import pytest
+import torch
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 
@@ -16,13 +21,68 @@ SEGMENT_CONFIGS = [
     (SEGMENT_TOKENS, NUM_SEGMENTS),
 ]
 
+PROFILE_WAIT_STEPS = 50
+PROFILE_WARMUP_STEPS = 20
+PROFILE_ACTIVE_STEPS = 300
+PROFILE_ROW_LIMIT = 20
+ENABLE_TORCH_PROFILER = os.environ.get("VLLM_ENABLE_TORCH_PROFILER",
+                                       "1") == "1"
+
+
+class EpisodeMetrics(NamedTuple):
+    tbt_s: float
+    total_latency_s: float
+    consolidation_time_s: float
+    episode_wall_s: float
+    framework_overhead_s: float
+    profile_cpu_table: str
+    profile_cuda_table: str
+
+
+def _build_profiler(enabled: bool):
+    if not enabled or not ENABLE_TORCH_PROFILER:
+        return None
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    return torch.profiler.profile(
+        activities=activities,
+        schedule=torch.profiler.schedule(wait=PROFILE_WAIT_STEPS,
+                                         warmup=PROFILE_WARMUP_STEPS,
+                                         active=PROFILE_ACTIVE_STEPS,
+                                         repeat=1),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    )
+
+
+def _extract_profile_tables(prof, has_cuda: bool) -> tuple[str, str]:
+    if prof is None:
+        return "", ""
+    try:
+        key_avg = prof.key_averages()
+        cpu_table = key_avg.table(sort_by="self_cpu_time_total",
+                                  row_limit=PROFILE_ROW_LIMIT)
+        cuda_table = ""
+        if has_cuda:
+            cuda_table = key_avg.table(sort_by="self_cuda_time_total",
+                                       row_limit=PROFILE_ROW_LIMIT)
+        return cpu_table, cuda_table
+    except Exception as exc:
+        return f"<failed to collect cpu profile table: {exc}>", (
+            f"<failed to collect cuda profile table: {exc}>" if has_cuda else "")
+
 
 def _run_episode(*,
                  use_semantic_segment: bool,
                  consolidate: bool,
                  segment_tokens: int,
                  num_segments: int,
-                 progress_label: str) -> tuple[float, float, float]:
+                 progress_label: str,
+                 enable_profile: bool = True) -> EpisodeMetrics:
     if consolidate and not use_semantic_segment:
         raise ValueError("consolidate requires semantic segment mode")
     if segment_tokens <= 0 or num_segments <= 1:
@@ -86,55 +146,68 @@ def _run_episode(*,
         consolidation_time_s = 0.0
         next_boundary = segment_tokens
         current_segment = 1
+        has_cuda = torch.cuda.is_available()
+        prof = _build_profiler(enable_profile)
 
-        while not finished:
-            step_count += 1
-            t0 = time.perf_counter()
-            outputs = llm.llm_engine.step()
-            dt = time.perf_counter() - t0
+        loop_ctx = prof if prof is not None else nullcontext()
+        episode_start = time.perf_counter()
 
-            if step_count % 50 == 0:
-                print(
-                    f"[{progress_label}] step={step_count} "
-                    f"tokens={token_steps}/{total_tokens} "
-                    f"segment={current_segment}/{num_segments}",
-                    flush=True,
-                )
+        with loop_ctx:
+            while not finished:
+                step_count += 1
+                t0 = time.perf_counter()
+                outputs = llm.llm_engine.step()
+                dt = time.perf_counter() - t0
 
-            for out in outputs:
-                if out.request_id != req_a:
-                    continue
+                if prof is not None:
+                    prof.step()
 
-                if out.outputs and out.outputs[0].token_ids:
-                    current_total_token_count = len(out.outputs[0].token_ids)
-                    new_tokens = current_total_token_count - prev_total_token_count
-                    if new_tokens > 0:
-                        counted_new_tokens = min(new_tokens,
-                                                 total_tokens - token_steps)
-                        token_steps += counted_new_tokens
-                        prev_total_token_count = current_total_token_count
-                        generated_time_s += dt
-                        generated_token_count += counted_new_tokens
+                if step_count % 50 == 0:
+                    print(
+                        f"[{progress_label}] step={step_count} "
+                        f"tokens={token_steps}/{total_tokens} "
+                        f"segment={current_segment}/{num_segments}",
+                        flush=True,
+                    )
 
-                    while token_steps >= next_boundary and current_segment < num_segments:
-                        if consolidate:
-                            print(
-                                f"[{progress_label}] consolidate at "
-                                f"tokens={token_steps}, segment={current_segment}",
-                                flush=True,
-                            )
-                            t1 = time.perf_counter()
-                            llm.llm_engine.seal(req_a)
-                            llm.llm_engine.consolidate_memory(req_a)
-                            consolidation_time_s += time.perf_counter() - t1
-                        current_segment += 1
-                        next_boundary += segment_tokens
+                for out in outputs:
+                    if out.request_id != req_a:
+                        continue
 
-                if out.finished:
+                    if out.outputs and out.outputs[0].token_ids:
+                        current_total_token_count = len(out.outputs[0].token_ids)
+                        new_tokens = current_total_token_count - prev_total_token_count
+                        if new_tokens > 0:
+                            counted_new_tokens = min(new_tokens,
+                                                     total_tokens - token_steps)
+                            token_steps += counted_new_tokens
+                            prev_total_token_count = current_total_token_count
+                            generated_time_s += dt
+                            generated_token_count += counted_new_tokens
+
+                        while token_steps >= next_boundary and current_segment < num_segments:
+                            if consolidate:
+                                print(
+                                    f"[{progress_label}] consolidate at "
+                                    f"tokens={token_steps}, segment={current_segment}",
+                                    flush=True,
+                                )
+                                t1 = time.perf_counter()
+                                llm.llm_engine.seal(req_a)
+                                llm.llm_engine.consolidate_memory(req_a)
+                                consolidation_time_s += time.perf_counter() - t1
+                            current_segment += 1
+                            next_boundary += segment_tokens
+
+                    if out.finished:
+                        finished = True
+
+                if token_steps >= total_tokens:
                     finished = True
 
-            if token_steps >= total_tokens:
-                finished = True
+        episode_wall_s = time.perf_counter() - episode_start
+        framework_overhead_s = max(
+            0.0, episode_wall_s - generated_time_s - consolidation_time_s)
 
         assert token_steps == total_tokens, (
             f"Expected exactly {total_tokens} generated tokens, got {token_steps}"
@@ -154,10 +227,22 @@ def _run_episode(*,
             f"[{progress_label}] finished: steps={step_count}, "
             f"tokens={token_steps}, segments={current_segment}, "
             f"post_total={total_latency_s:.6f}s, "
-            f"consolidate={consolidation_time_s:.6f}s",
+            f"consolidate={consolidation_time_s:.6f}s, "
+            f"episode_wall={episode_wall_s:.6f}s, "
+            f"overhead={framework_overhead_s:.6f}s",
             flush=True,
         )
-        return tbt_s, total_latency_s, consolidation_time_s
+        profile_cpu_table, profile_cuda_table = _extract_profile_tables(
+            prof, has_cuda)
+        return EpisodeMetrics(
+            tbt_s=tbt_s,
+            total_latency_s=total_latency_s,
+            consolidation_time_s=consolidation_time_s,
+            episode_wall_s=episode_wall_s,
+            framework_overhead_s=framework_overhead_s,
+            profile_cpu_table=profile_cpu_table,
+            profile_cuda_table=profile_cuda_table,
+        )
     finally:
         del llm
         cleanup_dist_env_and_memory()
@@ -179,28 +264,106 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
     post-checkpoint latencies against a baseline run without semantic segment.
     """
 
-    baseline_tbt, baseline_total_s, _ = _run_episode(
-        use_semantic_segment=False,
-        consolidate=False,
-        segment_tokens=segment_tokens,
-        num_segments=num_segments,
-        progress_label="baseline",
-    )
+    profile_mode = os.environ.get("VLLM_PROFILE_MODE", "both").strip().lower()
+    if profile_mode not in {"baseline", "semantic", "both"}:
+        raise ValueError(
+            "VLLM_PROFILE_MODE must be one of: baseline, semantic, both"
+        )
 
-    agent_tbt, agent_total_s, consolidation_time_s = _run_episode(
-        use_semantic_segment=True,
-        consolidate=True,
-        segment_tokens=segment_tokens,
-        num_segments=num_segments,
-        progress_label="semantic",
-    )
+    baseline_metrics = None
+    semantic_metrics = None
 
-    assert consolidation_time_s >= 0
-    assert baseline_tbt > 0 and baseline_total_s > 0
-    assert agent_tbt > 0 and agent_total_s > 0
-    
-    print(f"Baseline TBT: {baseline_tbt:.6f}s, Total: {baseline_total_s:.6f}s")
-    print(f"Semantic TBT: {agent_tbt:.6f}s, Total: {agent_total_s:.6f}s, Consolidation: {consolidation_time_s:.6f}s")
+    if profile_mode in {"baseline", "both"}:
+        baseline_metrics = _run_episode(
+            use_semantic_segment=False,
+            consolidate=False,
+            segment_tokens=segment_tokens,
+            num_segments=num_segments,
+            progress_label="baseline",
+            enable_profile=True,
+        )
+
+    if profile_mode in {"semantic", "both"}:
+        semantic_metrics = _run_episode(
+            use_semantic_segment=True,
+            consolidate=True,
+            segment_tokens=segment_tokens,
+            num_segments=num_segments,
+            progress_label="semantic",
+            enable_profile=True,
+        )
+
+    if profile_mode == "baseline":
+        assert baseline_metrics is not None
+        print(
+            f"Baseline TBT: {baseline_metrics.tbt_s:.6f}s, "
+            f"Generated: {baseline_metrics.total_latency_s:.6f}s, "
+            f"Wall: {baseline_metrics.episode_wall_s:.6f}s, "
+            f"Overhead: {baseline_metrics.framework_overhead_s:.6f}s")
+        print("\n===== PROFILER CPU TOP OPS: BASELINE =====")
+        print(baseline_metrics.profile_cpu_table)
+        if baseline_metrics.profile_cuda_table:
+            print("\n===== PROFILER CUDA TOP OPS: BASELINE =====")
+            print(baseline_metrics.profile_cuda_table)
+        return
+
+    if profile_mode == "semantic":
+        assert semantic_metrics is not None
+        print(
+            f"Semantic TBT: {semantic_metrics.tbt_s:.6f}s, "
+            f"Generated: {semantic_metrics.total_latency_s:.6f}s, "
+            f"Wall: {semantic_metrics.episode_wall_s:.6f}s, "
+            f"Consolidation: {semantic_metrics.consolidation_time_s:.6f}s, "
+            f"Overhead: {semantic_metrics.framework_overhead_s:.6f}s")
+        print("\n===== PROFILER CPU TOP OPS: SEMANTIC =====")
+        print(semantic_metrics.profile_cpu_table)
+        if semantic_metrics.profile_cuda_table:
+            print("\n===== PROFILER CUDA TOP OPS: SEMANTIC =====")
+            print(semantic_metrics.profile_cuda_table)
+        return
+
+    assert baseline_metrics is not None and semantic_metrics is not None
+
+    assert semantic_metrics.consolidation_time_s >= 0
+    assert baseline_metrics.tbt_s > 0 and baseline_metrics.total_latency_s > 0
+    assert semantic_metrics.tbt_s > 0 and semantic_metrics.total_latency_s > 0
+
+    print(
+        f"Baseline TBT: {baseline_metrics.tbt_s:.6f}s, "
+        f"Generated: {baseline_metrics.total_latency_s:.6f}s, "
+        f"Wall: {baseline_metrics.episode_wall_s:.6f}s, "
+        f"Overhead: {baseline_metrics.framework_overhead_s:.6f}s")
+    print(
+        f"Semantic TBT: {semantic_metrics.tbt_s:.6f}s, "
+        f"Generated: {semantic_metrics.total_latency_s:.6f}s, "
+        f"Wall: {semantic_metrics.episode_wall_s:.6f}s, "
+        f"Consolidation: {semantic_metrics.consolidation_time_s:.6f}s, "
+        f"Overhead: {semantic_metrics.framework_overhead_s:.6f}s")
+
+    print("\n===== PROFILER CPU TOP OPS: BASELINE =====")
+    print(baseline_metrics.profile_cpu_table)
+    print("\n===== PROFILER CPU TOP OPS: SEMANTIC =====")
+    print(semantic_metrics.profile_cpu_table)
+
+    if semantic_metrics.profile_cuda_table:
+        print("\n===== PROFILER CUDA TOP OPS: BASELINE =====")
+        print(baseline_metrics.profile_cuda_table)
+        print("\n===== PROFILER CUDA TOP OPS: SEMANTIC =====")
+        print(semantic_metrics.profile_cuda_table)
+
+    print("\n===== DELTA SUMMARY =====")
+    print(
+        f"Generated delta (semantic-baseline): "
+        f"{semantic_metrics.total_latency_s - baseline_metrics.total_latency_s:.6f}s"
+    )
+    print(
+        f"Overhead delta (semantic-baseline): "
+        f"{semantic_metrics.framework_overhead_s - baseline_metrics.framework_overhead_s:.6f}s"
+    )
+    print(
+        f"TBT delta (semantic-baseline): "
+        f"{semantic_metrics.tbt_s - baseline_metrics.tbt_s:.6f}s/token"
+    )
 
     # Under the assumption that tool latency can hide consolidation overhead,
     # semantic segment mode should provide a better latency signal while
