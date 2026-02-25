@@ -567,6 +567,10 @@ class KVCacheManager:
             num_tokens=num_tokens_need_slot,
             new_computed_segments=new_computed_segments_list,
         )
+
+        # Guard against negative values when existing allocation already
+        # satisfies the requested token budget.
+        num_tokens_to_allocate = max(0, num_tokens_to_allocate)
         
         if num_tokens_to_allocate > self.coordinator.get_num_free_tokens():
             # Cannot allocate enough new tokens
@@ -586,10 +590,15 @@ class KVCacheManager:
                 request.request_id, new_computed_segments_list
             )
 
-        # Allocate new blocks
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id, num_tokens_need_slot
-        )
+        # Allocate only the incremental tokens required in this step.
+        if num_tokens_to_allocate == 0:
+            new_blocks = tuple(
+                [] for _ in range(len(self.coordinator.single_type_managers))
+            )
+        else:
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id, num_tokens_to_allocate
+            )
 
         if not self.enable_caching or delay_cache_blocks:
             return self.create_kv_cache_blocks(new_blocks)
