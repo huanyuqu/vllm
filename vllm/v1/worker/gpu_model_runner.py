@@ -1558,9 +1558,18 @@ class GPUModelRunner(
                     num_segments_list.append(num_segs)
 
                 if segment_pointers_list:
-                    segment_pointers = torch.tensor(segment_pointers_list, dtype=torch.int64, device=self.device)
-                    segment_lens = torch.tensor(segment_lens_list, dtype=torch.int32, device=self.device)
-                    num_segments = torch.tensor(num_segments_list, dtype=torch.int32, device=self.device)
+                    segment_pointers = torch.tensor(
+                        segment_pointers_list,
+                        dtype=torch.int64,
+                    )
+                    segment_lens = torch.tensor(
+                        segment_lens_list,
+                        dtype=torch.int32,
+                    )
+                    num_segments = torch.tensor(
+                        num_segments_list,
+                        dtype=torch.int32,
+                    )
 
             encoder_seq_lens = self._get_encoder_seq_lens(
                 scheduled_encoder_inputs or {},

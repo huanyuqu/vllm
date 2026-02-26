@@ -172,6 +172,7 @@ class FlashAttentionMetadata:
     query_start_loc: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -458,6 +459,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
@@ -664,10 +666,46 @@ class FlashAttentionImpl(AttentionImpl):
             # - segment_lens / segment_{k,v}_ptrs: [B, max_num_segments]
             # The last segment is paged => ptrs are 0 and block_table only
             # contains its blocks.
-            num_segments_cpu = attn_metadata.num_segments.cpu()
-            flat_seg_ptrs = attn_metadata.segment_pointers
-            flat_seg_lens = attn_metadata.segment_lens
-            assert flat_seg_ptrs is not None and flat_seg_lens is not None
+            num_segments_tensor = attn_metadata.num_segments
+            flat_seg_ptrs_tensor = attn_metadata.segment_pointers
+            flat_seg_lens_tensor = attn_metadata.segment_lens
+            assert (
+                num_segments_tensor is not None
+                and flat_seg_ptrs_tensor is not None
+                and flat_seg_lens_tensor is not None
+            )
+
+            if num_segments_tensor.device.type == "cpu":
+                num_segments_cpu = num_segments_tensor
+            else:
+                num_segments_cpu = num_segments_tensor.cpu()
+
+            if flat_seg_ptrs_tensor.device.type == "cpu":
+                flat_seg_ptrs_cpu = flat_seg_ptrs_tensor
+            else:
+                flat_seg_ptrs_cpu = flat_seg_ptrs_tensor.cpu()
+
+            if flat_seg_lens_tensor.device.type == "cpu":
+                flat_seg_lens_cpu = flat_seg_lens_tensor
+            else:
+                flat_seg_lens_cpu = flat_seg_lens_tensor.cpu()
+
+            if attn_metadata.seq_lens_cpu is not None:
+                seq_lens_cpu = attn_metadata.seq_lens_cpu
+            elif attn_metadata.seq_lens.device.type == "cpu":
+                seq_lens_cpu = attn_metadata.seq_lens
+            else:
+                seq_lens_cpu = attn_metadata.seq_lens.cpu()
+
+            if attn_metadata.block_table.device.type == "cpu":
+                block_table_cpu = attn_metadata.block_table
+            else:
+                block_table_cpu = attn_metadata.block_table.cpu()
+
+            num_segments_list = num_segments_cpu.tolist()
+            flat_seg_ptrs_list = flat_seg_ptrs_cpu.tolist()
+            flat_seg_lens_list = flat_seg_lens_cpu.tolist()
+            seq_lens_list = seq_lens_cpu.tolist()
 
             # Flatten KV cache to compute base pointers for sealed segments.
             k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
@@ -680,21 +718,21 @@ class FlashAttentionImpl(AttentionImpl):
             per_req_num_segs: list[int] = []
 
             for req_idx in range(num_reqs):
-                n_sealed = int(num_segments_cpu[req_idx].item())
+                n_sealed = int(num_segments_list[req_idx])
                 sealed_ptrs: list[int] = []
                 sealed_lens: list[int] = []
                 sealed_tokens = 0
 
                 for _ in range(n_sealed):
-                    start_idx = int(flat_seg_ptrs[seg_cursor].item())
-                    seg_len = int(flat_seg_lens[seg_cursor].item())
+                    start_idx = int(flat_seg_ptrs_list[seg_cursor])
+                    seg_len = int(flat_seg_lens_list[seg_cursor])
                     seg_cursor += 1
 
                     sealed_ptrs.append(start_idx)
                     sealed_lens.append(seg_len)
                     sealed_tokens += seg_len
 
-                seq_len = int(attn_metadata.seq_lens[req_idx].item())
+                seq_len = int(seq_lens_list[req_idx])
                 paged_len = max(0, seq_len - sealed_tokens)
 
                 # Always include a trailing paged segment.
@@ -705,25 +743,21 @@ class FlashAttentionImpl(AttentionImpl):
 
             max_num_segments = max(per_req_num_segs) if per_req_num_segs else 1
             device = key_cache.device
-            segment_num = torch.tensor(
+            segment_num_cpu = torch.tensor(
                 per_req_num_segs,
                 dtype=torch.int32,
-                device=device,
             )
-            segment_lens = torch.zeros(
+            segment_lens_cpu = torch.zeros(
                 (num_reqs, max_num_segments),
                 dtype=torch.int32,
-                device=device,
             )
-            segment_k_ptrs = torch.zeros(
+            segment_k_ptrs_cpu = torch.zeros(
                 (num_reqs, max_num_segments),
                 dtype=torch.int64,
-                device=device,
             )
-            segment_v_ptrs = torch.zeros(
+            segment_v_ptrs_cpu = torch.zeros(
                 (num_reqs, max_num_segments),
                 dtype=torch.int64,
-                device=device,
             )
 
             # Build a block table just for the trailing paged segment.
@@ -731,11 +765,10 @@ class FlashAttentionImpl(AttentionImpl):
             for req_idx in range(num_reqs):
                 paged_blocks = cdiv(per_req_paged_lens[req_idx], block_size)
                 max_paged_blocks = max(max_paged_blocks, paged_blocks)
-            block_table_paged = torch.full(
+            block_table_paged_cpu = torch.full(
                 (num_reqs, max_paged_blocks if max_paged_blocks > 0 else 1),
                 -1,
                 dtype=torch.int32,
-                device=device,
             )
 
             for req_idx in range(num_reqs):
@@ -746,26 +779,32 @@ class FlashAttentionImpl(AttentionImpl):
                 for seg_j, (start_idx, seg_len) in enumerate(
                     zip(sealed_ptrs, sealed_lens)
                 ):
-                    segment_lens[req_idx, seg_j] = seg_len
-                    segment_k_ptrs[req_idx, seg_j] = k_flat[start_idx].data_ptr()
-                    segment_v_ptrs[req_idx, seg_j] = v_flat[start_idx].data_ptr()
+                    segment_lens_cpu[req_idx, seg_j] = seg_len
+                    segment_k_ptrs_cpu[req_idx, seg_j] = k_flat[start_idx].data_ptr()
+                    segment_v_ptrs_cpu[req_idx, seg_j] = v_flat[start_idx].data_ptr()
 
                 # Fill trailing paged segment.
                 paged_len = per_req_paged_lens[req_idx]
                 paged_seg_j = len(sealed_ptrs)
-                segment_lens[req_idx, paged_seg_j] = paged_len
+                segment_lens_cpu[req_idx, paged_seg_j] = paged_len
 
                 if paged_len > 0:
-                    used_blocks = cdiv(
-                        int(attn_metadata.seq_lens[req_idx].item()), block_size
-                    )
+                    used_blocks = cdiv(int(seq_lens_list[req_idx]), block_size)
                     paged_blocks = cdiv(paged_len, block_size)
                     if paged_blocks > 0:
-                        src = attn_metadata.block_table[
+                        src = block_table_cpu[
                             req_idx,
                             used_blocks - paged_blocks : used_blocks,
                         ]
-                        block_table_paged[req_idx, :paged_blocks] = src
+                        block_table_paged_cpu[req_idx, :paged_blocks] = src
+
+            segment_num = segment_num_cpu.to(device=device, non_blocking=True)
+            segment_lens = segment_lens_cpu.to(device=device, non_blocking=True)
+            segment_k_ptrs = segment_k_ptrs_cpu.to(device=device, non_blocking=True)
+            segment_v_ptrs = segment_v_ptrs_cpu.to(device=device, non_blocking=True)
+            block_table_paged = block_table_paged_cpu.to(
+                device=device, non_blocking=True
+            )
 
             descale_shape = (num_reqs, self.num_kv_heads)
             flash_attn_varlen_func(
