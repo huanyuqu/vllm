@@ -329,6 +329,14 @@ class LLMEngine:
     def consolidate_memory(self, request_id: str) -> None:
         self.engine_core.consolidate_memory(request_id)
 
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        """Execute pending semantic memory ops immediately.
+
+        Designed for external orchestrators to call during tool-calling gaps
+        (e.g., LLM -> tool -> LLM) after `seal` and `consolidate_memory`.
+        """
+        return self.engine_core.execute_semantic_memory_ops()
+
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 

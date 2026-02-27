@@ -587,6 +587,13 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
+    def apply_semantic_segment_memory_ops(
+        self,
+        moves: list[tuple[int, int, int, int]],
+        swaps: list[tuple[int, int, int, int]],
+    ) -> None:
+        self.model_runner.apply_semantic_segment_memory_ops(moves, swaps)
+
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return

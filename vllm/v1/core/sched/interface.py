@@ -187,3 +187,9 @@ class SchedulerInterface(ABC):
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments for the request."""
         raise NotImplementedError
+
+    def pop_pending_semantic_memory_ops(
+        self,
+    ) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+        """Pop pending semantic memory moves/swaps queued by consolidation."""
+        raise NotImplementedError

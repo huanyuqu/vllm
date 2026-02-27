@@ -670,27 +670,25 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
-    def _apply_semantic_segment_memory_ops(
-        self, scheduler_output: "SchedulerOutput"
+    def apply_semantic_segment_memory_ops(
+        self,
+        moves: list[tuple[int, int, int, int]],
+        swaps: list[tuple[int, int, int, int]],
     ) -> None:
-        # Execute semantic segment memory moves and swaps
-        if scheduler_output.semantic_segment_moves:
-            for (
-                group_id,
-                src_addr,
-                dst_addr,
-                size,
-            ) in scheduler_output.semantic_segment_moves:
+        if not moves and not swaps:
+            return
+
+        if moves:
+            for group_id, src_addr, dst_addr, size in moves:
                 if group_id < len(self.kv_caches):
                     kv_cache = self.kv_caches[group_id]
-                    # View as flat buffer [total_tokens, num_heads, head_size]
                     flat_cache = kv_cache.view(-1, *kv_cache.shape[2:])
                     flat_cache[dst_addr : dst_addr + size].copy_(
                         flat_cache[src_addr : src_addr + size]
                     )
 
-        if scheduler_output.semantic_segment_swaps:
-            for group_id, addr1, addr2, size in scheduler_output.semantic_segment_swaps:
+        if swaps:
+            for group_id, addr1, addr2, size in swaps:
                 if group_id < len(self.kv_caches):
                     kv_cache = self.kv_caches[group_id]
                     flat_cache = kv_cache.view(-1, *kv_cache.shape[2:])
@@ -2771,7 +2769,6 @@ class GPUModelRunner(
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
-                self._apply_semantic_segment_memory_ops(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(

@@ -192,11 +192,6 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
     
-    # List of memory moves (group_id, src_addr, dst_addr, size)
-    semantic_segment_moves: list[tuple[int, int, int, int]] = field(default_factory=list)
-    # List of memory swaps (group_id, addr1, addr2, size)
-    semantic_segment_swaps: list[tuple[int, int, int, int]] = field(default_factory=list)
-
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.
     pending_structured_output_tokens: bool = False

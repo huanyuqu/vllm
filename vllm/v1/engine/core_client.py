@@ -196,6 +196,9 @@ class EngineCoreClient(ABC):
     def consolidate_memory(self, request_id: str) -> None:
         raise NotImplementedError
 
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        raise NotImplementedError
+
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         raise NotImplementedError
 
@@ -289,6 +292,9 @@ class InprocClient(EngineCoreClient):
 
     def consolidate_memory(self, request_id: str) -> None:
         self.engine_core.consolidate_memory(request_id)
+
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        return self.engine_core.execute_semantic_memory_ops()
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()
@@ -771,6 +777,9 @@ class SyncMPClient(MPClient):
 
     def consolidate_memory(self, request_id: str) -> None:
         self.call_utility("consolidate_memory", request_id)
+
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        return self.call_utility("execute_semantic_memory_ops")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)

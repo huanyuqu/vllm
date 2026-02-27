@@ -301,6 +301,35 @@ class EngineCore:
         """Consolidate the memory of the sealed segments for the request."""
         self.scheduler.consolidate_segment_memory(request_id)
 
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        """Execute pending semantic memory ops immediately.
+
+        This is intended for orchestrators that run tool-calling between
+        decode phases and want to trigger semantic memory compaction in that
+        gap instead of waiting for the next model execute step.
+        """
+        moves, swaps = self.scheduler.pop_pending_semantic_memory_ops()
+        if not moves and not swaps:
+            return {
+                "num_moves": 0,
+                "num_swaps": 0,
+                "moved_tokens": 0,
+                "swapped_tokens": 0,
+            }
+
+        moved_tokens = sum(size for _, _, _, size in moves)
+        swapped_tokens = sum(size for _, _, _, size in swaps)
+        self.model_executor.collective_rpc(
+            "apply_semantic_segment_memory_ops", args=(moves, swaps)
+        )
+
+        return {
+            "num_moves": len(moves),
+            "num_swaps": len(swaps),
+            "moved_tokens": moved_tokens,
+            "swapped_tokens": swapped_tokens,
+        }
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -541,6 +570,29 @@ class EngineCore:
 
     def consolidate_memory(self, request_id: str) -> None:
         self.scheduler.consolidate_segment_memory(request_id)
+
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        moves, swaps = self.scheduler.pop_pending_semantic_memory_ops()
+        if not moves and not swaps:
+            return {
+                "num_moves": 0,
+                "num_swaps": 0,
+                "moved_tokens": 0,
+                "swapped_tokens": 0,
+            }
+
+        moved_tokens = sum(size for _, _, _, size in moves)
+        swapped_tokens = sum(size for _, _, _, size in swaps)
+        self.model_executor.collective_rpc(
+            "apply_semantic_segment_memory_ops", args=(moves, swaps)
+        )
+
+        return {
+            "num_moves": len(moves),
+            "num_swaps": len(swaps),
+            "moved_tokens": moved_tokens,
+            "swapped_tokens": swapped_tokens,
+        }
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.

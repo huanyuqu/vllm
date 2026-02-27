@@ -1501,6 +1501,39 @@ class LLM:
     def reset_prefix_cache(self) -> None:
         self.llm_engine.reset_prefix_cache()
 
+    def seal_segment(self, request_id: str) -> None:
+        """Seal the current semantic segment for a request."""
+        self.llm_engine.seal(request_id)
+
+    def consolidate_memory(self, request_id: str) -> None:
+        """Plan semantic segment memory compaction for a request."""
+        self.llm_engine.consolidate_memory(request_id)
+
+    def consolidate_semantic_memory(self, request_id: str) -> None:
+        """Backward-compatible alias of `consolidate_memory`."""
+        self.consolidate_memory(request_id)
+
+    def execute_semantic_memory_ops(self) -> dict[str, int]:
+        """Execute pending semantic memory ops immediately."""
+        return self.llm_engine.execute_semantic_memory_ops()
+
+    def seal(self, request_id: str) -> dict[str, int]:
+        """Seal and execute semantic memory ops for one tool boundary.
+
+        This is a convenience API for orchestrators in a typical
+        `LLM -> tool use -> LLM` loop. It will:
+        1) seal current semantic segment,
+        2) plan semantic memory compaction,
+        3) execute pending semantic memory ops immediately.
+
+        Returns:
+            A per-round summary dict containing move/swap counts and token sizes
+            from `execute_semantic_memory_ops`.
+        """
+        self.seal_segment(request_id)
+        self.consolidate_memory(request_id)
+        return self.execute_semantic_memory_ops()
+
     def sleep(self, level: int = 1):
         """
         Put the engine to sleep. The engine should not process any requests.
