@@ -32,9 +32,8 @@ ENABLE_TORCH_PROFILER = os.environ.get("VLLM_ENABLE_TORCH_PROFILER",
 class EpisodeMetrics(NamedTuple):
     tbt_s: float
     total_latency_s: float
-    consolidation_time_s: float
+    execute_memory_ops_time_s: float
     episode_wall_s: float
-    framework_overhead_s: float
     profile_cpu_table: str
     profile_cuda_table: str
 
@@ -78,13 +77,10 @@ def _extract_profile_tables(prof, has_cuda: bool) -> tuple[str, str]:
 
 def _run_episode(*,
                  use_semantic_segment: bool,
-                 consolidate: bool,
                  segment_tokens: int,
                  num_segments: int,
                  progress_label: str,
                  enable_profile: bool = True) -> EpisodeMetrics:
-    if consolidate and not use_semantic_segment:
-        raise ValueError("consolidate requires semantic segment mode")
     if segment_tokens <= 0 or num_segments <= 1:
         raise ValueError("segment_tokens>0 and num_segments>1 are required")
 
@@ -143,7 +139,7 @@ def _run_episode(*,
         prev_total_token_count = 0
         generated_time_s = 0.0
         generated_token_count = 0
-        consolidation_time_s = 0.0
+        execute_memory_ops_time_s = 0.0
         next_boundary = segment_tokens
         current_segment = 1
         has_cuda = torch.cuda.is_available()
@@ -186,16 +182,15 @@ def _run_episode(*,
                             generated_token_count += counted_new_tokens
 
                         while token_steps >= next_boundary and current_segment < num_segments:
-                            if consolidate:
+                            if use_semantic_segment:
                                 print(
                                     f"[{progress_label}] consolidate at "
                                     f"tokens={token_steps}, segment={current_segment}",
                                     flush=True,
                                 )
                                 t1 = time.perf_counter()
-                                llm.llm_engine.seal(req_a)
-                                llm.llm_engine.consolidate_memory(req_a)
-                                consolidation_time_s += time.perf_counter() - t1
+                                llm.seal(req_a)
+                                execute_memory_ops_time_s += time.perf_counter() - t1
                             current_segment += 1
                             next_boundary += segment_tokens
 
@@ -206,8 +201,6 @@ def _run_episode(*,
                     finished = True
 
         episode_wall_s = time.perf_counter() - episode_start
-        framework_overhead_s = max(
-            0.0, episode_wall_s - generated_time_s - consolidation_time_s)
 
         assert token_steps == total_tokens, (
             f"Expected exactly {total_tokens} generated tokens, got {token_steps}"
@@ -227,9 +220,8 @@ def _run_episode(*,
             f"[{progress_label}] finished: steps={step_count}, "
             f"tokens={token_steps}, segments={current_segment}, "
             f"post_total={total_latency_s:.6f}s, "
-            f"consolidate={consolidation_time_s:.6f}s, "
-            f"episode_wall={episode_wall_s:.6f}s, "
-            f"overhead={framework_overhead_s:.6f}s",
+            f"mem_ops={execute_memory_ops_time_s:.6f}s, "
+            f"episode_wall={episode_wall_s:.6f}s",
             flush=True,
         )
         profile_cpu_table, profile_cuda_table = _extract_profile_tables(
@@ -237,9 +229,8 @@ def _run_episode(*,
         return EpisodeMetrics(
             tbt_s=tbt_s,
             total_latency_s=total_latency_s,
-            consolidation_time_s=consolidation_time_s,
+            execute_memory_ops_time_s=execute_memory_ops_time_s,
             episode_wall_s=episode_wall_s,
-            framework_overhead_s=framework_overhead_s,
             profile_cpu_table=profile_cpu_table,
             profile_cuda_table=profile_cuda_table,
         )
@@ -276,7 +267,6 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
     if profile_mode in {"baseline", "both"}:
         baseline_metrics = _run_episode(
             use_semantic_segment=False,
-            consolidate=False,
             segment_tokens=segment_tokens,
             num_segments=num_segments,
             progress_label="baseline",
@@ -286,7 +276,6 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
     if profile_mode in {"semantic", "both"}:
         semantic_metrics = _run_episode(
             use_semantic_segment=True,
-            consolidate=True,
             segment_tokens=segment_tokens,
             num_segments=num_segments,
             progress_label="semantic",
@@ -298,8 +287,7 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
         print(
             f"Baseline TBT: {baseline_metrics.tbt_s:.6f}s, "
             f"Generated: {baseline_metrics.total_latency_s:.6f}s, "
-            f"Wall: {baseline_metrics.episode_wall_s:.6f}s, "
-            f"Overhead: {baseline_metrics.framework_overhead_s:.6f}s")
+            f"Wall: {baseline_metrics.episode_wall_s:.6f}s")
         print("\n===== PROFILER CPU TOP OPS: BASELINE =====")
         print(baseline_metrics.profile_cpu_table)
         if baseline_metrics.profile_cuda_table:
@@ -313,8 +301,7 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
             f"Semantic TBT: {semantic_metrics.tbt_s:.6f}s, "
             f"Generated: {semantic_metrics.total_latency_s:.6f}s, "
             f"Wall: {semantic_metrics.episode_wall_s:.6f}s, "
-            f"Consolidation: {semantic_metrics.consolidation_time_s:.6f}s, "
-            f"Overhead: {semantic_metrics.framework_overhead_s:.6f}s")
+            f"MemoryOps: {semantic_metrics.execute_memory_ops_time_s:.6f}s")
         print("\n===== PROFILER CPU TOP OPS: SEMANTIC =====")
         print(semantic_metrics.profile_cpu_table)
         if semantic_metrics.profile_cuda_table:
@@ -324,21 +311,18 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
 
     assert baseline_metrics is not None and semantic_metrics is not None
 
-    assert semantic_metrics.consolidation_time_s >= 0
     assert baseline_metrics.tbt_s > 0 and baseline_metrics.total_latency_s > 0
     assert semantic_metrics.tbt_s > 0 and semantic_metrics.total_latency_s > 0
 
     print(
         f"Baseline TBT: {baseline_metrics.tbt_s:.6f}s, "
         f"Generated: {baseline_metrics.total_latency_s:.6f}s, "
-        f"Wall: {baseline_metrics.episode_wall_s:.6f}s, "
-        f"Overhead: {baseline_metrics.framework_overhead_s:.6f}s")
+        f"Wall: {baseline_metrics.episode_wall_s:.6f}s")
     print(
         f"Semantic TBT: {semantic_metrics.tbt_s:.6f}s, "
         f"Generated: {semantic_metrics.total_latency_s:.6f}s, "
         f"Wall: {semantic_metrics.episode_wall_s:.6f}s, "
-        f"Consolidation: {semantic_metrics.consolidation_time_s:.6f}s, "
-        f"Overhead: {semantic_metrics.framework_overhead_s:.6f}s")
+        f"MemoryOps: {semantic_metrics.execute_memory_ops_time_s:.6f}s")
 
     print("\n===== PROFILER CPU TOP OPS: BASELINE =====")
     print(baseline_metrics.profile_cpu_table)
@@ -353,12 +337,12 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
 
     print("\n===== DELTA SUMMARY =====")
     print(
-        f"Generated delta (semantic-baseline): "
+        f"Generated delta (semantic_no_mem_ops-baseline): "
         f"{semantic_metrics.total_latency_s - baseline_metrics.total_latency_s:.6f}s"
     )
     print(
-        f"Overhead delta (semantic-baseline): "
-        f"{semantic_metrics.framework_overhead_s - baseline_metrics.framework_overhead_s:.6f}s"
+        f"MemoryOps delta (semantic-baseline): "
+        f"{semantic_metrics.execute_memory_ops_time_s - baseline_metrics.execute_memory_ops_time_s:.6f}s"
     )
     print(
         f"TBT delta (semantic-baseline): "
