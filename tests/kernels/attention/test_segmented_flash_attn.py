@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
+import os
 
 import pytest
 import torch
@@ -30,6 +31,20 @@ def _fa2_varlen_fwd_supports_segmented() -> bool:
         return "segment_num" in schema_str and "segment_lens" in schema_str
     except Exception:
         return False
+
+
+def _cuda_avg_ms(fn, warmup_iters: int, measure_iters: int) -> float:
+    for _ in range(warmup_iters):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(measure_iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / max(measure_iters, 1)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")
@@ -206,9 +221,10 @@ def test_v1_flashattn_impl_forwards_segment_metadata() -> None:
 
     # Semantic segment metadata: one sealed segment of length 16 at token index 0.
     # The remaining 16 tokens are the paged tail.
-    num_segments = torch.tensor([1], dtype=torch.int32)
-    segment_pointers = torch.tensor([0], dtype=torch.int32)
-    segment_lens = torch.tensor([16], dtype=torch.int32)
+    num_segments = torch.tensor([2], dtype=torch.int32)
+    segment_start_indices = torch.tensor([[0, 0]], dtype=torch.int64)
+    segment_lens = torch.tensor([[16, 16]], dtype=torch.int32)
+    segment_block_table = torch.tensor([[1]], dtype=torch.int32)
 
     # Build FlashAttentionMetadata required by FlashAttentionImpl.forward.
     query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
@@ -233,8 +249,9 @@ def test_v1_flashattn_impl_forwards_segment_metadata() -> None:
         scheduler_metadata=None,
         prefix_scheduler_metadata=None,
         max_num_splits=0,
-        segment_pointers=segment_pointers,
         segment_lens=segment_lens,
+        segment_block_table=segment_block_table,
+        segment_start_indices=segment_start_indices,
         num_segments=num_segments,
         causal=True,
     )
@@ -305,3 +322,173 @@ def test_v1_flashattn_impl_forwards_segment_metadata() -> None:
         soft_cap=None,
     )
     torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")
+@torch.inference_mode()
+def test_segmented_hybrid_attention_perf_vs_paged_attention() -> None:
+    """Micro-benchmark segmented-hybrid attention against paged attention.
+
+    This test runs the same decode workload with two calls:
+    1) baseline paged attention
+    2) segmented-hybrid attention (sealed segments + trailing paged segment)
+
+    It always prints timings and speedup. Optionally, set
+    `VLLM_SEGMENTED_ASSERT_SPEEDUP=1` to assert segmented-hybrid is faster.
+    """
+
+    torch.set_default_device("cuda")
+
+    fa_version = 2
+    if not is_fa_version_supported(fa_version):
+        pytest.skip(
+            f"Flash attention version {fa_version} not supported due "
+            f'to: "{fa_version_unsupported_reason(fa_version)}"'
+        )
+
+    sig = inspect.signature(flash_attn_varlen_func)
+    if "segment_num" not in sig.parameters:
+        pytest.skip("flash_attn_varlen_func does not support segmented attention")
+
+    if not _fa2_varlen_fwd_supports_segmented():
+        pytest.skip(
+            "Loaded torch.ops._vllm_fa2_C.varlen_fwd schema does not expose "
+            "segment_* arguments; likely still using an old _vllm_fa2_C.abi3.so"
+        )
+
+    current_platform.seed_everything(0)
+
+    warmup_iters = int(os.environ.get("VLLM_SEGMENTED_BENCH_WARMUP", "30"))
+    measure_iters = int(os.environ.get("VLLM_SEGMENTED_BENCH_ITERS", "200"))
+    assert_speedup = os.environ.get("VLLM_SEGMENTED_ASSERT_SPEEDUP", "0") == "1"
+
+    num_reqs = 8
+    query_len = 1
+    kv_len = 4096
+    sealed_seg_lens = [1024, 1024]
+    sealed_total = sum(sealed_seg_lens)
+    paged_len = kv_len - sealed_total
+    assert paged_len > 0
+
+    num_query_heads = 8
+    num_kv_heads = 8
+    head_size = 128
+    dtype = torch.bfloat16
+    block_size = 16
+    scale = head_size**-0.5
+    window_size = (-1, -1)
+
+    kv_blocks_per_req = kv_len // block_size
+    paged_blocks_per_req = paged_len // block_size
+    max_num_blocks_per_seq = kv_blocks_per_req
+    num_blocks = num_reqs * kv_blocks_per_req
+
+    query = torch.randn(num_reqs * query_len, num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+
+    cu_query_lens = torch.arange(0, num_reqs + 1, dtype=torch.int32) * query_len
+    kv_lens = torch.full((num_reqs,), kv_len, dtype=torch.int32)
+
+    block_tables = torch.empty(
+        (num_reqs, max_num_blocks_per_seq),
+        dtype=torch.int32,
+    )
+    for req_idx in range(num_reqs):
+        start_block = req_idx * kv_blocks_per_req
+        block_tables[req_idx] = torch.arange(
+            start_block,
+            start_block + kv_blocks_per_req,
+            dtype=torch.int32,
+        )
+
+    k_flat = key_cache.view(-1, num_kv_heads, head_size)
+    v_flat = value_cache.view(-1, num_kv_heads, head_size)
+
+    max_num_segments = len(sealed_seg_lens) + 1
+    segment_num = torch.full((num_reqs,), max_num_segments, dtype=torch.int32)
+    segment_lens = torch.zeros((num_reqs, max_num_segments), dtype=torch.int32)
+    segment_k_ptrs = torch.zeros((num_reqs, max_num_segments), dtype=torch.int64)
+    segment_v_ptrs = torch.zeros((num_reqs, max_num_segments), dtype=torch.int64)
+
+    for req_idx in range(num_reqs):
+        start_token_idx = req_idx * kv_len
+        running = 0
+        for seg_idx, seg_len in enumerate(sealed_seg_lens):
+            seg_start = start_token_idx + running
+            segment_lens[req_idx, seg_idx] = seg_len
+            segment_k_ptrs[req_idx, seg_idx] = k_flat[seg_start].data_ptr()
+            segment_v_ptrs[req_idx, seg_idx] = v_flat[seg_start].data_ptr()
+            running += seg_len
+        segment_lens[req_idx, len(sealed_seg_lens)] = paged_len
+
+    block_table_paged = torch.empty((num_reqs, paged_blocks_per_req), dtype=torch.int32)
+    for req_idx in range(num_reqs):
+        block_table_paged[req_idx] = block_tables[req_idx, -paged_blocks_per_req:]
+
+    out_paged = torch.empty_like(query)
+    out_segmented = torch.empty_like(query)
+
+    def _run_paged() -> None:
+        flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out_paged,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=query_len,
+            max_seqlen_k=kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            fa_version=fa_version,
+        )
+
+    def _run_segmented() -> None:
+        flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out_segmented,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=query_len,
+            max_seqlen_k=kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_table_paged,
+            softcap=0,
+            segment_num=segment_num,
+            segment_lens=segment_lens,
+            segment_k_ptrs=segment_k_ptrs,
+            segment_v_ptrs=segment_v_ptrs,
+            fa_version=fa_version,
+        )
+
+    _run_paged()
+    _run_segmented()
+    torch.testing.assert_close(out_segmented, out_paged, atol=2e-2, rtol=2e-2)
+
+    paged_ms = _cuda_avg_ms(_run_paged, warmup_iters, measure_iters)
+    segmented_ms = _cuda_avg_ms(_run_segmented, warmup_iters, measure_iters)
+    speedup = paged_ms / max(segmented_ms, 1e-8)
+
+    print(
+        "\n[segmented_perf] "
+        f"paged_ms={paged_ms:.4f}, "
+        f"segmented_ms={segmented_ms:.4f}, "
+        f"speedup={speedup:.4f}x, "
+        f"warmup={warmup_iters}, "
+        f"iters={measure_iters}"
+    )
+
+    if assert_speedup:
+        assert segmented_ms <= paged_ms, (
+            "Expected segmented-hybrid attention to be faster than paged "
+            f"when VLLM_SEGMENTED_ASSERT_SPEEDUP=1, but got paged_ms={paged_ms:.4f}, "
+            f"segmented_ms={segmented_ms:.4f}"
+        )

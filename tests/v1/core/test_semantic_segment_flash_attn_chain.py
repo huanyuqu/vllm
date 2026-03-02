@@ -316,11 +316,18 @@ def test_semantic_segment_seal_consolidate_drives_segmented_flashattn() -> None:
     assert torch.equal(k_flat_dbg[start_token_idx : start_token_idx + seg_len], logical_k[:seg_len])
     assert torch.equal(v_flat_dbg[start_token_idx : start_token_idx + seg_len], logical_v[:seg_len])
 
-    num_segments = torch.tensor([1], dtype=torch.int32)
-    segment_pointers = torch.tensor([start_token_idx], dtype=torch.int64)
-    segment_lens = torch.tensor([seg_len], dtype=torch.int32)
-
     full_block_table = torch.tensor([page_ids_a_post], dtype=torch.int32)
+    num_segments = torch.tensor([2], dtype=torch.int32)
+    segment_start_indices = torch.tensor(
+        [[start_token_idx, 0]], dtype=torch.int64
+    )
+    segment_lens = torch.tensor(
+        [[seg_len, kv_len - seg_len]], dtype=torch.int32
+    )
+    segment_block_table = torch.tensor(
+        [[full_block_table[0, -1].item()]], dtype=torch.int32
+    )
+
     query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
     seq_lens = torch.tensor([kv_len], dtype=torch.int32)
     slot_mapping = torch.empty((query_len,), dtype=torch.int32)
@@ -343,8 +350,9 @@ def test_semantic_segment_seal_consolidate_drives_segmented_flashattn() -> None:
         scheduler_metadata=None,
         prefix_scheduler_metadata=None,
         max_num_splits=0,
-        segment_pointers=segment_pointers,
         segment_lens=segment_lens,
+        segment_block_table=segment_block_table,
+        segment_start_indices=segment_start_indices,
         num_segments=num_segments,
         causal=True,
     )
@@ -674,11 +682,18 @@ def test_semantic_segment_consolidate_with_live_request_triggers_swaps() -> None
     seg_len = sealed_seg.capacity
     assert seg_len == prefix_len
 
-    num_segments = torch.tensor([1], dtype=torch.int32)
-    segment_pointers = torch.tensor([start_token_idx], dtype=torch.int64)
-    segment_lens = torch.tensor([seg_len], dtype=torch.int32)
-
     full_block_table = torch.tensor([page_ids_a_final], dtype=torch.int32)
+    num_segments = torch.tensor([2], dtype=torch.int32)
+    segment_start_indices = torch.tensor(
+        [[start_token_idx, 0]], dtype=torch.int64
+    )
+    segment_lens = torch.tensor(
+        [[seg_len, kv_len - seg_len]], dtype=torch.int32
+    )
+    segment_block_table = torch.tensor(
+        [[full_block_table[0, -1].item()]], dtype=torch.int32
+    )
+
     query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
     seq_lens = torch.tensor([kv_len], dtype=torch.int32)
     slot_mapping = torch.empty((query_len,), dtype=torch.int32)
@@ -701,8 +716,9 @@ def test_semantic_segment_consolidate_with_live_request_triggers_swaps() -> None
         scheduler_metadata=None,
         prefix_scheduler_metadata=None,
         max_num_splits=0,
-        segment_pointers=segment_pointers,
         segment_lens=segment_lens,
+        segment_block_table=segment_block_table,
+        segment_start_indices=segment_start_indices,
         num_segments=num_segments,
         causal=True,
     )

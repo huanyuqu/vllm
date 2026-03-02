@@ -27,6 +27,16 @@ PROFILE_ACTIVE_STEPS = 300
 PROFILE_ROW_LIMIT = 20
 ENABLE_TORCH_PROFILER = os.environ.get("VLLM_ENABLE_TORCH_PROFILER",
                                        "1") == "1"
+ATTR_SCOPES = [
+    "schedule: allocate_slots",
+    "schedule: update_after_schedule",
+    "gpu_model_runner: preprocess",
+    "gpu_model_runner: semantic_segment_metadata",
+    "gpu_model_runner: forward",
+    "gpu_model_runner: postprocess",
+    "flash_attn: segmented_metadata_pack",
+    "flash_attn: segmented_kernel",
+]
 
 
 class EpisodeMetrics(NamedTuple):
@@ -36,10 +46,12 @@ class EpisodeMetrics(NamedTuple):
     episode_wall_s: float
     profile_cpu_table: str
     profile_cuda_table: str
+    scope_cpu_ms: dict[str, float]
+    scope_cuda_ms: dict[str, float]
 
 
-def _build_profiler(enabled: bool):
-    if not enabled or not ENABLE_TORCH_PROFILER:
+def _build_profiler():
+    if not ENABLE_TORCH_PROFILER:
         return None
 
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -75,12 +87,37 @@ def _extract_profile_tables(prof, has_cuda: bool) -> tuple[str, str]:
             f"<failed to collect cuda profile table: {exc}>" if has_cuda else "")
 
 
+def _extract_profile_event_total_ms(prof, event_name: str) -> tuple[float, float]:
+    if prof is None:
+        return 0.0, 0.0
+    cpu_total_us = 0.0
+    cuda_total_us = 0.0
+    try:
+        for item in prof.key_averages():
+            key = getattr(item, "key", None)
+            if key == event_name:
+                cpu_total_us += float(getattr(item, "cpu_time_total", 0.0))
+                cuda_total_us += float(getattr(item, "cuda_time_total", 0.0))
+    except Exception:
+        return 0.0, 0.0
+    return cpu_total_us / 1000.0, cuda_total_us / 1000.0
+
+
+def _collect_scope_totals(prof, scope_names: list[str]) -> tuple[dict[str, float], dict[str, float]]:
+    cpu_totals_ms: dict[str, float] = {}
+    cuda_totals_ms: dict[str, float] = {}
+    for scope in scope_names:
+        cpu_ms, cuda_ms = _extract_profile_event_total_ms(prof, scope)
+        cpu_totals_ms[scope] = cpu_ms
+        cuda_totals_ms[scope] = cuda_ms
+    return cpu_totals_ms, cuda_totals_ms
+
+
 def _run_episode(*,
                  use_semantic_segment: bool,
                  segment_tokens: int,
                  num_segments: int,
-                 progress_label: str,
-                 enable_profile: bool = True) -> EpisodeMetrics:
+                 progress_label: str) -> EpisodeMetrics:
     if segment_tokens <= 0 or num_segments <= 1:
         raise ValueError("segment_tokens>0 and num_segments>1 are required")
 
@@ -143,10 +180,25 @@ def _run_episode(*,
         next_boundary = segment_tokens
         current_segment = 1
         has_cuda = torch.cuda.is_available()
-        prof = _build_profiler(enable_profile)
+        prof = _build_profiler()
+        worker_profiler_started = False
 
         loop_ctx = prof if prof is not None else nullcontext()
         episode_start = time.perf_counter()
+
+        if ENABLE_TORCH_PROFILER:
+            try:
+                llm.start_profile()
+                worker_profiler_started = True
+                print(
+                    f"[{progress_label}] worker profiler started",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[{progress_label}] worker profiler not started: {exc}",
+                    flush=True,
+                )
 
         with loop_ctx:
             while not finished:
@@ -200,6 +252,14 @@ def _run_episode(*,
                 if token_steps >= total_tokens:
                     finished = True
 
+        if worker_profiler_started:
+            llm.stop_profile()
+            print(
+                f"[{progress_label}] worker profiler stopped; "
+                "see VLLM_TORCH_PROFILER_DIR/profiler_out_0.txt",
+                flush=True,
+            )
+
         episode_wall_s = time.perf_counter() - episode_start
 
         assert token_steps == total_tokens, (
@@ -226,6 +286,7 @@ def _run_episode(*,
         )
         profile_cpu_table, profile_cuda_table = _extract_profile_tables(
             prof, has_cuda)
+        scope_cpu_ms, scope_cuda_ms = _collect_scope_totals(prof, ATTR_SCOPES)
         return EpisodeMetrics(
             tbt_s=tbt_s,
             total_latency_s=total_latency_s,
@@ -233,6 +294,8 @@ def _run_episode(*,
             episode_wall_s=episode_wall_s,
             profile_cpu_table=profile_cpu_table,
             profile_cuda_table=profile_cuda_table,
+            scope_cpu_ms=scope_cpu_ms,
+            scope_cuda_ms=scope_cuda_ms,
         )
     finally:
         del llm
@@ -270,7 +333,6 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
             segment_tokens=segment_tokens,
             num_segments=num_segments,
             progress_label="baseline",
-            enable_profile=True,
         )
 
     if profile_mode in {"semantic", "both"}:
@@ -279,7 +341,6 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
             segment_tokens=segment_tokens,
             num_segments=num_segments,
             progress_label="semantic",
-            enable_profile=True,
         )
 
     if profile_mode == "baseline":
@@ -290,6 +351,12 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
             f"Wall: {baseline_metrics.episode_wall_s:.6f}s")
         print("\n===== PROFILER CPU TOP OPS: BASELINE =====")
         print(baseline_metrics.profile_cpu_table)
+        print("\n===== ATTRIBUTION SCOPES (BASELINE, ms) =====")
+        for scope in ATTR_SCOPES:
+            print(
+                f"{scope}: cpu={baseline_metrics.scope_cpu_ms[scope]:.3f}, "
+                f"cuda={baseline_metrics.scope_cuda_ms[scope]:.3f}"
+            )
         if baseline_metrics.profile_cuda_table:
             print("\n===== PROFILER CUDA TOP OPS: BASELINE =====")
             print(baseline_metrics.profile_cuda_table)
@@ -304,6 +371,12 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
             f"MemoryOps: {semantic_metrics.execute_memory_ops_time_s:.6f}s")
         print("\n===== PROFILER CPU TOP OPS: SEMANTIC =====")
         print(semantic_metrics.profile_cpu_table)
+        print("\n===== ATTRIBUTION SCOPES (SEMANTIC, ms) =====")
+        for scope in ATTR_SCOPES:
+            print(
+                f"{scope}: cpu={semantic_metrics.scope_cpu_ms[scope]:.3f}, "
+                f"cuda={semantic_metrics.scope_cuda_ms[scope]:.3f}"
+            )
         if semantic_metrics.profile_cuda_table:
             print("\n===== PROFILER CUDA TOP OPS: SEMANTIC =====")
             print(semantic_metrics.profile_cuda_table)
@@ -334,6 +407,28 @@ def test_llm_user_entry_semantic_segment_agent_ttft_tbt(
         print(baseline_metrics.profile_cuda_table)
         print("\n===== PROFILER CUDA TOP OPS: SEMANTIC =====")
         print(semantic_metrics.profile_cuda_table)
+
+    print("\n===== ATTRIBUTION SCOPES DELTA (SEMANTIC - BASELINE, ms) =====")
+    all_scope_zero = True
+    for scope in ATTR_SCOPES:
+        cpu_delta = semantic_metrics.scope_cpu_ms[scope] - baseline_metrics.scope_cpu_ms[
+            scope
+        ]
+        cuda_delta = semantic_metrics.scope_cuda_ms[scope] - baseline_metrics.scope_cuda_ms[
+            scope
+        ]
+        if abs(cpu_delta) > 1e-6 or abs(cuda_delta) > 1e-6:
+            all_scope_zero = False
+        print(f"{scope}: cpu_delta={cpu_delta:.3f}, cuda_delta={cuda_delta:.3f}")
+
+    if all_scope_zero:
+        print(
+            "[attribution] all custom-scope deltas are zero in this process. "
+            "Likely profiling only the client process. "
+            "Use worker profiling with: "
+            "VLLM_TORCH_PROFILER_DIR=<dir> "
+            "VLLM_CUSTOM_SCOPES_FOR_PROFILING=1"
+        )
 
     print("\n===== DELTA SUMMARY =====")
     print(
