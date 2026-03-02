@@ -1514,60 +1514,64 @@ class GPUModelRunner(
         for kv_cache_gid, kv_cache_group in enumerate(
             self.kv_cache_config.kv_cache_groups
         ):
-            segment_pointers: torch.Tensor | None = None
             segment_lens: torch.Tensor | None = None
+            segment_block_table: torch.Tensor | None = None
+            segment_start_indices: torch.Tensor | None = None
             num_segments: torch.Tensor | None = None
+            num_segments_cpu: torch.Tensor | None = None
+            segment_pointers_list: list[int] = []
+            segment_lens_list: list[int] = []
+            num_segments_list: list[int] = []
 
             if self.cache_config.enable_semantic_segment:
-                segment_pointers_list = []
-                segment_lens_list = []
-                num_segments_list = []
-                
-                for i in range(num_reqs):
-                    req_id = self.input_batch.req_ids[i]
-                    req_state = self.requests[req_id]
-                    
-                    segments_obj = req_state.semantic_segments
-                    num_segs = 0
-                    
-                    if segments_obj is not None and kv_cache_gid < len(segments_obj.multi_group_segments):
-                        group_segments = segments_obj.multi_group_segments[kv_cache_gid]
-                        for segment in group_segments:
-                            if segment.is_sealed and segment.is_consolidated:
-                                # Optimized path for consolidated segments:
-                                # They are contiguous in memory, so we can directly calculate
-                                # the start address and length without iterating over blocks.
-                                if segment.head is not None:
-                                    max_block_size = max(self.cache_config.semantic_supported_block_sizes)
-                                    
-                                    start_token_idx = segment.head.block_id * max_block_size
-                                    start_token_idx += segment.head.relative_id * segment.head.size
-                                    
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: semantic_segment_metadata"
+                ):
+                    max_block_size = max(
+                        self.cache_config.semantic_supported_block_sizes
+                    )
+
+                    for i in range(num_reqs):
+                        req_id = self.input_batch.req_ids[i]
+                        req_state = self.requests[req_id]
+
+                        segments_obj = req_state.semantic_segments
+                        num_segs = 0
+
+                        if (
+                            segments_obj is not None
+                            and kv_cache_gid < len(segments_obj.multi_group_segments)
+                        ):
+                            group_segments = segments_obj.multi_group_segments[
+                                kv_cache_gid
+                            ]
+                            for segment in group_segments:
+                                if (
+                                    segment.is_sealed
+                                    and segment.is_consolidated
+                                    and segment.head is not None
+                                ):
+                                    # Optimized path for consolidated segments:
+                                    # They are contiguous in memory, so we can directly calculate
+                                    # the start address and length without iterating over blocks.
+                                    start_token_idx = (
+                                        segment.head.block_id * max_block_size
+                                    )
+                                    start_token_idx += (
+                                        segment.head.relative_id * segment.head.size
+                                    )
+
                                     # Use segment.length to get the number of valid tokens.
                                     length = segment.capacity
-                                    
+
                                     segment_pointers_list.append(start_token_idx)
                                     segment_lens_list.append(length)
                                     num_segs += 1
-                            # If not sealed or not consolidated, we skip adding it to segment_pointers.
-                            # These segments will be handled by the paged attention mechanism
-                            # using the block table, which already contains all blocks for the request.
-                    
-                    num_segments_list.append(num_segs)
+                                # If not sealed or not consolidated, we skip adding it to segment_pointers.
+                                # These segments will be handled by the paged attention mechanism
+                                # using the block table, which already contains all blocks for the request.
 
-                if segment_pointers_list:
-                    segment_pointers = torch.tensor(
-                        segment_pointers_list,
-                        dtype=torch.int64,
-                    )
-                    segment_lens = torch.tensor(
-                        segment_lens_list,
-                        dtype=torch.int32,
-                    )
-                    num_segments = torch.tensor(
-                        num_segments_list,
-                        dtype=torch.int32,
-                    )
+                        num_segments_list.append(num_segs)
 
             encoder_seq_lens = self._get_encoder_seq_lens(
                 scheduled_encoder_inputs or {},
@@ -1597,6 +1601,98 @@ class GPUModelRunner(
                 # graph mode.
                 blk_table.slot_mapping.gpu[total_num_scheduled_tokens:].fill_(-1)
 
+                if segment_pointers_list:
+                    segment_pointers_cpu = torch.tensor(
+                        segment_pointers_list,
+                        dtype=torch.int64,
+                    )
+                    flat_segment_lens_cpu = torch.tensor(
+                        segment_lens_list,
+                        dtype=torch.int32,
+                    )
+                    num_segments_cpu = torch.tensor(
+                        num_segments_list,
+                        dtype=torch.int32,
+                        pin_memory=self.pin_memory,
+                    )
+                    block_table_cpu = blk_table.get_cpu_tensor()
+
+                    max_num_segments_with_paged = max(num_segments_list) + 1
+                    packed_segment_lens_cpu = torch.zeros(
+                        (num_reqs, max_num_segments_with_paged),
+                        dtype=torch.int32,
+                        pin_memory=self.pin_memory,
+                    )
+                    segment_start_indices = torch.zeros(
+                        (num_reqs, max_num_segments_with_paged),
+                        dtype=torch.int64,
+                        pin_memory=self.pin_memory,
+                    )
+
+                    seg_cursor = 0
+                    seq_lens_list = seq_lens_cpu.tolist()
+                    segment_lens_prefix_sum = [0]
+                    for seg_len in segment_lens_list:
+                        segment_lens_prefix_sum.append(
+                            segment_lens_prefix_sum[-1] + seg_len
+                        )
+                    paged_blocks_per_req = [0] * num_reqs
+                    used_blocks_per_req = [0] * num_reqs
+                    max_paged_blocks = 0
+                    for req_idx in range(num_reqs):
+                        n_sealed = num_segments_list[req_idx]
+                        sealed_tokens = 0
+
+                        if n_sealed > 0:
+                            next_cursor = seg_cursor + n_sealed
+                            sealed_ptrs = segment_pointers_cpu[seg_cursor:next_cursor]
+                            sealed_lens = flat_segment_lens_cpu[seg_cursor:next_cursor]
+                            segment_start_indices[req_idx, :n_sealed] = sealed_ptrs
+                            packed_segment_lens_cpu[req_idx, :n_sealed] = sealed_lens
+                            sealed_tokens = (
+                                segment_lens_prefix_sum[next_cursor]
+                                - segment_lens_prefix_sum[seg_cursor]
+                            )
+                            seg_cursor = next_cursor
+
+                        seq_len = seq_lens_list[req_idx]
+                        paged_len = max(0, seq_len - sealed_tokens)
+                        packed_segment_lens_cpu[req_idx, n_sealed] = paged_len
+                        paged_blocks = cdiv(paged_len, blk_table.block_size)
+                        used_blocks = cdiv(seq_len, blk_table.block_size)
+                        paged_blocks_per_req[req_idx] = paged_blocks
+                        used_blocks_per_req[req_idx] = used_blocks
+                        if paged_blocks > max_paged_blocks:
+                            max_paged_blocks = paged_blocks
+
+                    block_table_paged_cpu = torch.full(
+                        (num_reqs, max_paged_blocks if max_paged_blocks > 0 else 1),
+                        -1,
+                        dtype=torch.int32,
+                        pin_memory=self.pin_memory,
+                    )
+
+                    for req_idx in range(num_reqs):
+                        paged_blocks = paged_blocks_per_req[req_idx]
+                        if paged_blocks <= 0:
+                            continue
+                        used_blocks = used_blocks_per_req[req_idx]
+                        block_table_paged_cpu[req_idx, :paged_blocks] = block_table_cpu[
+                            req_idx,
+                            used_blocks - paged_blocks : used_blocks,
+                        ]
+
+                    segment_lens = packed_segment_lens_cpu.to(
+                        device=self.device, non_blocking=True
+                    )
+                    segment_block_table = block_table_paged_cpu.to(
+                        device=self.device, non_blocking=True
+                    )
+                    num_segments_cpu = num_segments_cpu + 1
+                    num_segments = num_segments_cpu.to(
+                        device=self.device, non_blocking=True
+                    )
+
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc_cpu,
@@ -1615,9 +1711,11 @@ class GPUModelRunner(
                 encoder_seq_lens=encoder_seq_lens,
                 dcp_local_seq_lens=dcp_local_seq_lens,
                 dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
-                segment_pointers=segment_pointers,
                 segment_lens=segment_lens,
+                segment_block_table=segment_block_table,
+                segment_start_indices=segment_start_indices,
                 num_segments=num_segments,
+                num_segments_cpu=num_segments_cpu,
             )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
