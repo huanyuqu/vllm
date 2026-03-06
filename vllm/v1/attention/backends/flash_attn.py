@@ -615,7 +615,8 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache = kv_cache[0]
+        value_cache = kv_cache[1]
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
@@ -723,6 +724,25 @@ class FlashAttentionImpl(AttentionImpl):
                 )
 
             descale_shape = (num_reqs, self.num_kv_heads)
+            q_descale = None
+            k_descale = None
+            v_descale = None
+            if self.kv_cache_dtype.startswith("fp8"):
+                q_descale = (
+                    layer._q_scale.expand(descale_shape)
+                    if layer._q_scale is not None
+                    else None
+                )
+                k_descale = (
+                    layer._k_scale.expand(descale_shape)
+                    if layer._k_scale is not None
+                    else None
+                )
+                v_descale = (
+                    layer._v_scale.expand(descale_shape)
+                    if layer._v_scale is not None
+                    else None
+                )
             with record_function_or_nullcontext("flash_attn: segmented_kernel"):
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
@@ -745,15 +765,9 @@ class FlashAttentionImpl(AttentionImpl):
                     segment_v_ptrs=segment_v_ptrs,
                     num_splits=attn_metadata.max_num_splits,
                     fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape)
-                    if layer._q_scale is not None
-                    else None,
-                    k_descale=layer._k_scale.expand(descale_shape)
-                    if layer._k_scale is not None
-                    else None,
-                    v_descale=layer._v_scale.expand(descale_shape)
-                    if layer._v_scale is not None
-                    else None,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                 )
             return output
 
@@ -766,6 +780,25 @@ class FlashAttentionImpl(AttentionImpl):
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+            q_descale = None
+            k_descale = None
+            v_descale = None
+            if self.kv_cache_dtype.startswith("fp8"):
+                q_descale = (
+                    layer._q_scale.expand(descale_shape)
+                    if layer._q_scale is not None
+                    else None
+                )
+                k_descale = (
+                    layer._k_scale.expand(descale_shape)
+                    if layer._k_scale is not None
+                    else None
+                )
+                v_descale = (
+                    layer._v_scale.expand(descale_shape)
+                    if layer._v_scale is not None
+                    else None
+                )
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
@@ -776,9 +809,9 @@ class FlashAttentionImpl(AttentionImpl):
                     value_cache,
                     output[:num_actual_tokens],
                     attn_metadata,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                 )
                 return output
             else:
@@ -799,9 +832,9 @@ class FlashAttentionImpl(AttentionImpl):
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
@@ -829,9 +862,9 @@ class FlashAttentionImpl(AttentionImpl):
             fa_version=self.vllm_flash_attn_version,
             prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
             suffix_scheduler_metadata=attn_metadata.scheduler_metadata,
-            q_descale=layer._q_scale,
-            k_descale=layer._k_scale,
-            v_descale=layer._v_scale,
+            q_descale=layer._q_scale if self.kv_cache_dtype.startswith("fp8") else None,
+            k_descale=layer._k_scale if self.kv_cache_dtype.startswith("fp8") else None,
+            v_descale=layer._v_scale if self.kv_cache_dtype.startswith("fp8") else None,
             s_aux=self.sinks,
         )
         return output
@@ -947,11 +980,6 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_query_len
 
-        descale_shape = (
-            cu_seqlens_q.shape[0] - 1,  # type: ignore[union-attr]
-            self.num_kv_heads,
-        )
-
         # Call flash attention directly on Q, K, V tensors
         flash_attn_varlen_func(
             q=query,
@@ -968,9 +996,9 @@ class FlashAttentionImpl(AttentionImpl):
             window_size=self.sliding_window,
             softcap=self.logits_soft_cap,
             fa_version=self.vllm_flash_attn_version,
-            q_descale=layer._q_scale.expand(descale_shape),
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
             num_splits=1 if self.batch_invariant_enabled else 0,
         )
 
