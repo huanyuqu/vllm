@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.attention import AttentionMetadata
@@ -18,13 +19,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, MultiGroupSemanticSegments
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import OffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
-from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
+from vllm.v1.kv_offload.mediums import (
+    CPUAtomicRangeLoadStoreSpec,
+    CPUMixedAtomicLoadStoreSpec,
+    CPULoadStoreSpec,
+    GPUAtomicRangeLoadStoreSpec,
+    GPUMixedAtomicLoadStoreSpec,
+    GPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import OffloadingWorker, TransferSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -33,6 +41,105 @@ from vllm.v1.request import Request
 ReqId = str
 
 logger = init_logger(__name__)
+
+
+def _expand_block_ids_to_atomic_ids(
+    block_ids: np.ndarray,
+    block_size_factor: int,
+) -> list[int]:
+    atomic_ids: list[int] = []
+    for block_id in block_ids.tolist():
+        base = block_id * block_size_factor
+        atomic_ids.extend(base + idx for idx in range(block_size_factor))
+    return atomic_ids
+
+
+def _split_atomic_transfer(
+    atomic_positions: list[int],
+    src_atomic_ids: list[int],
+    dst_atomic_ids: list[int],
+    range_eligible_slices: list[tuple[int, int]],
+) -> tuple[
+    list[tuple[int, int]],
+    list[tuple[int, int]],
+    list[int],
+    list[int],
+]:
+    src_ranges: list[tuple[int, int]] = []
+    dst_ranges: list[tuple[int, int]] = []
+    src_blocks: list[int] = []
+    dst_blocks: list[int] = []
+
+    run_start: int | None = None
+    slice_idx = 0
+
+    def get_slice_end(atomic_pos: int) -> int | None:
+        nonlocal slice_idx
+        while (
+            slice_idx < len(range_eligible_slices)
+            and atomic_pos >= range_eligible_slices[slice_idx][1]
+        ):
+            slice_idx += 1
+
+        if slice_idx >= len(range_eligible_slices):
+            return None
+
+        slice_start, slice_end = range_eligible_slices[slice_idx]
+        if slice_start <= atomic_pos < slice_end:
+            return slice_end
+        return None
+
+    def flush_run(end_idx: int) -> None:
+        nonlocal run_start
+        if run_start is None:
+            return
+        length = end_idx - run_start
+        src_ranges.append((src_atomic_ids[run_start], length))
+        dst_ranges.append((dst_atomic_ids[run_start], length))
+        run_start = None
+
+    for idx, atomic_pos in enumerate(atomic_positions):
+        slice_end = get_slice_end(atomic_pos)
+        eligible = slice_end is not None
+        if eligible:
+            if run_start is None:
+                run_start = idx
+                continue
+
+            prev_idx = idx - 1
+            contiguous = (
+                atomic_pos < slice_end
+                and atomic_positions[prev_idx] + 1 == atomic_pos
+                and src_atomic_ids[prev_idx] + 1 == src_atomic_ids[idx]
+                and dst_atomic_ids[prev_idx] + 1 == dst_atomic_ids[idx]
+            )
+            if contiguous:
+                continue
+
+            flush_run(idx)
+            run_start = idx
+            continue
+
+        flush_run(idx)
+        src_blocks.append(src_atomic_ids[idx])
+        dst_blocks.append(dst_atomic_ids[idx])
+
+    flush_run(len(atomic_positions))
+    return src_ranges, dst_ranges, src_blocks, dst_blocks
+
+
+def _get_semantic_segments_by_req_id(
+    scheduler_output: SchedulerOutput,
+) -> dict[ReqId, MultiGroupSemanticSegments]:
+    segments: dict[ReqId, MultiGroupSemanticSegments] = {}
+    for req_data in scheduler_output.scheduled_new_reqs:
+        if req_data.semantic_segments is not None:
+            segments[req_data.req_id] = req_data.semantic_segments
+
+    cached_reqs = scheduler_output.scheduled_cached_reqs
+    if cached_reqs.semantic_segments is not None:
+        segments.update(cached_reqs.semantic_segments)
+    return segments
 
 
 @dataclass
@@ -136,12 +243,17 @@ class OffloadingConnectorScheduler:
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
         self.manager: OffloadingManager = spec.get_manager()
+        cache_config = spec.vllm_config.cache_config
+        self.enable_semantic_segment_memory_management = (
+            cache_config.enable_semantic_segment_memory_management
+        )
 
         self._requests: dict[ReqId, Request] = {}
         # list of GPU block IDs per request
         self._request_block_ids: dict[ReqId, list[int]] = {}
         # requests to load for the current scheduler step
         self._reqs_to_load: dict[ReqId, TransferSpec] = {}
+        self._reqs_to_load_windows: dict[ReqId, tuple[int, int]] = {}
         # request blocks are stored in order
         # index of next block (of size offloaded_block_size) to offload
         self._next_stored_block_idx: dict[ReqId, int] = {}
@@ -254,10 +366,143 @@ class OffloadingConnectorScheduler:
         )
 
         self._reqs_to_load[request.request_id] = (src_spec, dst_spec)
+        self._reqs_to_load_windows[request.request_id] = (
+            start_block_idx,
+            num_blocks,
+        )
         self._reqs_being_loaded[request.request_id].update(block_hashes)
         self._next_stored_block_idx[request.request_id] = num_blocks
 
-    def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
+    def _get_range_eligible_segment_atomic_slices(
+        self,
+        semantic_segments: MultiGroupSemanticSegments | None,
+        start_block_idx: int,
+        end_block_idx: int,
+    ) -> list[tuple[int, int]] | None:
+        if semantic_segments is None or not semantic_segments.multi_group_segments:
+            return None
+
+        group_segments = semantic_segments.multi_group_segments[0]
+        start_atomic = start_block_idx * self.block_size_factor
+        end_atomic = end_block_idx * self.block_size_factor
+        if end_atomic <= start_atomic:
+            return None
+
+        current_atomic = 0
+        selected_slices: list[tuple[int, int]] = []
+        for segment in group_segments:
+            if segment.capacity <= 0:
+                continue
+
+            if segment.capacity % self.gpu_block_size != 0:
+                return None
+
+            segment_atomic_len = segment.capacity // self.gpu_block_size
+            seg_start = current_atomic
+            seg_end = seg_start + segment_atomic_len
+            current_atomic = seg_end
+
+            if seg_end <= start_atomic:
+                continue
+            if seg_start >= end_atomic:
+                break
+
+            if not segment.is_sealed or not segment.is_consolidated:
+                continue
+
+            overlap_start = max(seg_start, start_atomic)
+            overlap_end = min(seg_end, end_atomic)
+            selected_slices.append(
+                (overlap_start - start_atomic, overlap_end - start_atomic)
+            )
+
+        if not selected_slices:
+            return None
+        return selected_slices
+
+    def _maybe_promote_transfer_to_segment_ranges(
+        self,
+        transfer_spec: TransferSpec,
+        semantic_segments: MultiGroupSemanticSegments | None,
+        start_block_idx: int,
+        end_block_idx: int,
+        atomic_positions: list[int] | None = None,
+    ) -> TransferSpec:
+        if not self.enable_semantic_segment_memory_management:
+            return transfer_spec
+
+        range_eligible_slices = self._get_range_eligible_segment_atomic_slices(
+            semantic_segments, start_block_idx, end_block_idx
+        )
+        if range_eligible_slices is None:
+            return transfer_spec
+
+        src_spec, dst_spec = transfer_spec
+        if isinstance(src_spec, GPULoadStoreSpec) and isinstance(dst_spec, CPULoadStoreSpec):
+            src_atomic_ids = src_spec.block_ids.tolist()
+            dst_atomic_ids = _expand_block_ids_to_atomic_ids(
+                dst_spec.block_ids,
+                self.block_size_factor,
+            )
+            if len(src_atomic_ids) != len(dst_atomic_ids):
+                return transfer_spec
+            if atomic_positions is None:
+                atomic_positions = list(range(len(src_atomic_ids)))
+
+            src_ranges, dst_ranges, src_blocks, dst_blocks = _split_atomic_transfer(
+                atomic_positions,
+                src_atomic_ids,
+                dst_atomic_ids,
+                range_eligible_slices,
+            )
+            if not src_ranges:
+                return transfer_spec
+            if src_blocks:
+                return (
+                    GPUMixedAtomicLoadStoreSpec(src_ranges, src_blocks),
+                    CPUMixedAtomicLoadStoreSpec(dst_ranges, dst_blocks),
+                )
+            return (
+                GPUAtomicRangeLoadStoreSpec(src_ranges),
+                CPUAtomicRangeLoadStoreSpec(dst_ranges),
+            )
+
+        if isinstance(src_spec, CPULoadStoreSpec) and isinstance(dst_spec, GPULoadStoreSpec):
+            src_atomic_ids = _expand_block_ids_to_atomic_ids(
+                src_spec.block_ids,
+                self.block_size_factor,
+            )
+            dst_atomic_ids = dst_spec.block_ids.tolist()
+            if len(src_atomic_ids) != len(dst_atomic_ids):
+                return transfer_spec
+            if atomic_positions is None:
+                atomic_positions = list(range(len(src_atomic_ids)))
+
+            src_ranges, dst_ranges, src_blocks, dst_blocks = _split_atomic_transfer(
+                atomic_positions,
+                src_atomic_ids,
+                dst_atomic_ids,
+                range_eligible_slices,
+            )
+            if not src_ranges:
+                return transfer_spec
+            if src_blocks:
+                return (
+                    CPUMixedAtomicLoadStoreSpec(src_ranges, src_blocks),
+                    GPUMixedAtomicLoadStoreSpec(dst_ranges, dst_blocks),
+                )
+            return (
+                CPUAtomicRangeLoadStoreSpec(src_ranges),
+                GPUAtomicRangeLoadStoreSpec(dst_ranges),
+            )
+
+        return transfer_spec
+
+    def _get_reqs_to_store(
+        self,
+        scheduler_output: SchedulerOutput,
+        semantic_segments_by_req_id: dict[ReqId, MultiGroupSemanticSegments],
+    ):
         reqs_to_store: dict[ReqId, TransferSpec] = {}
         # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
@@ -306,7 +551,9 @@ class OffloadingConnectorScheduler:
                 req, start_idx=start_block_idx, end_idx=num_blocks
             )
             dst_spec = store_output.store_spec
+            expected_atomic_ids = num_new_blocks * self.block_size_factor
             src_block_ids: list[int] = []
+            src_atomic_positions: list[int] = []
             for idx, blk_hash in enumerate(new_block_hashes):
                 if blk_hash not in block_hashes_to_store:
                     continue
@@ -314,9 +561,20 @@ class OffloadingConnectorScheduler:
                 gpu_block_idx = offloaded_block_idx * self.block_size_factor
                 for i in range(self.block_size_factor):
                     src_block_ids.append(block_ids[gpu_block_idx + i])
+                    src_atomic_positions.append(idx * self.block_size_factor + i)
             src_spec = GPULoadStoreSpec(src_block_ids)
 
-            reqs_to_store[req_id] = (src_spec, dst_spec)
+            transfer_spec: TransferSpec = (src_spec, dst_spec)
+            if src_block_ids:
+                transfer_spec = self._maybe_promote_transfer_to_segment_ranges(
+                    transfer_spec,
+                    semantic_segments_by_req_id.get(req_id),
+                    start_block_idx,
+                    num_blocks,
+                    atomic_positions=src_atomic_positions,
+                )
+
+            reqs_to_store[req_id] = transfer_spec
             self._reqs_being_stored[req_id] |= block_hashes_to_store
 
             logger.debug(
@@ -331,11 +589,28 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        semantic_segments_by_req_id = _get_semantic_segments_by_req_id(
+            scheduler_output
+        )
+        reqs_to_load = {
+            req_id: self._maybe_promote_transfer_to_segment_ranges(
+                transfer_spec,
+                semantic_segments_by_req_id.get(req_id),
+                *self._reqs_to_load_windows[req_id],
+            )
+            if req_id in self._reqs_to_load_windows
+            else transfer_spec
+            for req_id, transfer_spec in self._reqs_to_load.items()
+        }
         meta = OffloadingConnectorMetadata(
-            reqs_to_load=self._reqs_to_load,
-            reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            reqs_to_load=reqs_to_load,
+            reqs_to_store=self._get_reqs_to_store(
+                scheduler_output,
+                semantic_segments_by_req_id,
+            ),
         )
         self._reqs_to_load = {}
+        self._reqs_to_load_windows = {}
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -375,6 +650,7 @@ class OffloadingConnectorScheduler:
         self._requests.pop(req_id, None)
         self._request_block_ids.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
+        self._reqs_to_load_windows.pop(req_id, None)
 
         request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None

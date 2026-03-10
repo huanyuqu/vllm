@@ -19,12 +19,23 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_manager import MultiGroupSemanticSegments
+from vllm.v1.core.kv_cache_utils import BuddyTreeBlock, SemanticSegment
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     get_request_block_hasher,
     init_none_hash,
 )
+from vllm.v1.core.semantic_segment_manager import SemanticSegments
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_offload.mediums import (
+    CPUAtomicRangeLoadStoreSpec,
+    CPUMixedAtomicLoadStoreSpec,
+    CPULoadStoreSpec,
+    GPUAtomicRangeLoadStoreSpec,
+    GPUMixedAtomicLoadStoreSpec,
+    GPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
     OffloadingEvent,
@@ -390,6 +401,210 @@ def generate_store_output(block_hashes: Iterable[BlockHash]):
         store_spec=MockLoadStoreSpec(block_hashes),
         block_hashes_evicted=[],
     )
+
+
+def _make_multi_group_segments(
+    capacities: list[int],
+    block_size: int,
+    consolidated: bool = True,
+    consolidated_flags: list[bool] | None = None,
+) -> MultiGroupSemanticSegments:
+    segments = SemanticSegments()
+    next_block_id = 0
+    for segment_id, capacity in enumerate(capacities, start=1):
+        segment = SemanticSegment(segment_id=segment_id)
+        for _ in range(capacity // block_size):
+            segment.append(BuddyTreeBlock(block_id=next_block_id, size=block_size))
+            next_block_id += 1
+        segment.seal()
+        if consolidated_flags is None:
+            segment.is_consolidated = consolidated
+        else:
+            segment.is_consolidated = consolidated_flags[segment_id - 1]
+        segments.append(segment)
+    return MultiGroupSemanticSegments((segments,))
+
+
+def test_promote_store_transfer_to_segment_ranges():
+    vllm_config = create_vllm_config(block_size=4, max_num_batched_tokens=1000)
+    vllm_config.cache_config.enable_semantic_segment_memory_management = True
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "spec_name": "MockOffloadingSpec",
+            "spec_module_path": "tests.v1.kv_connector.unit.test_offloading_connector",  # noqa: E501
+            "block_size": 4,
+        },
+    )
+    scheduler = OffloadingConnector(vllm_config, KVConnectorRole.SCHEDULER)
+    connector_scheduler = scheduler.connector_scheduler
+    assert connector_scheduler is not None
+
+    transfer_spec = (
+        GPULoadStoreSpec([0, 1, 2, 3]),
+        CPULoadStoreSpec([10, 11, 12, 13]),
+    )
+    semantic_segments = _make_multi_group_segments([8, 8], block_size=4)
+
+    promoted = connector_scheduler._maybe_promote_transfer_to_segment_ranges(
+        transfer_spec,
+        semantic_segments,
+        start_block_idx=0,
+        end_block_idx=4,
+    )
+
+    src_spec, dst_spec = promoted
+    assert isinstance(src_spec, GPUAtomicRangeLoadStoreSpec)
+    assert isinstance(dst_spec, CPUAtomicRangeLoadStoreSpec)
+    assert src_spec.ranges.tolist() == [[0, 2], [2, 2]]
+    assert dst_spec.ranges.tolist() == [[10, 2], [12, 2]]
+
+
+def test_promote_load_transfer_to_segment_ranges_with_cpu_expansion():
+    vllm_config = create_vllm_config(block_size=4, max_num_batched_tokens=1000)
+    vllm_config.cache_config.enable_semantic_segment_memory_management = True
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "spec_name": "MockOffloadingSpec",
+            "spec_module_path": "tests.v1.kv_connector.unit.test_offloading_connector",  # noqa: E501
+            "block_size": 8,
+        },
+    )
+    scheduler = OffloadingConnector(vllm_config, KVConnectorRole.SCHEDULER)
+    connector_scheduler = scheduler.connector_scheduler
+    assert connector_scheduler is not None
+
+    transfer_spec = (
+        CPULoadStoreSpec([5, 6]),
+        GPULoadStoreSpec([20, 21, 22, 23]),
+    )
+    semantic_segments = _make_multi_group_segments([8, 8], block_size=4)
+
+    promoted = connector_scheduler._maybe_promote_transfer_to_segment_ranges(
+        transfer_spec,
+        semantic_segments,
+        start_block_idx=0,
+        end_block_idx=2,
+    )
+
+    src_spec, dst_spec = promoted
+    assert isinstance(src_spec, CPUAtomicRangeLoadStoreSpec)
+    assert isinstance(dst_spec, GPUAtomicRangeLoadStoreSpec)
+    assert src_spec.ranges.tolist() == [[10, 2], [12, 2]]
+    assert dst_spec.ranges.tolist() == [[20, 2], [22, 2]]
+
+
+def test_promote_partial_segment_window_to_partial_ranges():
+    vllm_config = create_vllm_config(block_size=4, max_num_batched_tokens=1000)
+    vllm_config.cache_config.enable_semantic_segment_memory_management = True
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "spec_name": "MockOffloadingSpec",
+            "spec_module_path": "tests.v1.kv_connector.unit.test_offloading_connector",
+            "block_size": 4,
+        },
+    )
+    scheduler = OffloadingConnector(vllm_config, KVConnectorRole.SCHEDULER)
+    connector_scheduler = scheduler.connector_scheduler
+    assert connector_scheduler is not None
+
+    transfer_spec = (
+        GPULoadStoreSpec([20, 21]),
+        CPULoadStoreSpec([30, 31]),
+    )
+    semantic_segments = _make_multi_group_segments([16], block_size=4)
+
+    promoted = connector_scheduler._maybe_promote_transfer_to_segment_ranges(
+        transfer_spec,
+        semantic_segments,
+        start_block_idx=1,
+        end_block_idx=3,
+    )
+
+    src_spec, dst_spec = promoted
+    assert isinstance(src_spec, GPUAtomicRangeLoadStoreSpec)
+    assert isinstance(dst_spec, CPUAtomicRangeLoadStoreSpec)
+    assert src_spec.ranges.tolist() == [[20, 2]]
+    assert dst_spec.ranges.tolist() == [[30, 2]]
+
+
+def test_promote_segment_overlap_to_mixed_ranges_and_blocks():
+    vllm_config = create_vllm_config(block_size=4, max_num_batched_tokens=1000)
+    vllm_config.cache_config.enable_semantic_segment_memory_management = True
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "spec_name": "MockOffloadingSpec",
+            "spec_module_path": "tests.v1.kv_connector.unit.test_offloading_connector",
+            "block_size": 4,
+        },
+    )
+    scheduler = OffloadingConnector(vllm_config, KVConnectorRole.SCHEDULER)
+    connector_scheduler = scheduler.connector_scheduler
+    assert connector_scheduler is not None
+
+    transfer_spec = (
+        GPULoadStoreSpec([0, 1, 5, 7]),
+        CPULoadStoreSpec([10, 11, 12, 13]),
+    )
+    semantic_segments = _make_multi_group_segments(
+        [8, 8],
+        block_size=4,
+        consolidated_flags=[True, False],
+    )
+
+    promoted = connector_scheduler._maybe_promote_transfer_to_segment_ranges(
+        transfer_spec,
+        semantic_segments,
+        start_block_idx=0,
+        end_block_idx=4,
+    )
+
+    src_spec, dst_spec = promoted
+    assert isinstance(src_spec, GPUMixedAtomicLoadStoreSpec)
+    assert isinstance(dst_spec, CPUMixedAtomicLoadStoreSpec)
+    assert src_spec.ranges.tolist() == [[0, 2]]
+    assert dst_spec.ranges.tolist() == [[10, 2]]
+    assert src_spec.block_ids.tolist() == [5, 7]
+    assert dst_spec.block_ids.tolist() == [12, 13]
+
+
+def test_segment_promotion_falls_back_when_ranges_do_not_align():
+    vllm_config = create_vllm_config(block_size=4, max_num_batched_tokens=1000)
+    vllm_config.cache_config.enable_semantic_segment_memory_management = True
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "spec_name": "MockOffloadingSpec",
+            "spec_module_path": "tests.v1.kv_connector.unit.test_offloading_connector",  # noqa: E501
+            "block_size": 4,
+        },
+    )
+    scheduler = OffloadingConnector(vllm_config, KVConnectorRole.SCHEDULER)
+    connector_scheduler = scheduler.connector_scheduler
+    assert connector_scheduler is not None
+
+    transfer_spec = (
+        GPULoadStoreSpec([0, 1, 2, 3]),
+        CPULoadStoreSpec([10, 12, 14, 16]),
+    )
+    semantic_segments = _make_multi_group_segments([8, 8], block_size=4)
+
+    promoted = connector_scheduler._maybe_promote_transfer_to_segment_ranges(
+        transfer_spec,
+        semantic_segments,
+        start_block_idx=0,
+        end_block_idx=4,
+    )
+
+    assert promoted == transfer_spec
 
 
 def test_offloading_connector(request_runner):

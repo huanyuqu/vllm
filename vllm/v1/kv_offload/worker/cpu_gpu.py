@@ -8,7 +8,12 @@ from vllm import _custom_ops as ops
 from vllm.attention import AttentionBackend
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
+from vllm.v1.kv_offload.mediums import (
+    AtomicRangeLoadStoreSpec,
+    MixedAtomicLoadStoreSpec,
+    CPULoadStoreSpec,
+    GPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
     TransferResult,
@@ -112,26 +117,79 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 )
             )
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
-        src_spec, dst_spec = spec
-        if isinstance(src_spec, CPULoadStoreSpec):
-            assert isinstance(dst_spec, GPULoadStoreSpec)
-            stream = self.h2d_stream
-            src_tensors = self.cpu_tensors
-            dst_tensors = self.gpu_tensors
-            src_block_size_factor = self.block_size_factor
-            dst_block_size_factor = 1
+    def _copy_tensor_ranges(
+        self,
+        src_tensor: torch.Tensor,
+        dst_tensor: torch.Tensor,
+        src_start: int,
+        dst_start: int,
+        length: int,
+        kv_dim_before_num_blocks: bool,
+    ) -> None:
+        if kv_dim_before_num_blocks:
+            dst_tensor[0, dst_start : dst_start + length].copy_(
+                src_tensor[0, src_start : src_start + length],
+                non_blocking=True,
+            )
+            dst_tensor[1, dst_start : dst_start + length].copy_(
+                src_tensor[1, src_start : src_start + length],
+                non_blocking=True,
+            )
         else:
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            assert isinstance(dst_spec, CPULoadStoreSpec)
-            stream = self.d2h_stream
-            src_tensors = self.gpu_tensors
-            dst_tensors = self.cpu_tensors
-            src_block_size_factor = 1
-            dst_block_size_factor = self.block_size_factor
+            dst_tensor[dst_start : dst_start + length].copy_(
+                src_tensor[src_start : src_start + length],
+                non_blocking=True,
+            )
 
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
+    def _transfer_atomic_ranges_async(
+        self,
+        job_id: int,
+        src_spec: AtomicRangeLoadStoreSpec,
+        dst_spec: AtomicRangeLoadStoreSpec,
+        stream: torch.cuda.Stream,
+        src_tensors: list[torch.Tensor],
+        dst_tensors: list[torch.Tensor],
+    ) -> bool:
+        src_ranges = src_spec.ranges
+        dst_ranges = dst_spec.ranges
+        assert src_ranges.shape == dst_ranges.shape
+
+        event = self.events_pool.pop() if self.events_pool else torch.Event()
+        with torch.cuda.stream(stream):
+            for src_tensor, dst_tensor, kv_dim in zip(
+                src_tensors,
+                dst_tensors,
+                self.kv_dim_before_num_blocks,
+            ):
+                for (src_start, src_len), (dst_start, dst_len) in zip(
+                    src_ranges.tolist(),
+                    dst_ranges.tolist(),
+                ):
+                    assert src_len == dst_len
+                    self._copy_tensor_ranges(
+                        src_tensor,
+                        dst_tensor,
+                        src_start,
+                        dst_start,
+                        src_len,
+                        kv_dim,
+                    )
+            event.record(stream)
+
+        self.transfer_events[job_id] = event
+        return True
+
+    def _transfer_block_mapping_async(
+        self,
+        src_blocks: np.ndarray,
+        dst_blocks: np.ndarray,
+        stream: torch.cuda.Stream,
+        src_tensors: list[torch.Tensor],
+        dst_tensors: list[torch.Tensor],
+        src_block_size_factor: int,
+        dst_block_size_factor: int,
+        event: torch.Event,
+    ) -> None:
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
 
@@ -153,7 +211,6 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         )
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        event = self.events_pool.pop() if self.events_pool else torch.Event()
         with torch.cuda.stream(stream):
             for src_tensor, dst_tensor, kv_dim in zip(
                 src_tensors, dst_tensors, self.kv_dim_before_num_blocks
@@ -168,6 +225,116 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 else:
                     ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
             event.record(stream)
+
+    def _transfer_mixed_atomic_async(
+        self,
+        job_id: int,
+        src_spec: MixedAtomicLoadStoreSpec,
+        dst_spec: MixedAtomicLoadStoreSpec,
+        stream: torch.cuda.Stream,
+        src_tensors: list[torch.Tensor],
+        dst_tensors: list[torch.Tensor],
+    ) -> bool:
+        src_ranges = src_spec.ranges
+        dst_ranges = dst_spec.ranges
+        src_blocks = src_spec.block_ids
+        dst_blocks = dst_spec.block_ids
+        assert src_ranges.shape == dst_ranges.shape
+        assert src_blocks.shape == dst_blocks.shape
+
+        event = self.events_pool.pop() if self.events_pool else torch.Event()
+        with torch.cuda.stream(stream):
+            if src_ranges.size:
+                for src_tensor, dst_tensor, kv_dim in zip(
+                    src_tensors,
+                    dst_tensors,
+                    self.kv_dim_before_num_blocks,
+                ):
+                    for (src_start, src_len), (dst_start, dst_len) in zip(
+                        src_ranges.tolist(),
+                        dst_ranges.tolist(),
+                    ):
+                        assert src_len == dst_len
+                        self._copy_tensor_ranges(
+                            src_tensor,
+                            dst_tensor,
+                            src_start,
+                            dst_start,
+                            src_len,
+                            kv_dim,
+                        )
+
+        if src_blocks.size:
+            self._transfer_block_mapping_async(
+                src_blocks,
+                dst_blocks,
+                stream,
+                src_tensors,
+                dst_tensors,
+                1,
+                1,
+                event,
+            )
+        else:
+            with torch.cuda.stream(stream):
+                event.record(stream)
+
+        self.transfer_events[job_id] = event
+        return True
+
+    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        src_spec, dst_spec = spec
+        if src_spec.medium() == CPULoadStoreSpec.medium():
+            assert dst_spec.medium() == GPULoadStoreSpec.medium()
+            stream = self.h2d_stream
+            src_tensors = self.cpu_tensors
+            dst_tensors = self.gpu_tensors
+            src_block_size_factor = self.block_size_factor
+            dst_block_size_factor = 1
+        else:
+            assert src_spec.medium() == GPULoadStoreSpec.medium()
+            assert dst_spec.medium() == CPULoadStoreSpec.medium()
+            stream = self.d2h_stream
+            src_tensors = self.gpu_tensors
+            dst_tensors = self.cpu_tensors
+            src_block_size_factor = 1
+            dst_block_size_factor = self.block_size_factor
+
+        if isinstance(src_spec, AtomicRangeLoadStoreSpec):
+            assert isinstance(dst_spec, AtomicRangeLoadStoreSpec)
+            return self._transfer_atomic_ranges_async(
+                job_id,
+                src_spec,
+                dst_spec,
+                stream,
+                src_tensors,
+                dst_tensors,
+            )
+
+        if isinstance(src_spec, MixedAtomicLoadStoreSpec):
+            assert isinstance(dst_spec, MixedAtomicLoadStoreSpec)
+            return self._transfer_mixed_atomic_async(
+                job_id,
+                src_spec,
+                dst_spec,
+                stream,
+                src_tensors,
+                dst_tensors,
+            )
+
+        src_blocks = src_spec.block_ids
+        dst_blocks = dst_spec.block_ids
+        event = self.events_pool.pop() if self.events_pool else torch.Event()
+        self._transfer_block_mapping_async(
+            src_blocks,
+            dst_blocks,
+            stream,
+            src_tensors,
+            dst_tensors,
+            src_block_size_factor,
+            dst_block_size_factor,
+            event,
+        )
 
         self.transfer_events[job_id] = event
 

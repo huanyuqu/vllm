@@ -1,0 +1,1 @@
+- If you want to run `pytest`, remember to use the `vagent` conda environment, or you can use `$HOME/miniconda3/envs/vagent/bin/python -m pytest` to run pytest without activating the environment.
