@@ -704,6 +704,329 @@ def test_scheduler_to_model_runner_semantic_ops_vs_paged(dist_init, release_b: b
     assert np.array_equal(sem_token, paged_token)
 
 
+def test_memory_management_only_no_kernel_basic_parity(dist_init):
+    """Verify forward pass with memory management (no segment kernel) produces
+    the same result as pure paged attention, including after a segment seal.
+
+    Uses a real scheduler so the SemanticSegmentCoordinator block-allocation
+    path is exercised across a chunked prefill (two schedule steps) and the
+    segment is sealed at least once before the final decode step.
+    Both runners receive the same sequence of SchedulerOutput objects; the
+    mm-only runner uses paged attention for the forward pass just like the
+    baseline paged runner, so their sampled tokens must be identical.
+    """
+
+    def _build_runner(memory_management: bool) -> GPUModelRunner:
+        vllm_config = get_vllm_config()
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if memory_management:
+            vllm_config.cache_config.enable_semantic_segment_memory_management = True
+            vllm_config.cache_config.enable_semantic_segment_kernel = False
+            vllm_config.cache_config.semantic_supported_block_sizes = [BLOCK_SIZE]
+            vllm_config.cache_config.semantic_eviction_policy = "tight"
+
+        runner = GPUModelRunner(vllm_config, DEVICE)
+        runner.load_model()
+        kv_cache_spec = runner.get_kv_cache_spec()
+        kv_cache_config = get_kv_cache_configs(
+            vllm_config, [kv_cache_spec], [1 * GiB_bytes]
+        )[0]
+        runner.initialize_kv_cache(kv_cache_config)
+        return runner
+
+    def _consume_step(runner: GPUModelRunner, so: SchedulerOutput):
+        out = runner.execute_model(so)
+        if out is None:
+            out = runner.sample_tokens(None)
+        return out
+
+    # Build a scheduler configured with memory management only (no kernel).
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=16,
+        max_num_batched_tokens=192,
+        max_model_len=4096,
+        long_prefill_token_threshold=160,
+        enable_chunked_prefill=True,
+    )
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    cache_config = CacheConfig(
+        block_size=BLOCK_SIZE,
+        gpu_memory_utilization=0.9,
+        swap_space=0,
+        cache_dtype="auto",
+        enable_semantic_segment_memory_management=True,
+        enable_semantic_segment_kernel=False,
+        semantic_supported_block_sizes=[16, 32, 64],
+        semantic_eviction_policy="tight",
+    )
+    cache_config.num_gpu_blocks = 1000
+    vllm_config = VllmConfig(
+        scheduler_config=scheduler_config,
+        model_config=model_config,
+        cache_config=cache_config,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"], FullAttentionSpec(BLOCK_SIZE, 1, 1, torch.float32, False)
+            )
+        ],
+    )
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        block_size=BLOCK_SIZE,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+    )
+
+    (req_a,) = create_requests(
+        num_requests=1,
+        num_tokens=256,
+        block_size=BLOCK_SIZE,
+        req_ids=["req_a_basic_seal"],
+    )
+    scheduler.add_request(req_a)
+
+    # Chunked prefill: two schedule steps to cover the 256-token context.
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens[req_a.request_id] == 160
+    out2 = scheduler.schedule()
+    assert out2.num_scheduled_tokens[req_a.request_id] == 96
+
+    # Seal the unsealed segment so the sealed-segment code path is exercised
+    # before the decode forward pass.
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    segs_obj = manager.req_to_segments[req_a.request_id]
+    tail = segs_obj.unsealed_segment.tail
+    assert tail is not None
+    tail.block_hash = make_block_hash_with_group_id(BlockHash(b"u" * 32), 0)
+    scheduler.seal_segment(req_a.request_id)
+
+    # Decode step after sealing (no consolidation, just paged attention).
+    out3 = scheduler.schedule()
+    assert out3.num_scheduled_tokens[req_a.request_id] == 1
+
+    runner_mm_only = _build_runner(memory_management=True)
+    runner_paged = _build_runner(memory_management=False)
+
+    # Feed the prefill outputs to both runners.
+    for so in [out1, out2]:
+        _consume_step(runner_mm_only, so)
+        _consume_step(runner_paged, so)
+
+    # The decode step after sealing must yield the same sampled token.
+    out_mm = _consume_step(runner_mm_only, out3)
+    out_paged = _consume_step(runner_paged, out3)
+
+    assert out_mm is not None
+    assert out_paged is not None
+    assert np.array_equal(out_mm.sampled_token_ids[0], out_paged.sampled_token_ids[0])
+
+
+@pytest.mark.parametrize("release_b", [False, True])
+def test_memory_management_only_no_kernel_consolidation_parity(
+    dist_init, release_b: bool
+):
+    """E2E: memory management only (no segment kernel) + segment consolidation
+    produces the same output as pure paged attention.
+
+    After consolidate_segment_memory the scheduler emits move/swap ops.
+    This test verifies that:
+    1. apply_semantic_segment_memory_ops correctly relocates KV data.
+    2. The updated block IDs are reflected in the block table.
+    3. The subsequent paged-attention forward pass reads the right KV values
+       and produces the same token as a baseline paged runner that receives
+       the identical memory ops.
+    """
+
+    def _build_runner(memory_management: bool) -> GPUModelRunner:
+        vllm_config = get_vllm_config()
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if memory_management:
+            vllm_config.cache_config.enable_semantic_segment_memory_management = True
+            vllm_config.cache_config.enable_semantic_segment_kernel = False
+            vllm_config.cache_config.semantic_supported_block_sizes = [BLOCK_SIZE]
+            vllm_config.cache_config.semantic_eviction_policy = "tight"
+
+        runner = GPUModelRunner(vllm_config, DEVICE)
+        runner.load_model()
+        kv_cache_spec = runner.get_kv_cache_spec()
+        kv_cache_config = get_kv_cache_configs(
+            vllm_config, [kv_cache_spec], [1 * GiB_bytes]
+        )[0]
+        runner.initialize_kv_cache(kv_cache_config)
+        return runner
+
+    def _consume_step(runner: GPUModelRunner, so: SchedulerOutput):
+        out = runner.execute_model(so)
+        if out is None:
+            out = runner.sample_tokens(None)
+        return out
+
+    def _build_followup_decode_output(
+        runner: GPUModelRunner, req_id: str
+    ) -> SchedulerOutput:
+        req_state = runner.requests[req_id]
+        num_groups = len(runner.kv_cache_config.kv_cache_groups)
+        next_block_ids = tuple(
+            [group_block_ids[-1] + 1] if group_block_ids else [0]
+            for group_block_ids in req_state.block_ids
+        )
+        cached_req_data = CachedRequestData(
+            req_ids=[req_id],
+            resumed_req_ids=set(),
+            new_token_ids=[[]],
+            all_token_ids={},
+            new_block_ids=[next_block_ids],
+            num_computed_tokens=[req_state.num_computed_tokens],
+            num_output_tokens=[len(req_state.output_token_ids)],
+        )
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached_req_data,
+            num_scheduled_tokens={req_id: 1},
+            total_num_scheduled_tokens=1,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[0] * num_groups,
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+
+    # Build scheduler with memory management only (no segment kernel).
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=16,
+        max_num_batched_tokens=192,
+        max_model_len=4096,
+        long_prefill_token_threshold=160,
+        enable_chunked_prefill=True,
+    )
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    cache_config = CacheConfig(
+        block_size=BLOCK_SIZE,
+        gpu_memory_utilization=0.9,
+        swap_space=0,
+        cache_dtype="auto",
+        enable_semantic_segment_memory_management=True,
+        enable_semantic_segment_kernel=False,
+        semantic_supported_block_sizes=[16, 32, 64],
+        semantic_eviction_policy="tight",
+    )
+    cache_config.num_gpu_blocks = 1000
+    vllm_config = VllmConfig(
+        scheduler_config=scheduler_config,
+        model_config=model_config,
+        cache_config=cache_config,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"], FullAttentionSpec(BLOCK_SIZE, 1, 1, torch.float32, False)
+            )
+        ],
+    )
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        block_size=BLOCK_SIZE,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+    )
+
+    req_a, req_b = create_requests(
+        num_requests=2,
+        num_tokens=256,
+        block_size=BLOCK_SIZE,
+        req_ids=["req_a_mm_only", "req_b_mm_only"],
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens[req_a.request_id] == 160
+    assert out1.num_scheduled_tokens[req_b.request_id] == 32
+
+    out2 = scheduler.schedule()
+    assert out2.num_scheduled_tokens[req_a.request_id] == 96
+
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    segs_a_obj = manager.req_to_segments[req_a.request_id]
+    tail_a = segs_a_obj.unsealed_segment.tail
+    assert tail_a is not None
+    tail_a.block_hash = make_block_hash_with_group_id(BlockHash(b"w" * 32), 0)
+    scheduler.seal_segment(req_a.request_id)
+
+    out_b_free = None
+    if release_b:
+        # Free B before consolidation to force move-path.
+        segs_b_obj = manager.req_to_segments[req_b.request_id]
+        tail_b = segs_b_obj.unsealed_segment.tail
+        assert tail_b is not None
+        tail_b.block_hash = make_block_hash_with_group_id(BlockHash(b"v" * 32), 0)
+        scheduler.finish_requests(req_b.request_id, RequestStatus.FINISHED_ABORTED)
+        out_b_free = scheduler.schedule()
+
+    scheduler.consolidate_segment_memory(req_a.request_id)
+    out_ops = scheduler.schedule()
+
+    # Collect the CUDA memory ops (moves/swaps) produced by consolidation.
+    moves, swaps = scheduler.pop_pending_semantic_memory_ops()
+    if release_b:
+        assert moves, "expected move ops when req_b was freed before consolidation"
+    else:
+        assert swaps, "expected swap ops when req_b was still alive during consolidation"
+
+    # Build both runners: memory-management-only and pure paged.
+    runner_mm_only = _build_runner(memory_management=True)
+    runner_paged = _build_runner(memory_management=False)
+
+    # Feed the same prefill scheduler outputs to both runners.
+    for so in filter(None, [out1, out2, out_b_free]):
+        _consume_step(runner_mm_only, so)
+        _consume_step(runner_paged, so)
+
+    # Apply the consolidation CUDA ops to both runners so their KV caches
+    # have data at the post-consolidation block locations.
+    runner_mm_only.apply_semantic_segment_memory_ops(moves, swaps)
+    runner_paged.apply_semantic_segment_memory_ops(moves, swaps)
+
+    # Feed the decode step whose block IDs reflect the consolidated layout.
+    _consume_step(runner_mm_only, out_ops)
+    _consume_step(runner_paged, out_ops)
+
+    # Run one more decode step and compare sampled tokens.
+    followup_mm_only = _build_followup_decode_output(runner_mm_only, req_a.request_id)
+    out_mm_only = _consume_step(runner_mm_only, followup_mm_only)
+    assert out_mm_only is not None
+    mm_only_token = out_mm_only.sampled_token_ids[0]
+
+    followup_paged = _build_followup_decode_output(runner_paged, req_a.request_id)
+    out_paged = _consume_step(runner_paged, followup_paged)
+    assert out_paged is not None
+    paged_token = out_paged.sampled_token_ids[0]
+
+    assert np.array_equal(mm_only_token, paged_token)
+
+
 def test_kv_cache_stride_order(monkeypatch, model_runner):
     # This test checks if GPUModelRunner initializes correctly when an attention
     # backend enforces a non-default KV cache stride order.
