@@ -1523,7 +1523,7 @@ class GPUModelRunner(
             segment_lens_list: list[int] = []
             num_segments_list: list[int] = []
 
-            if self.cache_config.enable_semantic_segment:
+            if self.cache_config.enable_semantic_segment_kernel:
                 with record_function_or_nullcontext(
                     "gpu_model_runner: semantic_segment_metadata"
                 ):

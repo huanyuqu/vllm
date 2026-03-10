@@ -4,7 +4,7 @@
 from dataclasses import field
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, SkipValidation, field_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from pydantic.dataclasses import dataclass
 
 from vllm.config.utils import config
@@ -78,7 +78,19 @@ class CacheConfig:
     """Whether to enable prefix caching. Enabled by default for V1."""
     enable_semantic_segment: bool = False
     """Whether to enable semantic segment based caching. This is an experimental
-    feature and disabled by default."""
+    feature and disabled by default.
+    Deprecated: use enable_semantic_segment_memory_management and
+    enable_semantic_segment_kernel instead."""
+    enable_semantic_segment_memory_management: bool = False
+    """Whether to enable semantic segment based memory management (block
+    allocation, eviction, and movement). When True the scheduler uses the
+    SemanticSegmentCoordinator instead of the standard paged coordinator.
+    If enable_semantic_segment=True, this is automatically set to True."""
+    enable_semantic_segment_kernel: bool = False
+    """Whether to use segmented attention kernels during the forward pass when
+    sealed+consolidated segments are available. Requires
+    enable_semantic_segment_memory_management=True.
+    If enable_semantic_segment=True, this is automatically set to True."""
     semantic_eviction_policy: SemanticEvictionPolicy = "tight"
     """The eviction policy for semantic segment caching."""
     semantic_supported_block_sizes: list[int] | None = None
@@ -154,6 +166,20 @@ class CacheConfig:
     """The backend to use for KV cache offloading. Supported backends include
     'native' (vLLM native CPU offloading), 'lmcache' This option must be used 
     together with kv_offloading_size."""
+
+    @model_validator(mode="after")
+    def _apply_semantic_segment_compat(self) -> "CacheConfig":
+        """Backward compat: enable_semantic_segment=True implies both new flags."""
+        if self.enable_semantic_segment:
+            object.__setattr__(self, "enable_semantic_segment_memory_management", True)
+            object.__setattr__(self, "enable_semantic_segment_kernel", True)
+        if (self.enable_semantic_segment_kernel
+                and not self.enable_semantic_segment_memory_management):
+            raise ValueError(
+                "enable_semantic_segment_kernel=True requires "
+                "enable_semantic_segment_memory_management=True"
+            )
+        return self
 
     def compute_hash(self) -> str:
         """

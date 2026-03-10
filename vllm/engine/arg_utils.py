@@ -427,6 +427,10 @@ class EngineArgs:
     block_size: BlockSize | None = CacheConfig.block_size
     enable_prefix_caching: bool | None = CacheConfig.enable_prefix_caching
     enable_semantic_segment: bool = CacheConfig.enable_semantic_segment
+    enable_semantic_segment_memory_management: bool = (
+        CacheConfig.enable_semantic_segment_memory_management
+    )
+    enable_semantic_segment_kernel: bool = CacheConfig.enable_semantic_segment_kernel
     semantic_eviction_policy: str = CacheConfig.semantic_eviction_policy
     semantic_supported_block_sizes: list[int] | None = (
         CacheConfig.semantic_supported_block_sizes
@@ -931,6 +935,14 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--enable-semantic-segment", **cache_kwargs["enable_semantic_segment"]
+        )
+        cache_group.add_argument(
+            "--enable-semantic-segment-memory-management",
+            **cache_kwargs["enable_semantic_segment_memory_management"],
+        )
+        cache_group.add_argument(
+            "--enable-semantic-segment-kernel",
+            **cache_kwargs["enable_semantic_segment_kernel"],
         )
         cache_group.add_argument(
             "--semantic-eviction-policy", **cache_kwargs["semantic_eviction_policy"]
@@ -1442,6 +1454,10 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             enable_semantic_segment=self.enable_semantic_segment,
+            enable_semantic_segment_memory_management=(
+                self.enable_semantic_segment_memory_management
+            ),
+            enable_semantic_segment_kernel=self.enable_semantic_segment_kernel,
             semantic_eviction_policy=self.semantic_eviction_policy,
             semantic_supported_block_sizes=self.semantic_supported_block_sizes,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
