@@ -6,7 +6,7 @@ def run_benchmark():
     # 隐层维度 4096, 32个Head, 16个Token为一个Block
     # FP16每元素2字节，K和V各占一半
     # Block Size: 16 * 4096 * 2 (KV) * 2 (bytes) = 262,144 bytes = 256 KB
-    num_layers = 36
+    num_layers = 12
     seq_len = 32 * 1024
     block_size = 16
     head_dim = 128
@@ -24,7 +24,7 @@ def run_benchmark():
     # 【核心】务必使用 pin_memory 控制 CPU 在锁页内存区，否则都会被缺页中断拖慢
     print("Allocating pinned memory on CPU... ", end="")
     src_layers = [
-        torch.randn(num_blocks, elements_per_block, dtype=torch.float16).pin_memory()
+        torch.empty(num_blocks, elements_per_block, dtype=torch.float16).pin_memory()
         for _ in range(num_layers)
     ]
     print("Done.")

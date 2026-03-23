@@ -39,7 +39,19 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--prompt-len", type=int, default=32 * 1024)
-    parser.add_argument("--decode-tokens", type=int, default=400)
+    parser.add_argument(
+        "--compute-tokens",
+        type=int,
+        default=400,
+        help="Number of tokens to decode or prefill in the compute phase.",
+    )
+    parser.add_argument(
+        "--compute-mode",
+        type=str,
+        choices=["decode", "prefill"],
+        default="decode",
+        help="Mode for the compute phase: 'decode' (step-by-step) or 'prefill' (chunk).",
+    )
     parser.add_argument(
         "--num-layers",
         type=int,
@@ -49,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=5,
+        default=4,
         help="Number of requests to run together in each iteration.",
     )
     parser.add_argument("--num-heads", type=int, default=8)
@@ -126,14 +138,15 @@ def _simulate_restore_ms(
 def _simulate_compute_ms(
     llm: LLM,
     prompts: list[TokensPrompt],
-    sampling_params_decode: SamplingParams,
+    sampling_params: SamplingParams,
+    compute_mode: str,
 ) -> float:
-    outputs = llm.generate(prompts, sampling_params_decode, use_tqdm=False)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     if not outputs:
         raise RuntimeError("No output returned by LLM.generate.")
 
-    first_token_ts = None
-    last_token_ts = None
+    start_ts = None
+    end_ts = None
     for req_idx, output in enumerate(outputs):
         if not output.outputs:
             raise RuntimeError(
@@ -143,36 +156,54 @@ def _simulate_compute_ms(
         metrics = output.metrics
         if metrics is None:
             raise RuntimeError(
-                "Request metrics are unavailable; cannot isolate decode-only time."
-            )
-        if metrics.first_token_ts is None or metrics.last_token_ts is None:
-            raise RuntimeError(
-                "Request metrics are missing token timestamps; cannot isolate "
-                "decode-only time."
+                "Request metrics are unavailable; cannot isolate compute time."
             )
 
-        if first_token_ts is None:
-            first_token_ts = metrics.first_token_ts
-            last_token_ts = metrics.last_token_ts
+        if compute_mode == "prefill":
+            if metrics.scheduled_ts is None or metrics.first_token_ts is None:
+                raise RuntimeError(
+                    "Request metrics are missing scheduled/first-token timestamps; "
+                    "cannot isolate chunked prefill time."
+                )
+            start = metrics.scheduled_ts
+            end = metrics.first_token_ts
+        else:
+            if metrics.first_token_ts is None or metrics.last_token_ts is None:
+                raise RuntimeError(
+                    "Request metrics are missing first/last-token timestamps; "
+                    "cannot isolate decode time."
+                )
+            start = metrics.first_token_ts
+            end = metrics.last_token_ts
+
+        if start_ts is None:
+            start_ts = start
+            end_ts = end
             continue
 
-        first_token_ts = min(first_token_ts, metrics.first_token_ts)
-        last_token_ts = max(last_token_ts, metrics.last_token_ts)
+        start_ts = min(start_ts, start)
+        end_ts = max(end_ts, end)
 
-    decode_ms = (last_token_ts - first_token_ts) * 1000.0
-    return max(0.0, decode_ms)
+    compute_ms = (end_ts - start_ts) * 1000.0
+    return max(0.0, compute_ms)
 
 
-def _build_prompt(prompt_len: int, first_token: int) -> TokensPrompt:
-    token_ids = [0] * prompt_len
-    token_ids[0] = first_token
+def _build_prompt(
+    prompt_len: int,
+    request_index: int,
+    vocab_size: int,
+) -> TokensPrompt:
+    token_ids = [(request_index + offset) % vocab_size for offset in range(prompt_len)]
     return TokensPrompt(prompt_token_ids=token_ids)
 
 
-def _build_prompts(prompt_len: int, batch_size: int) -> list[TokensPrompt]:
-    first_token_base = 123456
+def _build_prompts(
+    prompt_len: int,
+    batch_size: int,
+    vocab_size: int,
+) -> list[TokensPrompt]:
     return [
-        _build_prompt(prompt_len, first_token=first_token_base + idx)
+        _build_prompt(prompt_len, request_index=idx, vocab_size=vocab_size)
         for idx in range(batch_size)
     ]
 
@@ -185,6 +216,7 @@ def _build_llm(
     gpu_memory_utilization: float,
     max_num_batched_tokens: int,
     max_num_seqs: int,
+    enable_prefix_caching: bool,
 ) -> LLM:
     llm_kwargs = dict(
         model=model,
@@ -195,7 +227,7 @@ def _build_llm(
         disable_log_stats=False,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
-        enable_prefix_caching=False,
+        enable_prefix_caching=enable_prefix_caching,
     )
     if num_layers > 0:
         llm_kwargs["hf_overrides"] = {"num_hidden_layers": num_layers}
@@ -215,6 +247,22 @@ def _resolve_num_layers(model: str, requested_num_layers: int) -> int:
             "--num-layers explicitly."
         )
     return int(resolved_num_layers)
+
+
+def _resolve_vocab_size(model: str) -> int:
+    hf_config = get_config(model, trust_remote_code=False)
+    text_config = get_hf_text_config(hf_config)
+    vocab_size = getattr(text_config, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(hf_config, "vocab_size", None)
+    if vocab_size is None:
+        raise RuntimeError(
+            "Unable to determine model vocab size; cannot build synthetic prompts."
+        )
+    vocab_size = int(vocab_size)
+    if vocab_size <= 0:
+        raise RuntimeError(f"Invalid vocab size resolved for model: {vocab_size}")
+    return vocab_size
 
 
 def _resolve_scheduler_limits(
@@ -282,7 +330,7 @@ def _run_restore_phase(
 
     print("\nBenchmarking restore phase...", flush=True)
     src_layers = [
-        torch.randn(cpu_shape, dtype=torch.float16, device="cpu").pin_memory()
+        torch.empty(cpu_shape, dtype=torch.float16, device="cpu").pin_memory()
         for _ in range(effective_num_layers)
     ]
     dst_layers = [
@@ -324,8 +372,8 @@ def main() -> None:
         raise RuntimeError("CUDA is required for this benchmark.")
     if args.prompt_len <= 0:
         raise ValueError("--prompt-len must be > 0")
-    if args.decode_tokens <= 0:
-        raise ValueError("--decode-tokens must be > 0")
+    if args.compute_tokens <= 0:
+        raise ValueError("--compute-tokens must be > 0")
     if args.num_layers < 0:
         raise ValueError("--num-layers must be >= 0")
     if args.batch_size <= 0:
@@ -336,13 +384,19 @@ def main() -> None:
         raise ValueError("--prompt-len must be divisible by --vllm-block-size")
 
     effective_num_layers = _resolve_num_layers(args.model, args.num_layers)
+    vocab_size = _resolve_vocab_size(args.model)
+    # Adjust prompt length for scheduler if in prefill mode
+    actual_prompt_len = args.prompt_len
+    if args.compute_mode == "prefill":
+        actual_prompt_len += args.compute_tokens
+
     (
         effective_max_num_batched_tokens,
         effective_max_num_seqs,
     ) = _resolve_scheduler_limits(
         requested_max_num_batched_tokens=args.max_num_batched_tokens,
         requested_max_num_seqs=args.max_num_seqs,
-        prompt_len=args.prompt_len,
+        prompt_len=actual_prompt_len,
         batch_size=args.batch_size,
     )
 
@@ -356,8 +410,8 @@ def main() -> None:
     total_kv_mb_per_layer = (num_blocks * block_size_bytes) / (1024**2)
     print("=== Benchmark Config ===", flush=True)
     print(
-        f"prompt_len={args.prompt_len}, decode_tokens={args.decode_tokens}, "
-        f"batch_size={args.batch_size}",
+        f"prompt_len={args.prompt_len}, compute_tokens={args.compute_tokens}, "
+        f"compute_mode={args.compute_mode}, batch_size={args.batch_size}",
         flush=True,
     )
     print(
@@ -436,14 +490,34 @@ def main() -> None:
 
     print("\nBenchmarking compute phase...", flush=True)
     llm: LLM | None = None
-    sampling_params_decode = SamplingParams(
-        temperature=0.0,
+    enable_prefix_caching = True
+    if args.compute_mode == "decode":
         # Force vLLM to decode exactly N tokens for each request.
-        max_tokens=args.decode_tokens,
-        min_tokens=args.decode_tokens,
-        ignore_eos=True,
-    )
-    prompts_fixed = _build_prompts(args.prompt_len, args.batch_size)
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=args.compute_tokens,
+            min_tokens=args.compute_tokens,
+            ignore_eos=True,
+        )
+        prompts_fixed = _build_prompts(
+            args.prompt_len,
+            args.batch_size,
+            vocab_size,
+        )
+    else:
+        # Prefill mode: treat additional tokens as part of a larger prompt,
+        # but generate only 1 token to capture the prefill time.
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            ignore_eos=True,
+        )
+        prompts_fixed = _build_prompts(
+            args.prompt_len + args.compute_tokens,
+            args.batch_size,
+            vocab_size,
+        )
+
     total_iters = args.warmup_iters + args.iters
 
     try:
@@ -454,23 +528,37 @@ def main() -> None:
             gpu_memory_utilization=effective_gpu_mem_util,
             max_num_batched_tokens=effective_max_num_batched_tokens,
             max_num_seqs=effective_max_num_seqs,
+            enable_prefix_caching=enable_prefix_caching,
         )
 
-        # Prime once so later runs represent existing-prefix behavior.
-        llm.generate(prompts_fixed, sampling_params_decode, use_tqdm=False)
+        # Prime only the prefix so subsequent runs hit the cached prefix.
+        prompts_baseline = _build_prompts(
+            args.prompt_len,
+            args.batch_size,
+            vocab_size,
+        )
+        sampling_params_baseline = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            ignore_eos=True,
+        )
+        print(f"Priming {args.prompt_len} prefix tokens...", flush=True)
+        llm.generate(prompts_baseline, sampling_params_baseline, use_tqdm=False)
 
         for i in range(total_iters):
             compute_ms = _simulate_compute_ms(
                 llm,
                 prompts_fixed,
-                sampling_params_decode,
+                sampling_params,
+                args.compute_mode,
             )
 
             if i >= args.warmup_iters:
                 compute_ms_values.append(compute_ms)
+                label = "decode" if args.compute_mode == "decode" else "prefill"
                 print(
                     f"iter={i - args.warmup_iters + 1}/{args.iters} "
-                    f"compute_real_model={compute_ms:.3f}ms",
+                    f"compute_{label}={compute_ms:.3f}ms",
                     flush=True,
                 )
     finally:
@@ -480,8 +568,14 @@ def main() -> None:
 
     print("\n=== Results ===", flush=True)
     print(_summary_ms("restore_host_to_gpu", restore_ms_values), flush=True)
+    label = "32k_prefix"  # Keep legacy naming where possible or generalize
+    if args.compute_mode == "decode":
+        summary_label = f"compute_decode_{args.compute_tokens}_tokens"
+    else:
+        summary_label = f"compute_prefill_{args.compute_tokens}_tokens"
+
     print(
-        _summary_ms("compute_with_real_model_on_32k_prefix", compute_ms_values),
+        _summary_ms(summary_label, compute_ms_values),
         flush=True,
     )
 
@@ -494,6 +588,14 @@ def main() -> None:
             f"(restore={mean_restore:.3f}ms, compute={mean_compute:.3f}ms)",
             flush=True,
         )
+
+        # Offloading bandwidth calculation
+        # Total KV size across all layers for the batch in MB
+        total_kv_mb = total_kv_mb_per_layer * effective_num_layers
+        # Bandwidth = Size (MB) / Time (s) = Size (GB) / Time (s)
+        # Restore time is in ms, so (MB / 1024) / (ms / 1000) = (MB * 1000) / (ms * 1024) GB/s
+        bandwidth_gb_s = (total_kv_mb * 1000.0) / (mean_restore * 1024.0)
+        print(f"offloading_bandwidth={bandwidth_gb_s:.3f} GB/s", flush=True)
 
 
 if __name__ == "__main__":

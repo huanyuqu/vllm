@@ -54,11 +54,11 @@ class CompactionExecutor:
         self.device = device
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self.total_slots = num_blocks * block_size
         self.kv_caches = [
             torch.empty(
-                self.total_slots,
+                num_blocks,
                 2,
+                block_size,
                 num_kv_heads,
                 head_size,
                 dtype=dtype,
@@ -82,24 +82,22 @@ class CompactionExecutor:
             return
 
         if moves:
-            for group_id, src_addr, dst_addr, size in moves:
+            for group_id, src_block, dst_block, size_blocks in moves:
                 if group_id < len(self.kv_caches):
                     kv_cache = self.kv_caches[group_id]
-                    flat_cache = kv_cache.view(-1, *kv_cache.shape[2:])
-                    flat_cache[dst_addr:dst_addr + size].copy_(
-                        flat_cache[src_addr:src_addr + size]
+                    kv_cache[dst_block:dst_block + size_blocks].copy_(
+                        kv_cache[src_block:src_block + size_blocks]
                     )
 
         if swaps:
-            for group_id, addr1, addr2, size in swaps:
+            for group_id, block1, block2, size_blocks in swaps:
                 if group_id < len(self.kv_caches):
                     kv_cache = self.kv_caches[group_id]
-                    flat_cache = kv_cache.view(-1, *kv_cache.shape[2:])
-                    temp = flat_cache[addr1:addr1 + size].clone()
-                    flat_cache[addr1:addr1 + size].copy_(
-                        flat_cache[addr2:addr2 + size]
+                    temp = kv_cache[block1:block1 + size_blocks].clone()
+                    kv_cache[block1:block1 + size_blocks].copy_(
+                        kv_cache[block2:block2 + size_blocks]
                     )
-                    flat_cache[addr2:addr2 + size].copy_(temp)
+                    kv_cache[block2:block2 + size_blocks].copy_(temp)
 
     def sync(self) -> None:
         torch.cuda.synchronize(self.device)
@@ -129,14 +127,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-ops",
         type=int,
-        default=128,
-        help="Number of move/swap ops in one compaction round.",
+        default=25,
+        help=(
+            "Number of move/swap ops in one compaction round. Smaller values "
+            "with larger block copies make head_size effects easier to see."
+        ),
     )
     parser.add_argument(
         "--copy-size-blocks",
         type=int,
         default=1,
-        help="How many contiguous blocks each op copies.",
+        help=(
+            "How many contiguous blocks each op copies. Larger values shift "
+            "the benchmark toward data-movement cost instead of per-op overhead."
+        ),
     )
     parser.add_argument(
         "--layout",
@@ -160,7 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-blocks", type=int, default=4096)
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
-    parser.add_argument("--num-layers", type=int, default=32)
+    parser.add_argument("--num-layers", type=int, default=12)
     parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--head-size", type=int, default=128)
     parser.add_argument(
@@ -279,10 +283,10 @@ def _build_scenario(
 ) -> Scenario:
     rng = random.Random(seed)
     pairs = _build_pairs(args, rng=rng)
-    size = args.copy_size_blocks * args.block_size
+    size_blocks = args.copy_size_blocks
     if mode == "move":
         moves = [
-            (layer_id, src * args.block_size, dst * args.block_size, size)
+            (layer_id, src, dst, size_blocks)
             for layer_id in range(args.num_layers)
             for src, dst in pairs
         ]
@@ -290,7 +294,7 @@ def _build_scenario(
     else:
         moves = []
         swaps = [
-            (layer_id, src * args.block_size, dst * args.block_size, size)
+            (layer_id, src, dst, size_blocks)
             for layer_id in range(args.num_layers)
             for src, dst in pairs
         ]
