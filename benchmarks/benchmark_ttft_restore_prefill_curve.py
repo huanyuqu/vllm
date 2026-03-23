@@ -7,6 +7,7 @@ import gc
 import os
 import statistics
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -28,7 +29,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--load-format", type=str, default=DEFAULT_LOAD_FORMAT)
-    parser.add_argument("--num-layers", type=int, default=0)
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=0,
+        help="Number of model layers to keep for this benchmark. Use 0 for all layers.",
+    )
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -36,7 +42,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--restore-start-tokens", type=int, default=800)
     parser.add_argument("--restore-step-tokens", type=int, default=800)
-    parser.add_argument("--restore-max-tokens", type=int, default=64 * 1024)
+    parser.add_argument("--restore-max-tokens", type=int, default=32 * 1024)
     parser.add_argument("--prefill-new-tokens", type=int, default=400)
 
     parser.add_argument("--iters", type=int, default=3)
@@ -58,7 +64,22 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
-    parser.add_argument("--max-num-seqs", type=int, default=4)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument(
+        "--restart-llm-between-prefixes",
+        action="store_true",
+        default=True,
+        help=(
+            "Restart LLM engine for each prefill prefix point to avoid KV-cache "
+            "accumulation and scheduler waiting stalls."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-llm-across-prefixes",
+        action="store_false",
+        dest="restart_llm_between_prefixes",
+        help="Reuse one LLM across all prefix points (faster but less robust).",
+    )
 
     parser.add_argument(
         "--output-csv",
@@ -85,6 +106,41 @@ def _resolve_num_layers(model: str, requested_num_layers: int) -> int:
             "Unable to determine model layer count; pass --num-layers explicitly."
         )
     return int(resolved_num_layers)
+
+
+def _resolve_vocab_size(model: str) -> int:
+    hf_config = get_config(model, trust_remote_code=False)
+    text_config = get_hf_text_config(hf_config)
+    vocab_size = getattr(text_config, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(hf_config, "vocab_size", None)
+    if vocab_size is None:
+        raise RuntimeError(
+            "Unable to determine model vocab size; cannot build synthetic prompts."
+        )
+    vocab_size = int(vocab_size)
+    if vocab_size <= 0:
+        raise RuntimeError(f"Invalid vocab size resolved for model: {vocab_size}")
+    return vocab_size
+
+
+def _resolve_model_max_len(model: str) -> int | None:
+    hf_config = get_config(model, trust_remote_code=False)
+    text_config = get_hf_text_config(hf_config)
+
+    for cfg in (text_config, hf_config):
+        for attr in ("max_position_embeddings", "n_positions", "seq_length",
+                     "model_max_length"):
+            value = getattr(cfg, attr, None)
+            if value is None:
+                continue
+            try:
+                max_len = int(value)
+            except (TypeError, ValueError):
+                continue
+            if max_len > 0:
+                return max_len
+    return None
 
 
 def _resolve_gpu_memory_utilization(requested: float) -> float:
@@ -129,16 +185,22 @@ def _build_llm(
     return LLM(**llm_kwargs)
 
 
-def _build_prompt(prompt_len: int, first_token: int) -> TokensPrompt:
-    token_ids = [0] * prompt_len
-    token_ids[0] = first_token
+def _build_prompt(
+    prompt_len: int,
+    request_index: int,
+    vocab_size: int,
+) -> TokensPrompt:
+    token_ids = [(request_index + offset) % vocab_size for offset in range(prompt_len)]
     return TokensPrompt(prompt_token_ids=token_ids)
 
 
-def _build_prompts(prompt_len: int, batch_size: int) -> list[TokensPrompt]:
-    first_token_base = 333000
+def _build_prompts(
+    prompt_len: int,
+    batch_size: int,
+    vocab_size: int,
+) -> list[TokensPrompt]:
     return [
-        _build_prompt(prompt_len, first_token=first_token_base + i)
+        _build_prompt(prompt_len, request_index=i, vocab_size=vocab_size)
         for i in range(batch_size)
     ]
 
@@ -149,6 +211,8 @@ def _measure_prefill_ms(
     sampling_params: SamplingParams,
     warmup_iters: int,
     iters: int,
+    *,
+    label: str,
 ) -> float:
     values: list[float] = []
     total_iters = warmup_iters + iters
@@ -171,11 +235,95 @@ def _measure_prefill_ms(
         if i >= warmup_iters:
             values.append(iter_ms)
             print(
-                f"prefill iter={i - warmup_iters + 1}/{iters} prefill={iter_ms:.3f}ms",
+                f"prefill[{label}] iter={i - warmup_iters + 1}/{iters} "
+                f"ttft={iter_ms:.3f}ms",
                 flush=True,
             )
 
     return statistics.mean(values)
+
+
+def _measure_prefill_curve_ms(
+    *,
+    llm_builder: Callable[[], LLM],
+    restart_llm_between_prefixes: bool,
+    restore_tokens_list: list[int],
+    prefill_new_tokens: int,
+    batch_size: int,
+    vocab_size: int,
+    sampling_params: SamplingParams,
+    warmup_iters: int,
+    iters: int,
+) -> list[float]:
+    prefill_curve_ms: list[float] = []
+    shared_llm: LLM | None = None
+
+    if not restart_llm_between_prefixes:
+        shared_llm = llm_builder()
+
+    try:
+        for prefix_tokens in restore_tokens_list:
+            prompt_len_prefix = prefix_tokens
+            prompt_len_prefix_plus_new = prefix_tokens + prefill_new_tokens
+
+            prompts_prefix = _build_prompts(
+                prompt_len_prefix,
+                batch_size,
+                vocab_size,
+            )
+            prompts_prefix_plus_new = _build_prompts(
+                prompt_len_prefix_plus_new,
+                batch_size,
+                vocab_size,
+            )
+
+            local_llm: LLM | None = shared_llm
+            if restart_llm_between_prefixes:
+                local_llm = llm_builder()
+
+            try:
+                print(
+                    f"\nBenchmarking prefill increment at prefix={prefix_tokens} "
+                    f"(measure {prefix_tokens}->{prefix_tokens + prefill_new_tokens})...",
+                    flush=True,
+                )
+                ttft_prefix_ms = _measure_prefill_ms(
+                    local_llm,
+                    prompts_prefix,
+                    sampling_params,
+                    warmup_iters=warmup_iters,
+                    iters=iters,
+                    label=f"prefix={prompt_len_prefix}",
+                )
+                ttft_prefix_plus_new_ms = _measure_prefill_ms(
+                    local_llm,
+                    prompts_prefix_plus_new,
+                    sampling_params,
+                    warmup_iters=warmup_iters,
+                    iters=iters,
+                    label=f"prefix+new={prompt_len_prefix_plus_new}",
+                )
+
+                incremental_prefill_ms = max(0.0,
+                                             ttft_prefix_plus_new_ms - ttft_prefix_ms)
+                prefill_curve_ms.append(incremental_prefill_ms)
+                print(
+                    f"prefill_increment_ms(prefix={prefix_tokens}, new={prefill_new_tokens})="
+                    f"{incremental_prefill_ms:.3f} "
+                    f"(prefix_ttft={ttft_prefix_ms:.3f}, "
+                    f"prefix_plus_new_ttft={ttft_prefix_plus_new_ms:.3f})",
+                    flush=True,
+                )
+            finally:
+                if restart_llm_between_prefixes and local_llm is not None:
+                    del local_llm
+                    cleanup_dist_env_and_memory()
+    finally:
+        if shared_llm is not None:
+            del shared_llm
+            cleanup_dist_env_and_memory()
+
+    return prefill_curve_ms
 
 
 def _build_block_mapping(
@@ -298,7 +446,7 @@ def _save_csv(
     restore_tokens_list: list[int],
     restore_paged_ms: list[float],
     restore_contiguous_ms: list[float],
-    prefill_ms: float,
+    prefill_ms_list: list[float],
 ) -> None:
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
@@ -311,8 +459,11 @@ def _save_csv(
             "ttft_paged_ms",
             "ttft_contiguous_ms",
         ])
-        for x, paged_ms, contiguous_ms in zip(
-            restore_tokens_list, restore_paged_ms, restore_contiguous_ms
+        for x, paged_ms, contiguous_ms, prefill_ms in zip(
+            restore_tokens_list,
+            restore_paged_ms,
+            restore_contiguous_ms,
+            prefill_ms_list,
         ):
             writer.writerow([
                 x,
@@ -330,7 +481,7 @@ def _plot_curve(
     restore_tokens_list: list[int],
     ttft_paged_ms: list[float],
     ttft_contiguous_ms: list[float],
-    prefill_ms: float,
+    prefill_ms_list: list[float],
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -340,36 +491,65 @@ def _plot_curve(
         ) from exc
 
     os.makedirs(os.path.dirname(output_plot) or ".", exist_ok=True)
-    plt.style.use("bmh")
-    fig, ax = plt.subplots(figsize=(11, 7))
+    fig, ax = plt.subplots(figsize=(9, 7))
     ax.plot(
         restore_tokens_list,
         ttft_paged_ms,
         marker="o",
         linewidth=2,
-        label="TTFT (paged restore)",
+        label="TTFT (vLLM)",
     )
     ax.plot(
         restore_tokens_list,
         ttft_contiguous_ms,
-        marker="s",
+        marker="o",
         linewidth=2,
-        label="TTFT (contiguous restore)",
+        label="TTFT (Ours)",
     )
-    ax.axhline(
-        y=prefill_ms,
+    ax.plot(
+        restore_tokens_list,
+        prefill_ms_list,
+        marker="^",
+        linewidth=1.5,
+        linestyle="--",
+        color="gray",
+        label="Prefill (incremental)",
+    )
+
+    improvement_list = [
+        (vllm_ms - ours_ms) / vllm_ms if vllm_ms > 0 else 0.0
+        for vllm_ms, ours_ms in zip(ttft_paged_ms, ttft_contiguous_ms)
+    ]
+    max_idx = max(range(len(improvement_list)), key=improvement_list.__getitem__)
+    max_improvement_pct = improvement_list[max_idx] * 100.0
+    x_max_gain = restore_tokens_list[max_idx]
+    y_max_gain = max(ttft_paged_ms[max_idx], ttft_contiguous_ms[max_idx])
+
+    ax.axvline(
+        x=x_max_gain,
+        color="crimson",
         linestyle="--",
         linewidth=1.5,
-        color="gray",
-        label=f"Prefill(new tokens)={prefill_ms:.2f} ms",
+        alpha=0.9,
     )
-    ax.set_xlabel("Restored KV tokens")
-    ax.set_ylabel("TTFT (ms)")
-    ax.set_title("TTFT vs Restored KV Tokens (Paged vs Contiguous Transfer)")
+    ax.annotate(
+        f"Max gain: {max_improvement_pct:.2f}%",
+        xy=(x_max_gain, y_max_gain),
+        xytext=(-150, 50),
+        textcoords="offset points",
+        fontsize=18,
+        color="crimson",
+        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.8},
+        arrowprops={"arrowstyle": "->", "color": "crimson", "lw": 1.2},
+    )
+
+    ax.set_xlabel("Number of Prefix Tokens", fontsize=24)
+    ax.set_ylabel("TTFT (ms)", fontsize=24)
+    ax.tick_params(axis="both", labelsize=24)
     ax.grid(True, alpha=0.4)
-    ax.legend()
+    ax.legend(fontsize=24)
     fig.tight_layout()
-    fig.savefig(output_plot, dpi=200)
+    fig.savefig(output_plot, dpi=300)
     plt.close(fig)
 
 
@@ -410,9 +590,30 @@ def main() -> None:
     )
 
     effective_num_layers = _resolve_num_layers(args.model, args.num_layers)
+    vocab_size = _resolve_vocab_size(args.model)
+    model_max_len = _resolve_model_max_len(args.model)
     effective_gpu_mem_util = _resolve_gpu_memory_utilization(
         args.gpu_memory_utilization
     )
+
+    if effective_gpu_mem_util < 0.10:
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        raise RuntimeError(
+            "Insufficient free GPU memory to reliably run this benchmark. "
+            f"Only {free_mem / 1024**3:.2f} / {total_mem / 1024**3:.2f} GiB is free. "
+            "Please stop other GPU processes (for example stale VLLM::EngineCore) "
+            "or switch to a less loaded GPU."
+        )
+
+    required_prompt_len = restore_tokens_list[-1] + args.prefill_new_tokens
+    if model_max_len is not None and required_prompt_len > model_max_len:
+        raise ValueError(
+            "Requested prefill benchmark exceeds model context length: "
+            f"required max prompt len={required_prompt_len} "
+            f"(restore_max_tokens + prefill_new_tokens), "
+            f"model_max_len={model_max_len}. "
+            "Please reduce --restore-max-tokens or --prefill-new-tokens."
+        )
 
     print("=== Scenario ===", flush=True)
     print(
@@ -431,21 +632,19 @@ def main() -> None:
         flush=True,
     )
 
-    llm: LLM | None = None
-    prefill_ms = 0.0
+    prefill_ms_curve: list[float] = []
     sampling_params_prefill = SamplingParams(
         temperature=0.0,
         max_tokens=1,
         min_tokens=1,
         ignore_eos=True,
     )
-    prefill_prompts = _build_prompts(args.prefill_new_tokens, args.batch_size)
 
-    try:
-        llm = _build_llm(
+    def llm_builder() -> LLM:
+        return _build_llm(
             model=args.model,
             load_format=args.load_format,
-            num_layers=args.num_layers,
+            num_layers=effective_num_layers,
             gpu_memory_utilization=effective_gpu_mem_util,
             max_num_batched_tokens=max(
                 args.max_num_batched_tokens,
@@ -453,20 +652,29 @@ def main() -> None:
             ),
             max_num_seqs=max(args.max_num_seqs, args.batch_size),
         )
-        print("\nBenchmarking prefill(new 400 tokens)...", flush=True)
-        prefill_ms = _measure_prefill_ms(
-            llm,
-            prefill_prompts,
-            sampling_params_prefill,
-            warmup_iters=args.warmup_iters,
-            iters=args.iters,
-        )
-    finally:
-        if llm is not None:
-            del llm
-        cleanup_dist_env_and_memory()
 
-    print(f"prefill_mean_ms={prefill_ms:.3f}", flush=True)
+    print(
+        "\nBenchmarking prefill curve with varying prefix lengths "
+        f"(restart_llm_between_prefixes={args.restart_llm_between_prefixes})...",
+        flush=True,
+    )
+    prefill_ms_curve = _measure_prefill_curve_ms(
+        llm_builder=llm_builder,
+        restart_llm_between_prefixes=args.restart_llm_between_prefixes,
+        restore_tokens_list=restore_tokens_list,
+        prefill_new_tokens=args.prefill_new_tokens,
+        batch_size=args.batch_size,
+        vocab_size=vocab_size,
+        sampling_params=sampling_params_prefill,
+        warmup_iters=args.warmup_iters,
+        iters=args.iters,
+    )
+
+    print(
+        "prefill_curve_ms(first,last)="
+        f"({prefill_ms_curve[0]:.3f}, {prefill_ms_curve[-1]:.3f})",
+        flush=True,
+    )
 
     print("\nBenchmarking restore curves...", flush=True)
     restore_paged_ms, restore_contiguous_ms = _measure_restore_curve(
@@ -482,35 +690,39 @@ def main() -> None:
         iters=args.iters,
     )
 
-    ttft_paged_ms = [x + prefill_ms for x in restore_paged_ms]
-    ttft_contiguous_ms = [x + prefill_ms for x in restore_contiguous_ms]
+    ttft_paged_ms = [x + y for x, y in zip(restore_paged_ms, prefill_ms_curve)]
+    ttft_contiguous_ms = [
+        x + y for x, y in zip(restore_contiguous_ms, prefill_ms_curve)
+    ]
 
     _save_csv(
         output_csv=args.output_csv,
         restore_tokens_list=restore_tokens_list,
         restore_paged_ms=restore_paged_ms,
         restore_contiguous_ms=restore_contiguous_ms,
-        prefill_ms=prefill_ms,
+        prefill_ms_list=prefill_ms_curve,
     )
     _plot_curve(
         output_plot=args.output_plot,
         restore_tokens_list=restore_tokens_list,
         ttft_paged_ms=ttft_paged_ms,
         ttft_contiguous_ms=ttft_contiguous_ms,
-        prefill_ms=prefill_ms,
+        prefill_ms_list=prefill_ms_curve,
     )
 
     print("\n=== Results ===", flush=True)
     print(f"output_csv={args.output_csv}", flush=True)
     print(f"output_plot={args.output_plot}", flush=True)
     print(
-        "first_point(restore_tokens, ttft_paged_ms, ttft_contiguous_ms)="
-        f"({restore_tokens_list[0]}, {ttft_paged_ms[0]:.3f}, {ttft_contiguous_ms[0]:.3f})",
+        "first_point(restore_tokens, prefill_ms, ttft_paged_ms, ttft_contiguous_ms)="
+        f"({restore_tokens_list[0]}, {prefill_ms_curve[0]:.3f}, "
+        f"{ttft_paged_ms[0]:.3f}, {ttft_contiguous_ms[0]:.3f})",
         flush=True,
     )
     print(
-        "last_point(restore_tokens, ttft_paged_ms, ttft_contiguous_ms)="
-        f"({restore_tokens_list[-1]}, {ttft_paged_ms[-1]:.3f}, {ttft_contiguous_ms[-1]:.3f})",
+        "last_point(restore_tokens, prefill_ms, ttft_paged_ms, ttft_contiguous_ms)="
+        f"({restore_tokens_list[-1]}, {prefill_ms_curve[-1]:.3f}, "
+        f"{ttft_paged_ms[-1]:.3f}, {ttft_contiguous_ms[-1]:.3f})",
         flush=True,
     )
 
