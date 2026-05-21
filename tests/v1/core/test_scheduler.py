@@ -587,6 +587,97 @@ def test_check_stop_min_tokens():
     assert request_stop.stop_reason == 42
 
 
+def test_agent_kernel_prefill_warmup_seals_before_dummy_token():
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={"agent_kernel_prefill_warmup": True},
+    )
+    request = Request(
+        request_id="warmup",
+        prompt_token_ids=[0, 1, 2],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_prompt_tokens
+    calls = []
+
+    class FakeKVCacheManager:
+        def update_block_usage(self, req, num_computed_tokens):
+            calls.append((
+                "update",
+                list(req.output_token_ids),
+                num_computed_tokens,
+            ))
+
+        def seal_segment(self, req):
+            calls.append(("seal", list(req.output_token_ids)))
+
+        def take_events(self):
+            return None
+
+    class FakeStructuredOutputManager:
+        def should_advance(self, req):
+            return False
+
+    class FakeScheduler:
+        def __init__(self):
+            self.requests = {"warmup": request}
+            self.max_model_len = 100
+            self.kv_cache_manager = FakeKVCacheManager()
+            self.structured_output_manager = FakeStructuredOutputManager()
+            self.running = [request]
+            self.waiting = Mock()
+            self.connector = None
+            self.finished_req_ids_dict = {}
+            self.kv_event_publisher = Mock()
+
+        def _free_request(self, req):
+            return None
+
+        def make_stats(self, spec_decoding_stats, kv_connector_stats):
+            return None
+
+        def _update_request_with_output(
+            self,
+            req,
+            new_token_ids,
+            update_block_usage=True,
+        ):
+            return Scheduler._update_request_with_output(
+                self,
+                req,
+                new_token_ids,
+                update_block_usage,
+            )
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"warmup": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=["warmup"],
+        req_id_to_index={"warmup": 0},
+        sampled_token_ids=[np.array([42])],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    Scheduler.update_from_output(FakeScheduler(), scheduler_output, model_output)
+
+    assert list(request.output_token_ids) == [42]
+    assert calls == [("update", [], 3), ("seal", [])]
+
+
 @pytest.mark.parametrize(
     "enable_prefix_caching, prompt_logprobs",
     [

@@ -113,6 +113,21 @@ class SegmentHashToSegmentMap:
             
         self._unexpected_segments_type(segments)
         return None
+
+    def contains(
+        self,
+        key: SegmentHashWithGroupId,
+        segment_id: int,
+    ) -> bool:
+        segments = self._cache.get(key)
+        if segments is None:
+            return False
+        if isinstance(segments, SemanticSegment):
+            return segments.segment_id == segment_id
+        if isinstance(segments, dict):
+            return segment_id in segments
+        self._unexpected_segments_type(segments)
+        return False
     
     def __len__(self) -> int:
         return len(self._cache)
@@ -271,6 +286,7 @@ class SemanticSegmentManager:
 
         self.kv_cache_group_id = kv_cache_group_id
         self.num_cached_segments: dict[str, int] = {}
+        self.completed_req_to_segments: dict[str, SemanticSegments] = {}
         
         self.pending_moves: list[tuple[int, int, int, int]] = [] # list of (group_id, src_addr, dst_addr, size)
         self.pending_swaps: list[tuple[int, int, int, int]] = [] # list of (group_id, addr1, addr2, size)
@@ -299,7 +315,16 @@ class SemanticSegmentManager:
 
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments for the request."""
-        segments = self.req_to_segments[request_id]
+        active_segments = self.req_to_segments.get(request_id)
+        if active_segments is not None:
+            segments = list(active_segments)
+        else:
+            segments = self._consolidatable_segments(
+                self.completed_req_to_segments.get(
+                    request_id,
+                    SemanticSegments(),
+                )
+            )
         
         for segment in segments:
             if segment.is_sealed and segment.capacity > 0 and not segment.is_consolidated:
@@ -337,6 +362,27 @@ class SemanticSegmentManager:
                 # Single-round planner: if we produced any ops, we treat the
                 # segment as consolidated for subsequent attention metadata.
                 segment.is_consolidated = True
+
+    def _consolidatable_segments(
+        self,
+        segments: SemanticSegments,
+    ) -> list[SemanticSegment]:
+        return [
+            segment for segment in segments
+            if segment.ref_cnt == 0
+            and segment.is_sealed
+            and segment.capacity > 0
+            and not segment.is_consolidated
+            and self._is_segment_cached(segment)
+        ]
+
+    def _is_segment_cached(self, segment: SemanticSegment) -> bool:
+        if segment.segment_hash is None:
+            return False
+        return self.cached_segments.contains(
+            segment.segment_hash,
+            segment.segment_id,
+        )
 
     @staticmethod
     def _order_moves_safely(
@@ -537,9 +583,23 @@ class SemanticSegmentManager:
             # eviction is not needed
             return False
         
+        self._remove_completed_segment(segment)
         segment.reset_hash()
 
         return True
+
+    def _remove_completed_segment(self, segment: SemanticSegment) -> None:
+        for request_id, segments in list(self.completed_req_to_segments.items()):
+            kept = [
+                completed_segment for completed_segment in segments
+                if completed_segment.segment_id != segment.segment_id
+            ]
+            if len(kept) == len(segments):
+                continue
+            if kept:
+                self.completed_req_to_segments[request_id] = SemanticSegments(kept)
+            else:
+                del self.completed_req_to_segments[request_id]
 
     def _compute_partial_tail_hash(self, request: Request) -> Optional[BlockHash]:
         """Compute hash for a partial tail block of a request.
@@ -739,6 +799,13 @@ class SemanticSegmentManager:
                 else:
                     self.free_segment_queue.append(segment)  # type: ignore
                     self.num_free_segment_tokens += segment.capacity
+        completed_segments = self._consolidatable_segments(segments)
+        if completed_segments:
+            self.completed_req_to_segments[request_id] = SemanticSegments(
+                completed_segments
+            )
+        else:
+            self.completed_req_to_segments.pop(request_id, None)
                 
     def touch(self, segments: SemanticSegments) -> None:
         """
@@ -753,6 +820,7 @@ class SemanticSegmentManager:
             if segment.ref_cnt == 0:
                 self.free_segment_queue.remove(segment)  # type: ignore
                 self.num_free_segment_tokens -= segment.capacity
+                self._remove_completed_segment(segment)
             segment.ref_cnt += 1
                 
     def reset_prefix_cache(self) -> bool:
@@ -775,10 +843,12 @@ class SemanticSegmentManager:
             segment: SemanticSegment = self.free_segment_queue.popleft()  # type: ignore
             self.num_free_segment_tokens -= segment.capacity
             self._maybe_evict_cached_segment(segment)
+            segment.unseal()
             self.block_pool.free_blocks(reversed(segment.blocks))
 
         # Reset the hash map
         self.cached_segments = SegmentHashToSegmentMap()
+        self.completed_req_to_segments.clear()
 
         logger.info("Successfully reset prefix cache")
         

@@ -220,6 +220,12 @@ class EngineCoreClient(ABC):
     async def reset_prefix_cache_async(self) -> None:
         raise NotImplementedError
 
+    async def consolidate_memory_async(self, request_id: str) -> None:
+        raise NotImplementedError
+
+    async def execute_semantic_memory_ops_async(self) -> dict[str, int]:
+        raise NotImplementedError
+
     async def sleep_async(self, level: int = 1) -> None:
         raise NotImplementedError
 
@@ -990,6 +996,9 @@ class AsyncMPClient(MPClient):
 
     async def consolidate_memory_async(self, request_id: str) -> None:
         await self.call_utility_async("consolidate_memory", request_id)
+
+    async def execute_semantic_memory_ops_async(self) -> dict[str, int]:
+        return await self.call_utility_async("execute_semantic_memory_ops")
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

@@ -65,6 +65,7 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.agent_kernel_prefill_warmup = False
 
         if pooling_params is not None:
             # Pooling models.
@@ -76,9 +77,11 @@ class Request:
             if self.structured_output_request is not None:
                 self.status = RequestStatus.WAITING_FOR_FSM
 
-            if sampling_params.extra_args is not None:
-                self.kv_transfer_params = sampling_params.extra_args.get(
-                    "kv_transfer_params"
+            extra_args = sampling_params.extra_args
+            if extra_args is not None:
+                self.kv_transfer_params = extra_args.get("kv_transfer_params")
+                self.agent_kernel_prefill_warmup = (
+                    extra_args.get("agent_kernel_prefill_warmup") is True
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")

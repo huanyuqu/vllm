@@ -698,13 +698,14 @@ class KVCacheManager:
                 "seal_segment called without SemanticSegmentCoordinator")
         self.coordinator.seal_segment(request)
 
-    def consolidate_segment_memory(self, request: Request) -> None:
+    def consolidate_segment_memory(self, request: Request | str) -> None:
         """Consolidate the memory of the sealed segments."""
         if not isinstance(self.coordinator, SemanticSegmentCoordinator):
             raise RuntimeError(
                 "consolidate_segment_memory called without SemanticSegmentCoordinator"
             )
-        self.coordinator.consolidate_segment_memory(request.request_id)
+        request_id = request.request_id if isinstance(request, Request) else request
+        self.coordinator.consolidate_segment_memory(request_id)
 
     def get_pending_moves(self) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
         """Get and clear pending moves from all managers."""

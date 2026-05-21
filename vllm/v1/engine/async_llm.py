@@ -687,6 +687,26 @@ class AsyncLLM(EngineClient):
     async def reset_prefix_cache(self) -> None:
         await self.engine_core.reset_prefix_cache_async()
 
+    async def consolidate_memory(
+        self,
+        request_id: str | Iterable[str],
+    ) -> dict[str, int]:
+        """Consolidate cached semantic memory for completed request(s)."""
+        request_ids = (
+            (request_id,) if isinstance(request_id, str)
+            else tuple(request_id)
+        )
+        if not request_ids:
+            return {
+                "num_moves": 0,
+                "num_swaps": 0,
+                "moved_tokens": 0,
+                "swapped_tokens": 0,
+            }
+        for rid in request_ids:
+            await self.engine_core.consolidate_memory_async(rid)
+        return await self.engine_core.execute_semantic_memory_ops_async()
+
     async def sleep(self, level: int = 1) -> None:
         await self.reset_prefix_cache()
         await self.engine_core.sleep_async(level)

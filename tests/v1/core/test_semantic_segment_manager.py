@@ -520,6 +520,49 @@ def test_consolidate_segment_memory_no_change():
 
     result = SemanticSegmentManager._consolidate_segment_memory(segment, pool)
     assert result is None
+
+
+def test_consolidate_completed_request_cached_segment():
+    pool = BuddyBlockPool(num_max_gpu_blocks=4,
+                          supported_sizes=[128],
+                          enable_caching=True)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
+
+    blocks = manager.allocate_new_blocks("req", 256)
+    for i, block in enumerate(blocks):
+        block.block_hash = make_block_hash_with_group_id(
+            BlockHash(f"req-{i}".encode()),
+            0,
+        )
+    manager.seal_segment("req")
+    segment = manager.req_to_segments["req"].last_segment
+
+    manager.free("req")
+    assert "req" in manager.completed_req_to_segments
+
+    manager.consolidate_segment_memory("req")
+
+    assert segment is not None
+    assert segment.is_consolidated
+
+
+def test_consolidate_completed_request_after_prefix_reset_is_noop():
+    pool = BuddyBlockPool(num_max_gpu_blocks=4,
+                          supported_sizes=[128],
+                          enable_caching=True)
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
+
+    blocks = manager.allocate_new_blocks("req", 128)
+    blocks[0].block_hash = make_block_hash_with_group_id(BlockHash(b"req"), 0)
+    manager.seal_segment("req")
+    manager.free("req")
+
+    assert manager.reset_prefix_cache()
+
+    manager.consolidate_segment_memory("req")
+
+    assert "req" not in manager.completed_req_to_segments
+    assert "req" not in manager.req_to_segments
     
     
 def test_consolidate_segment_memory_move():

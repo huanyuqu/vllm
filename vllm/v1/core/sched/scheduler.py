@@ -1117,8 +1117,21 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                sealed_prefill_warmup = False
+                if (
+                    request.agent_kernel_prefill_warmup
+                    and request.num_output_tokens == 0
+                ):
+                    self.kv_cache_manager.update_block_usage(
+                        request,
+                        request.num_computed_tokens,
+                    )
+                    self.kv_cache_manager.seal_segment(request)
+                    sealed_prefill_warmup = True
                 new_token_ids, stopped = self._update_request_with_output(
-                    request, new_token_ids
+                    request,
+                    new_token_ids,
+                    update_block_usage=not sealed_prefill_warmup,
                 )
 
             # Stop checking for pooler models.
@@ -1242,6 +1255,7 @@ class Scheduler(SchedulerInterface):
         self,
         request: Request,
         new_token_ids: list[int],
+        update_block_usage: bool = True,
     ) -> tuple[list[int], bool]:
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
@@ -1256,9 +1270,13 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
-        
+
         # Update KV cache block usage to reflect actual tokens stored
-        self.kv_cache_manager.update_block_usage(request, request.num_computed_tokens)
+        if update_block_usage:
+            self.kv_cache_manager.update_block_usage(
+                request,
+                request.num_computed_tokens,
+            )
 
         return new_token_ids, stopped
 
@@ -1401,10 +1419,10 @@ class Scheduler(SchedulerInterface):
 
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments of the request."""
-        if request_id not in self.requests:
-            return
-        request = self.requests[request_id]
-        self.kv_cache_manager.consolidate_segment_memory(request)
+        request = self.requests.get(request_id)
+        self.kv_cache_manager.consolidate_segment_memory(
+            request if request is not None else request_id
+        )
 
     def pop_pending_semantic_memory_ops(
         self,
