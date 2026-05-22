@@ -1121,6 +1121,7 @@ class Scheduler(SchedulerInterface):
                 if (
                     request.agent_kernel_prefill_warmup
                     and request.num_output_tokens == 0
+                    and self.cache_config.enable_semantic_segment_memory_management
                 ):
                     self.kv_cache_manager.update_block_usage(
                         request,
@@ -1411,6 +1412,8 @@ class Scheduler(SchedulerInterface):
 
     def seal_segment(self, request_id: str) -> None:
         """Seal the current unsealed segment of the request."""
+        if not self.cache_config.enable_semantic_segment_memory_management:
+            return
         if request_id not in self.requests:
             # Request might be finished or not found
             return
@@ -1419,6 +1422,8 @@ class Scheduler(SchedulerInterface):
 
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments of the request."""
+        if not self.cache_config.enable_semantic_segment_memory_management:
+            return
         request = self.requests.get(request_id)
         self.kv_cache_manager.consolidate_segment_memory(
             request if request is not None else request_id
