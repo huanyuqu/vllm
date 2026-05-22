@@ -5,7 +5,6 @@ from collections.abc import Sequence
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
     KVCacheBlock,
     SegmentHash,
     BuddyTreeBlock,
@@ -200,7 +199,7 @@ class KVCacheCoordinator(ABC):
     @abstractmethod
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        request: Request,
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         pass
@@ -239,7 +238,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
 
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        request: Request,
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
@@ -288,11 +287,11 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
 
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        request: Request,
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         hit_blocks = self.single_type_managers[0].find_longest_cache_hit(
-            block_hashes=block_hashes,
+            block_hashes=request.block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
@@ -407,7 +406,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        request: Request,
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
@@ -424,7 +423,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         # First, find the longest cache hit for full attention.
         hit_blocks_full_attn = self.full_attention_manager_cls.find_longest_cache_hit(
-            block_hashes=block_hashes,
+            block_hashes=request.block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=self.full_attention_group_ids,
             block_pool=self.block_pool,
@@ -436,7 +435,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Next, find the cache hit for the other attention WITHIN
         # the cache hit of full attention.
         hit_blocks_other_attn = self.other_attention_cls.find_longest_cache_hit(
-            block_hashes=block_hashes,
+            block_hashes=request.block_hashes,
             max_length=hit_length,
             kv_cache_group_ids=self.other_group_ids,
             block_pool=self.block_pool,
@@ -674,7 +673,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
 
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        request: Request,
         max_cache_hit_length: int,
     ) -> tuple[tuple[SemanticSegments, ...], int]:
         """
@@ -683,18 +682,14 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         NOTE(huanyu): For semantic-segment caching we return matched segments.
         This intentionally differs from other coordinators which return blocks.
         """
-        # Cast BlockHash to SegmentHash. In semantic caching mode, we expect
-        # the input hashes to represent segment boundaries.
-        segment_hashes = [SegmentHash(h) for h in block_hashes]
-
         hit_segments = self.single_type_managers[0].find_longest_cache_hit(
-            segment_hashes=segment_hashes,
+            request=request,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=list(range(self.num_kv_cache_groups)),
             use_eagle=self.use_eagle,
         )
-            
-        return hit_segments, sum(seg.capacity for seg in hit_segments[0])
+
+        return hit_segments, sum(seg.num_tokens for seg in hit_segments[0])
     
     def reset_prefix_cache(self) -> None:
         """

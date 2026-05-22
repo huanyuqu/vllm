@@ -323,6 +323,10 @@ class SemanticSegment:
     @property
     def capacity(self) -> int:
         return self._capacity
+
+    @property
+    def num_tokens(self) -> int:
+        return sum(block.num_tokens for block in self)
     
     @property
     def segment_hash(self) -> Optional[SegmentHashWithGroupId]:

@@ -332,7 +332,7 @@ class KVCacheManager:
         max_cache_hit_length = request.num_tokens - 1
         computed, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                request, max_cache_hit_length
             )
         )
 
@@ -367,7 +367,7 @@ class KVCacheManager:
         max_cache_hit_length = request.num_tokens - 1
         computed, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                request, max_cache_hit_length
             )
         )
 

@@ -395,34 +395,6 @@ def test_get_cached_segment_hit(segment_manager):
     assert cached[0].segment_id == sealed.segment_id
 
 
-def test_find_longest_cache_hit(segment_manager):
-    request_id = "req1"
-
-    blocks = segment_manager.allocate_new_blocks(request_id, 1024)
-    group_id = 0
-    for i, block in enumerate(blocks):
-        block_hash = BlockHash(f"hash_{i}".encode())
-        block.block_hash = make_block_hash_with_group_id(block_hash, group_id)
-
-    segment_manager.seal_segment(request_id)
-    sealed = segment_manager.req_to_segments[request_id].last_segment
-    assert sealed is not None
-    assert sealed.is_sealed
-    assert sealed.segment_hash is not None
-    assert sealed.segment_hash == sealed.tail.block_hash
-    assert not(sealed.segment_hash is sealed.tail.block_hash)
-
-    hit_segments = segment_manager.find_longest_cache_hit(
-        segment_hashes=[get_block_hash(sealed.tail.block_hash)],
-        max_length=sealed.capacity,
-        kv_cache_group_ids=[group_id],
-        use_eagle=False,
-    )
-    assert len(hit_segments) == 1
-    assert len(hit_segments[0]) == 1
-    assert hit_segments[0][0] is sealed
-
-
 def test_cache_blocks_seal_segment(segment_manager):
     request_id = "req1"
     request = MagicMock(spec=Request)
@@ -937,3 +909,44 @@ def test_seal_segment_partial_tail_computes_hash_and_caches():
         extra_keys,
     )
     assert get_block_hash(sealed.segment_hash) == expected
+
+
+def test_find_longest_cache_hit_matches_partial_tail():
+    init_none_hash(sha256)
+
+    pool = BuddyBlockPool(
+        num_max_gpu_blocks=4,
+        supported_sizes=[16, 32],
+        enable_caching=True,
+    )
+    manager = SemanticSegmentManager(block_pool=pool, kv_cache_group_id=0)
+
+    request = Request(
+        request_id="req_partial",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        eos_token_id=0,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    manager.allocate_new_blocks(request_id=request.request_id, num_tokens=8)
+    manager.update_block_usage(request.request_id, request.num_tokens)
+    manager.seal_segment(request)
+
+    next_request = Request(
+        request_id="req_next",
+        prompt_token_ids=list(request.all_token_ids) + [9, 10],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        eos_token_id=0,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+    hit_segments = manager.find_longest_cache_hit(
+        request=next_request,
+        max_length=next_request.num_tokens - 1,
+        kv_cache_group_ids=[0],
+        use_eagle=False,
+    )
+    assert len(hit_segments[0]) == 1
+    assert hit_segments[0][0].num_tokens == request.num_tokens
