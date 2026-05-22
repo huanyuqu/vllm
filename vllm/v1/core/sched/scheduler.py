@@ -1273,7 +1273,10 @@ class Scheduler(SchedulerInterface):
                 break
 
         # Update KV cache block usage to reflect actual tokens stored
-        if update_block_usage:
+        if (
+            update_block_usage
+            and not self.cache_config.enable_semantic_segment_memory_management
+        ):
             self.kv_cache_manager.update_block_usage(
                 request,
                 request.num_computed_tokens,

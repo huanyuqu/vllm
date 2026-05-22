@@ -1561,8 +1561,7 @@ class GPUModelRunner(
                                         segment.head.relative_id * segment.head.size
                                     )
 
-                                    # Use segment.length to get the number of valid tokens.
-                                    length = segment.capacity
+                                    length = segment.num_tokens
 
                                     segment_pointers_list.append(start_token_idx)
                                     segment_lens_list.append(length)

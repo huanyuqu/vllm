@@ -132,6 +132,15 @@ class SegmentHashToSegmentMap:
     def __len__(self) -> int:
         return len(self._cache)
 
+    def iter_segments(self):
+        for segments in self._cache.values():
+            if isinstance(segments, SemanticSegment):
+                yield segments
+            elif isinstance(segments, dict):
+                yield from segments.values()
+            else:
+                self._unexpected_segments_type(segments)
+
     def _unexpected_segments_type(self, segments: Any) -> None:
         raise AssertionError(f"Invalid KV cache segment type {type(segments)}")
     
@@ -601,10 +610,12 @@ class SemanticSegmentManager:
             else:
                 del self.completed_req_to_segments[request_id]
 
-    def _compute_partial_tail_hash(self, request: Request) -> Optional[BlockHash]:
-        """Compute hash for a partial tail block of a request.
+    def _compute_tail_hash(self, request: Request) -> Optional[BlockHash]:
+        """Compute the prefix hash at the current request tail.
 
-        Returns None if there is no partial tail to hash.
+        Full tail blocks can use the request's latest block hash directly.
+        Partial tails are hashed with the same parent/extra-key logic used by
+        the regular block hasher.
         """
         hasher = request.get_hash_new_full_blocks
         if hasher is not None and hasattr(hasher, "func"):
@@ -620,8 +631,7 @@ class SemanticSegmentManager:
 
         start_token_idx = len(request.block_hashes) * block_size
         if start_token_idx >= request.num_tokens:
-            # No partial tail.
-            return None
+            return request.block_hashes[-1] if request.block_hashes else None
 
         end_token_idx = request.num_tokens
         curr_mm_idx = -1 if start_token_idx > 0 else 0
@@ -684,16 +694,16 @@ class SemanticSegmentManager:
         # ensuring all blocks have a block_hash.
         last_block_hash_with_group_id = unsealed_segment.tail.block_hash
         if last_block_hash_with_group_id is None:
-            # If the tail block is partial and request context is available,
-            # force a tail hash computation so the sealed segment still has a
-            # stable prefix-cache key.
-            partial_tail_hash = (
-                self._compute_partial_tail_hash(request_obj)
+            # If block metadata has not been populated on the tail, compute the
+            # request prefix hash at the segment end so generated full-block
+            # tails are still cacheable.
+            tail_hash = (
+                self._compute_tail_hash(request_obj)
                 if request_obj is not None
                 else None
             )
 
-            if partial_tail_hash is None:
+            if tail_hash is None:
                 # Keep lifecycle invariants even when no stable hash is available.
                 unsealed_segment.seal()
                 logger.debug(
@@ -702,7 +712,7 @@ class SemanticSegmentManager:
                 )
                 return
 
-            segment_hash = SegmentHash(partial_tail_hash)
+            segment_hash = SegmentHash(tail_hash)
         else:
             # Fast path: a full tail block already has a block hash.
             segment_hash = SegmentHash(get_block_hash(last_block_hash_with_group_id))
@@ -778,6 +788,7 @@ class SemanticSegmentManager:
         if isinstance(request, Request):
             request_id = request.request_id
             request_obj: Request | str = request
+            self.update_block_usage(request_id, request.num_tokens)
         else:
             request_id = request
             request_obj = request_id
@@ -886,37 +897,102 @@ class SemanticSegmentManager:
     
     def find_longest_cache_hit(
         self,
-        segment_hashes: list[SegmentHash],
+        request: Request,
         max_length: int,
         kv_cache_group_ids: list[int],
-        use_eagle: bool
+        use_eagle: bool,
     ) -> tuple[SemanticSegments, ...]:
         matched_segments: tuple[SemanticSegments, ...] = tuple(
             SemanticSegments() for _ in range(len(kv_cache_group_ids))
         )
-        
         current_length = 0
-        for segment_hash in segment_hashes:
-            cached_segments = self.get_cached_segment(segment_hash, kv_cache_group_ids)
-            if not cached_segments:
-                break
-            
-            # Assuming all segments in the group have the same capacity
-            segment_length = cached_segments[0].capacity
-            if current_length + segment_length > max_length:
+        candidate_lengths = sorted(
+            {
+                segment.num_tokens
+                for segment in self.cached_segments.iter_segments()
+                if segment.num_tokens > 0
+            },
+            reverse=True,
+        )
+
+        while current_length < max_length:
+            matched = False
+            for segment_length in candidate_lengths:
+                end_length = current_length + segment_length
+                if end_length > max_length:
+                    continue
+                segment_hash = self._prefix_hash(request, end_length)
+                if segment_hash is None:
+                    continue
+                cached_segments = self.get_cached_segment(
+                    segment_hash,
+                    kv_cache_group_ids,
+                )
+                if not cached_segments:
+                    continue
+                if cached_segments[0].num_tokens != segment_length:
+                    continue
+
+                for matched_group, segment in zip(
+                    matched_segments,
+                    cached_segments,
+                ):
+                    matched_group.append(segment)
+                current_length = end_length
+                matched = True
                 break
 
-            # Add segments to matched_segments
-            for matched, segment in zip(matched_segments, cached_segments):
-                matched.append(segment)
-            
-            current_length += segment_length
-                
+            if not matched:
+                break
+
         if use_eagle and matched_segments[0]:
-            for matched in matched_segments:
-                matched.pop()
-                
+            for matched_group in matched_segments:
+                matched_group.pop()
+
         return matched_segments
+
+    def _prefix_hash(
+        self,
+        request: Request,
+        end_token_idx: int,
+    ) -> Optional[SegmentHash]:
+        block_size = self.block_pool.min_block_size
+        if end_token_idx % block_size == 0:
+            block_idx = end_token_idx // block_size - 1
+            if block_idx < 0 or block_idx >= len(request.block_hashes):
+                return None
+            return SegmentHash(request.block_hashes[block_idx])
+
+        hasher = request.get_hash_new_full_blocks
+        if hasher is None or not hasattr(hasher, "func"):
+            return None
+        hasher_func = hasher.func
+        caching_hash_fn = getattr(hasher_func, "caching_hash_fn", None)
+        if caching_hash_fn is None:
+            return None
+
+        start_token_idx = (end_token_idx // block_size) * block_size
+        parent_block_hash = (
+            request.block_hashes[start_token_idx // block_size - 1]
+            if start_token_idx > 0
+            else None
+        )
+        curr_mm_idx = -1 if start_token_idx > 0 else 0
+        extra_keys, _ = generate_block_hash_extra_keys(
+            request,
+            start_token_idx,
+            end_token_idx,
+            curr_mm_idx,
+        )
+        block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
+        return SegmentHash(
+            hash_block_tokens(
+                caching_hash_fn,
+                parent_block_hash,
+                block_tokens,
+                extra_keys,
+            )
+        )
 
     @classmethod
     # TODO(huanyu): consolidating one segment may affect the memory layout of 
@@ -1076,19 +1152,10 @@ class SemanticSegmentManager:
         num_allocated_tokens = segments.capacity
 
         # Total tokens in the newly computed segments
-        num_computed_tokens = sum(seg.capacity for seg in new_computed_segments)
+        num_computed_tokens = sum(seg.num_tokens for seg in new_computed_segments)
 
         num_new_tokens = num_tokens - num_computed_tokens - num_allocated_tokens
-
-        # If a computed segment is an eviction candidate (present in the
-        # free queue with ref_cnt == 0), it will be converted from a free
-        # segment to a computed segment when the request is allocated, so
-        # we also count it as needing to be allocated.
-        num_evictable_computed_tokens = sum(
-            seg.capacity for seg in new_computed_segments if seg.ref_cnt == 0
-        )
-
-        return num_new_tokens + num_evictable_computed_tokens
+        return num_new_tokens
     
     def save_new_computed_segments(
         self, request_id: str, new_computed_segments: SemanticSegments
@@ -1103,6 +1170,7 @@ class SemanticSegmentManager:
         """
         segments = self.req_to_segments[request_id]
         segments += new_computed_segments
+        self.num_cached_segments[request_id] = len(segments)
 
     def get_num_free_tokens(self) -> int:
         return (self.block_pool.get_num_free_tokens() + 
