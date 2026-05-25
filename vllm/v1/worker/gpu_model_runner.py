@@ -112,6 +112,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.core.kv_cache_manager import MultiGroupSemanticSegments
+from vllm.v1.core.kv_cache_utils import BuddyTreeBlock
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -1527,8 +1528,13 @@ class GPUModelRunner(
                 with record_function_or_nullcontext(
                     "gpu_model_runner: semantic_segment_metadata"
                 ):
-                    max_block_size = max(
+                    supported_block_sizes = (
                         self.cache_config.semantic_supported_block_sizes
+                    )
+                    max_block_size = (
+                        max(supported_block_sizes)
+                        if supported_block_sizes is not None
+                        else kv_cache_group.kv_cache_spec.block_size
                     )
 
                     for i in range(num_reqs):
@@ -1554,12 +1560,19 @@ class GPUModelRunner(
                                     # Optimized path for consolidated segments:
                                     # They are contiguous in memory, so we can directly calculate
                                     # the start address and length without iterating over blocks.
-                                    start_token_idx = (
-                                        segment.head.block_id * max_block_size
-                                    )
-                                    start_token_idx += (
-                                        segment.head.relative_id * segment.head.size
-                                    )
+                                    if isinstance(segment.head, BuddyTreeBlock):
+                                        start_token_idx = (
+                                            segment.head.block_id * max_block_size
+                                        )
+                                        start_token_idx += (
+                                            segment.head.relative_id
+                                            * segment.head.size
+                                        )
+                                    else:
+                                        start_token_idx = (
+                                            segment.head.block_id
+                                            * kv_cache_group.kv_cache_spec.block_size
+                                        )
 
                                     length = segment.num_tokens
 

@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import MagicMock
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
 from vllm.v1.core.semantic_segment_manager import EvictionPolicy, SemanticSegmentManager
 from vllm.v1.core.kv_cache_utils import (
@@ -60,6 +61,72 @@ def test_allocate_block_with_excessive_memory(segment_manager):
     blocks = segment_manager.allocate_new_blocks(request_id, 64)
     assert len(blocks) == 1
     assert sum(b.size for b in blocks) == 128
+
+
+def test_allocate_new_blocks_with_block_pool():
+    pool = BlockPool(num_gpu_blocks=5, enable_caching=True)
+    manager = SemanticSegmentManager(
+        block_pool=pool,
+        kv_cache_group_id=0,
+        block_size=16,
+    )
+
+    blocks = manager.allocate_new_blocks("req1", 33)
+    assert len(blocks) == 3
+    assert [block.size for block in blocks] == [16, 16, 16]
+    assert [block.ref_cnt for block in blocks] == [1, 1, 1]
+
+    manager.update_block_usage("req1", 33)
+    assert [block.num_tokens for block in blocks] == [16, 16, 1]
+
+    manager.seal_segment("req1")
+    assert manager.req_to_segments["req1"].unsealed_segment is not None
+
+    blocks[-1].block_hash = make_block_hash_with_group_id(
+        BlockHash(b"req1_tail"),
+        0,
+    )
+    manager.free("req1")
+    assert manager.free_segment_queue.num_free_segments == 1
+
+    reused_blocks = manager.allocate_new_blocks("req2", 64)
+    assert len(reused_blocks) == 4
+
+
+def test_consolidate_memory_with_block_pool():
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True)
+    manager = SemanticSegmentManager(
+        block_pool=pool,
+        kv_cache_group_id=0,
+        block_size=16,
+    )
+
+    blocks = manager.allocate_new_blocks("req1", 48)
+    manager.update_block_usage("req1", 48)
+    blocks[-1].block_hash = make_block_hash_with_group_id(
+        BlockHash(b"req1_tail"),
+        0,
+    )
+    manager.seal_segment("req1")
+
+    # Simulate a fragmented fixed-block segment. The physical block order is
+    # now [1, 3, 2], so a contiguous segmented-attention span cannot represent
+    # it until compaction moves it elsewhere.
+    swap_blocks(blocks[1], blocks[2])
+    segment = manager.req_to_segments["req1"].last_segment
+    assert [block.block_id for block in segment.blocks] == [1, 3, 2]
+
+    manager.consolidate_segment_memory("req1")
+
+    assert segment.is_consolidated
+    assert [block.block_id for block in segment.blocks] == [4, 5, 6]
+    moves, swaps = manager.get_pending_moves()
+    assert swaps == []
+    assert moves == [
+        (0, 16, 64, 16),
+        (0, 48, 80, 16),
+        (0, 32, 96, 16),
+    ]
 
 
 def test_seal_segment(segment_manager):

@@ -94,7 +94,11 @@ class CacheConfig:
     semantic_eviction_policy: SemanticEvictionPolicy = "tight"
     """The eviction policy for semantic segment caching."""
     semantic_supported_block_sizes: list[int] | None = None
-    """The supported block sizes for semantic segment caching."""
+    """The supported block sizes for semantic segment caching.
+
+    If unset, semantic segment memory management uses the standard fixed-size
+    BlockPool. If set, it uses BuddyBlockPool with the provided block sizes.
+    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
     - "sha256" uses Pickle for object serialization before hashing.\n

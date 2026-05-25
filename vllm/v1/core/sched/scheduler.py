@@ -193,6 +193,15 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    def _semantic_block_id_sizes(self) -> tuple[int, int]:
+        supported_sizes = self.cache_config.semantic_supported_block_sizes
+        if supported_sizes is not None:
+            return min(supported_sizes), max(supported_sizes)
+        block_size = self.kv_cache_config.kv_cache_groups[
+            0
+        ].kv_cache_spec.block_size
+        return block_size, block_size
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -698,8 +707,7 @@ class Scheduler(SchedulerInterface):
 
         # Construct the scheduler output.
         if self.cache_config.enable_semantic_segment_memory_management:
-            min_block_size = min(self.cache_config.semantic_supported_block_sizes)
-            max_block_size = max(self.cache_config.semantic_supported_block_sizes)
+            min_block_size, max_block_size = self._semantic_block_id_sizes()
             new_reqs_data = [
                 NewRequestData.from_request(
                     req,
@@ -840,8 +848,7 @@ class Scheduler(SchedulerInterface):
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             if self.cache_config.enable_semantic_segment_memory_management:
-                min_block_size = min(self.cache_config.semantic_supported_block_sizes)
-                max_block_size = max(self.cache_config.semantic_supported_block_sizes)
+                min_block_size, max_block_size = self._semantic_block_id_sizes()
                 new_block_ids.append(
                     req_to_new_blocks[req_id].get_block_ids(
                         allow_none=True,
@@ -1127,8 +1134,9 @@ class Scheduler(SchedulerInterface):
                         request,
                         request.num_computed_tokens,
                     )
-                    self.kv_cache_manager.seal_segment(request)
-                    sealed_prefill_warmup = True
+                    sealed_prefill_warmup = self.kv_cache_manager.seal_segment(
+                        request
+                    )
                 new_token_ids, stopped = self._update_request_with_output(
                     request,
                     new_token_ids,

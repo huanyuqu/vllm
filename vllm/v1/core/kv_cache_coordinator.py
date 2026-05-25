@@ -470,14 +470,13 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
     """
     KV cache coordinator for semantic segment-based caching.
     
-    This coordinator uses BuddyBlockPool for variable-sized block allocation
-    and SemanticSegmentManager for segment-based prefix caching and computation. 
-    It supports dynamic block sizes and semantic-aware cache management.
+    This coordinator uses SemanticSegmentManager for segment-based prefix
+    caching and computation. It can allocate segment blocks from either the
+    standard BlockPool or BuddyBlockPool.
     
     TODO(huanyu): Currently only support one KV cache group like `UnitaryKVCacheCoordinator`. 
     
     Key differences from other coordinators:
-    - Uses BuddyBlockPool instead of BlockPool for variable-sized blocks
     - Uses SemanticSegmentManager instead of SingleTypeKVCacheManager
     - Caches at segment granularity rather than block granularity
     """
@@ -485,7 +484,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
-        supported_block_sizes: list[int],
+        supported_block_sizes: list[int] | None,
         max_model_len: int,
         use_eagle: bool,
         enable_caching: bool,
@@ -508,17 +507,31 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         assert dcp_world_size == 1, "Currently DCP not supported."
         assert pcp_world_size == 1, "Currently PCP not supported."
 
-        # Initialize BuddyBlockPool for variable-sized block allocation
-        self.block_pool: BuddyBlockPool = BuddyBlockPool(
-            num_max_gpu_blocks=kv_cache_config.num_blocks,
-            supported_sizes=supported_block_sizes,
-            enable_caching=enable_caching,
-            enable_kv_cache_events=enable_kv_cache_events,
-        )
+        block_size = self.kv_cache_config.kv_cache_groups[
+            0
+        ].kv_cache_spec.block_size
+        if supported_block_sizes is None:
+            self.block_pool: BuddyBlockPool | BlockPool = BlockPool(
+                num_gpu_blocks=kv_cache_config.num_blocks,
+                enable_caching=enable_caching,
+                enable_kv_cache_events=enable_kv_cache_events,
+            )
+        else:
+            self.block_pool = BuddyBlockPool(
+                num_max_gpu_blocks=kv_cache_config.num_blocks,
+                supported_sizes=supported_block_sizes,
+                enable_caching=enable_caching,
+                enable_kv_cache_events=enable_kv_cache_events,
+            )
 
         # Initialize SemanticSegmentManagers for each kv cache group
         self.single_type_managers: tuple[SemanticSegmentManager, ...] = tuple(
-            SemanticSegmentManager(self.block_pool, i, eviction_policy)
+            SemanticSegmentManager(
+                self.block_pool,
+                i,
+                eviction_policy,
+                block_size=block_size,
+            )
             for i in range(len(self.kv_cache_config.kv_cache_groups))
         )
 
@@ -570,10 +583,12 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
         for manager in self.single_type_managers:
             manager.update_block_usage(request_id, num_computed_tokens)
 
-    def seal_segment(self, request: Request | str) -> None:
+    def seal_segment(self, request: Request | str) -> bool:
         """Seal the current semantic segment."""
+        sealed = False
         for manager in self.single_type_managers:
-            manager.seal_segment(request)
+            sealed = manager.seal_segment(request) or sealed
+        return sealed
 
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments for the request."""
@@ -582,7 +597,7 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_encoder_tokens: int = 0
-    ) -> tuple[list[BuddyTreeBlock], ...]:
+    ) -> tuple[list[KVCacheBlock | BuddyTreeBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
         token slots.
@@ -595,7 +610,10 @@ class SemanticSegmentCoordinator(KVCacheCoordinator):  # Duck typing
             for manager in self.single_type_managers
         )
 
-    def get_blocks(self, request_id: str) -> tuple[list[BuddyTreeBlock], ...]:
+    def get_blocks(
+        self,
+        request_id: str,
+    ) -> tuple[list[KVCacheBlock | BuddyTreeBlock], ...]:
         """
         Get the blocks for the request.
         """
@@ -731,10 +749,6 @@ def get_kv_cache_coordinator(
     eviction_policy: EvictionPolicy = EvictionPolicy.TIGHT,
 ) -> "KVCacheCoordinator":
     if enable_semantic_segment:
-        assert supported_block_sizes is not None, (
-            "supported_block_sizes must be provided when "
-            "enable_semantic_segment_cache is True."
-        )
         return SemanticSegmentCoordinator(
             kv_cache_config,
             supported_block_sizes,

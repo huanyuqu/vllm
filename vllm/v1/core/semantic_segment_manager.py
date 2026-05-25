@@ -5,9 +5,11 @@ from enum import Enum
 
 from vllm.logger import init_logger
 from vllm.v1.core.buddy_block_pool import BuddyBlockPool
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
+    KVCacheBlock,
     SegmentHash,
     SegmentHashWithGroupId, 
     BuddyTreeBlock, 
@@ -20,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import (
     swap_blocks,
 )
 from vllm.v1.request import Request
+from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -271,12 +274,19 @@ class SemanticSegmentManager:
 
     def __init__(
         self,
-        block_pool: BuddyBlockPool,
+        block_pool: BuddyBlockPool | BlockPool,
         kv_cache_group_id: int,
         eviction_policy: EvictionPolicy = EvictionPolicy.TIGHT,
+        block_size: int | None = None,
     ):
         self.block_pool = block_pool
         self.eviction_policy = eviction_policy
+        self.uses_buddy_pool = isinstance(block_pool, BuddyBlockPool)
+        self.block_size = (
+            block_pool.min_block_size if self.uses_buddy_pool else block_size
+        )
+        if self.block_size is None:
+            raise ValueError("block_size is required for BlockPool-backed segments")
         
         # request_id -> semantic segments used by this request
         # The last segment might be unsealed (is_sealed=False)
@@ -299,8 +309,8 @@ class SemanticSegmentManager:
         
         self.pending_moves: list[tuple[int, int, int, int]] = [] # list of (group_id, src_addr, dst_addr, size)
         self.pending_swaps: list[tuple[int, int, int, int]] = [] # list of (group_id, addr1, addr2, size)
-        self.blocks_to_free_later: list[BuddyTreeBlock] = [] # blocks to be freed after current moves are executed
-        self.blocks_being_moved: list[BuddyTreeBlock] = [] # blocks currently being moved by the worker
+        self.blocks_to_free_later: list[KVCacheBlock] = [] # blocks to be freed after current moves are executed
+        self.blocks_being_moved: list[KVCacheBlock] = [] # blocks currently being moved by the worker
 
     def get_pending_moves(self) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
         """Get and clear pending moves."""
@@ -337,8 +347,15 @@ class SemanticSegmentManager:
         
         for segment in segments:
             if segment.is_sealed and segment.capacity > 0 and not segment.is_consolidated:
-                result = SemanticSegmentManager._consolidate_segment_memory(
-                    segment, self.block_pool)
+                if self.uses_buddy_pool:
+                    result = SemanticSegmentManager._consolidate_segment_memory(
+                        segment, self.block_pool)
+                else:
+                    if self._is_paged_segment_contiguous(segment):
+                        segment.is_consolidated = True
+                        continue
+                    result = self._consolidate_paged_segment_memory(segment)
+
                 if result:
                     moves, swaps = result
 
@@ -352,25 +369,46 @@ class SemanticSegmentManager:
                     # Some destinations may be previous move sources (i.e., an
                     # in-flight source location reused as a destination). Only
                     # free sources that are not reused as destinations.
-                    dst_blocks = {dst for _, dst in moves}
+                    dst_blocks = {id(dst) for _, dst in moves}
                     
                     # Process moves
                     for src_block, dst_block in moves:
-                        src_addr = self.block_pool.calculate_address(src_block)
-                        dst_addr = self.block_pool.calculate_address(dst_block)
-                        self.pending_moves.append((self.kv_cache_group_id, src_addr, dst_addr, src_block.size))
-                        if src_block not in dst_blocks:
+                        src_addr = self._block_address(src_block)
+                        dst_addr = self._block_address(dst_block)
+                        self.pending_moves.append(
+                            (
+                                self.kv_cache_group_id,
+                                src_addr,
+                                dst_addr,
+                                src_block.size,
+                            )
+                        )
+                        if id(src_block) not in dst_blocks:
                             self.blocks_to_free_later.append(src_block)
                         
                     # Process swaps
                     for block1, block2 in swaps:
-                        addr1 = self.block_pool.calculate_address(block1)
-                        addr2 = self.block_pool.calculate_address(block2)
-                        self.pending_swaps.append((self.kv_cache_group_id, addr1, addr2, block1.size))
+                        addr1 = self._block_address(block1)
+                        addr2 = self._block_address(block2)
+                        self.pending_swaps.append(
+                            (
+                                self.kv_cache_group_id,
+                                addr1,
+                                addr2,
+                                block1.size,
+                            )
+                        )
 
-                # Single-round planner: if we produced any ops, we treat the
-                # segment as consolidated for subsequent attention metadata.
-                segment.is_consolidated = True
+                    # Single-round planner: if we produced ops, we treat the
+                    # segment as consolidated for subsequent attention metadata.
+                    segment.is_consolidated = True
+                elif self.uses_buddy_pool:
+                    segment.is_consolidated = True
+
+    def _block_address(self, block: KVCacheBlock) -> int:
+        if isinstance(block, BuddyTreeBlock):
+            return self.block_pool.calculate_address(block)
+        return block.block_id * self.block_size
 
     def _consolidatable_segments(
         self,
@@ -498,10 +536,7 @@ class SemanticSegmentManager:
                 usage = max(0, tokens_remaining - current_block_offset)
                 
                 if current_block.num_tokens != usage:
-                    self.block_pool.update_block_usage(
-                        current_block.block_id, current_block.size, 
-                        current_block.relative_id, usage
-                    )
+                    self._update_block_usage(current_block, usage)
                 
                 # Update cursor
                 self.req_cursors[request_id] = ActiveBlockCursor(
@@ -514,28 +549,57 @@ class SemanticSegmentManager:
             
             # This block is fully used, mark it as full if needed
             if current_block.num_tokens != current_block.size:
-                self.block_pool.update_block_usage(
-                    current_block.block_id, current_block.size, 
-                    current_block.relative_id, current_block.size
-                )
+                self._update_block_usage(current_block, current_block.size)
             
             current_block_offset += current_block.size
             current_block = current_block.next_block
 
+    def _update_block_usage(
+        self,
+        block: KVCacheBlock,
+        num_tokens_used: int,
+    ) -> None:
+        if isinstance(block, BuddyTreeBlock):
+            self.block_pool.update_block_usage(
+                block.block_id,
+                block.size,
+                block.relative_id,
+                num_tokens_used,
+            )
+        else:
+            block.num_tokens = num_tokens_used
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int
-    ) -> list[BuddyTreeBlock]:
+    ) -> list[KVCacheBlock]:
         """
         Allocate blocks for a request.
         
         These blocks are added to the last segment of the request.
         If the last segment is sealed or doesn't exist, a new unsealed segment is created.
         """
-        # 1. Try allocate from slabs
+        blocks = (
+            self._allocate_buddy_blocks(num_tokens)
+            if self.uses_buddy_pool
+            else self._allocate_paged_blocks(num_tokens)
+        )
+
+        segments = self.req_to_segments[request_id]
+        if not segments.unsealed_segment:
+            # Create new unsealed segment
+            segment_id = SegmentIdGenerator().generate()
+            new_segment = SemanticSegment(segment_id=segment_id, ref_cnt=1)
+            segments.append(new_segment)
+        
+        # Append to unsealed segment
+        segments.unsealed_segment.append(blocks)
+            
+        return blocks
+
+    def _allocate_buddy_blocks(self, num_tokens: int) -> list[BuddyTreeBlock]:
         blocks, remaining = self.block_pool.get_new_blocks(num_tokens)
             
         if remaining > 0:
-            # 2. Free segments if needed
             freed_capacity = 0
             original_remaining = remaining
             if self.eviction_policy == EvictionPolicy.OVERPROVISION:
@@ -560,21 +624,103 @@ class SemanticSegmentManager:
                 remaining = original_remaining
 
             if remaining > 0:
-                # 3. Reclaim from allocated blocks if still needed
                 reclaimed_blocks = self.block_pool.reclaim_new_blocks(remaining)
                 blocks.extend(reclaimed_blocks)
-        
-        segments = self.req_to_segments[request_id]
-        if not segments.unsealed_segment:
-            # Create new unsealed segment
-            segment_id = SegmentIdGenerator().generate()
-            new_segment = SemanticSegment(segment_id=segment_id, ref_cnt=1)
-            segments.append(new_segment)
-        
-        # Append to unsealed segment
-        segments.unsealed_segment.append(blocks)
-            
+
         return blocks
+
+    def _allocate_paged_blocks(self, num_tokens: int) -> list[KVCacheBlock]:
+        num_blocks = cdiv(num_tokens, self.block_size)
+        try:
+            blocks = self.block_pool.get_new_blocks(num_blocks)
+        except ValueError:
+            while self.free_segment_queue.num_free_segments > 0:
+                segment: SemanticSegment = self.free_segment_queue.popleft()
+                self.num_free_segment_tokens -= segment.capacity
+                self._maybe_evict_cached_segment(segment)
+                segment.unseal()
+                self.block_pool.free_blocks(reversed(segment.blocks))
+                if self.block_pool.get_num_free_blocks() >= num_blocks:
+                    break
+            blocks = self.block_pool.get_new_blocks(num_blocks)
+
+        for block in blocks:
+            block.size = self.block_size
+            block.num_tokens = 0
+            setattr(block, "prev_block", None)
+            setattr(block, "next_block", None)
+            setattr(block, "segment", None)
+            setattr(block, "is_sealed", False)
+        
+        return blocks
+
+    def _is_paged_segment_contiguous(self, segment: SemanticSegment) -> bool:
+        blocks = segment.blocks
+        if not blocks:
+            return False
+        return all(
+            block.block_id == blocks[0].block_id + offset
+            for offset, block in enumerate(blocks)
+        )
+
+    def _consolidate_paged_segment_memory(
+        self,
+        segment: SemanticSegment,
+    ) -> Optional[
+        tuple[
+            list[tuple[KVCacheBlock, KVCacheBlock]],
+            list[tuple[KVCacheBlock, KVCacheBlock]],
+        ]
+    ]:
+        source_blocks = segment.blocks
+        if not source_blocks:
+            return None
+
+        target_blocks = self._allocate_contiguous_free_paged_blocks(
+            len(source_blocks)
+        )
+        if target_blocks is None:
+            return None
+
+        moves: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        for src_block, dst_block in zip(source_blocks, target_blocks):
+            dst_block.size = self.block_size
+            dst_block.num_tokens = src_block.num_tokens
+            moves.append((src_block, dst_block))
+            replace_block_in_segment(src_block, dst_block)
+
+        return moves, []
+
+    def _allocate_contiguous_free_paged_blocks(
+        self,
+        num_blocks: int,
+    ) -> Optional[list[KVCacheBlock]]:
+        blocks = self.block_pool.blocks
+        for start in range(0, len(blocks) - num_blocks + 1):
+            candidate = blocks[start:start + num_blocks]
+            if all(self._is_free_paged_block(block) for block in candidate):
+                for block in candidate:
+                    self.block_pool.free_block_queue.remove(block)
+                    if self.block_pool.enable_caching:
+                        self.block_pool._maybe_evict_cached_block(block)
+                    block.ref_cnt = 1
+                    block.size = self.block_size
+                    block.num_tokens = 0
+                    setattr(block, "prev_block", None)
+                    setattr(block, "next_block", None)
+                    setattr(block, "segment", None)
+                    setattr(block, "is_sealed", False)
+                return candidate
+        return None
+
+    @staticmethod
+    def _is_free_paged_block(block: KVCacheBlock) -> bool:
+        return (
+            not block.is_null
+            and block.ref_cnt == 0
+            and block.prev_free_block is not None
+            and block.next_free_block is not None
+        )
     
     def _maybe_evict_cached_segment(self, segment: SemanticSegment) -> bool:
         """
@@ -620,10 +766,10 @@ class SemanticSegmentManager:
         hasher = request.get_hash_new_full_blocks
         if hasher is not None and hasattr(hasher, "func"):
             hasher_func = hasher.func
-            block_size = getattr(hasher_func, "block_size", self.block_pool.min_block_size)
+            block_size = getattr(hasher_func, "block_size", self.block_size)
             caching_hash_fn = getattr(hasher_func, "caching_hash_fn", None)
         else:
-            block_size = self.block_pool.min_block_size
+            block_size = self.block_size
             caching_hash_fn = None
 
         if caching_hash_fn is None:
@@ -649,8 +795,10 @@ class SemanticSegmentManager:
         )
 
     def seal_segment(
-        self, request: Request | str
-    ) -> None:
+        self,
+        request: Request | str,
+        allow_partial: bool = False,
+    ) -> bool:
         """
         Seal the unsealed segment for a request.
         
@@ -681,13 +829,22 @@ class SemanticSegmentManager:
         unsealed_segment = segments.unsealed_segment
         if not unsealed_segment:
             logger.debug(f"Request {request_id} has no unsealed segment.")
-            return
+            return False
 
         if unsealed_segment.head is None or unsealed_segment.tail is None:
             raise ValueError(
                 f"Cannot seal segment for request {request_id}: "
                 "no blocks in unsealed segment."
             )
+
+        if (
+            not self.uses_buddy_pool
+            and unsealed_segment.num_tokens != unsealed_segment.capacity
+        ):
+            if allow_partial:
+                unsealed_segment.seal()
+                return True
+            return False
 
         # We can directly use the tail block's hash as the segment hash because
         # cache_full_blocks is always executed before sealing the segment,
@@ -710,7 +867,7 @@ class SemanticSegmentManager:
                     "Seal segment for request %s without block hash; skipping cache insertion.",
                     request_id,
                 )
-                return
+                return True
 
             segment_hash = SegmentHash(tail_hash)
         else:
@@ -727,11 +884,11 @@ class SemanticSegmentManager:
 
         # If prefix caching is disabled, do not insert segments into the cache.
         if not self.block_pool.enable_caching:
-            return
+            return True
 
         unsealed_segment.segment_hash = segment_hash_with_group_id
         self.cached_segments.insert(segment_hash_with_group_id, unsealed_segment)
-        return
+        return True
     
     def cache_segments(
         self,
@@ -793,7 +950,7 @@ class SemanticSegmentManager:
             request_id = request
             request_obj = request_id
 
-        self.seal_segment(request_obj)
+        self.seal_segment(request_obj, allow_partial=True)
         segments = self.req_to_segments.pop(request_id, SemanticSegments())
         self.req_cursors.pop(request_id, None)
         self.num_cached_segments.pop(request_id, None)
@@ -956,7 +1113,7 @@ class SemanticSegmentManager:
         request: Request,
         end_token_idx: int,
     ) -> Optional[SegmentHash]:
-        block_size = self.block_pool.min_block_size
+        block_size = self.block_size
         if end_token_idx % block_size == 0:
             block_idx = end_token_idx // block_size - 1
             if block_idx < 0 or block_idx >= len(request.block_hashes):
@@ -1173,5 +1330,8 @@ class SemanticSegmentManager:
         self.num_cached_segments[request_id] = len(segments)
 
     def get_num_free_tokens(self) -> int:
-        return (self.block_pool.get_num_free_tokens() + 
-                self.num_free_segment_tokens)
+        if self.uses_buddy_pool:
+            pool_free_tokens = self.block_pool.get_num_free_tokens()
+        else:
+            pool_free_tokens = self.block_pool.get_num_free_blocks() * self.block_size
+        return pool_free_tokens + self.num_free_segment_tokens

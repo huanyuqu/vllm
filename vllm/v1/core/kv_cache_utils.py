@@ -292,8 +292,9 @@ class SemanticSegment:
     It is the unit for prefix caching and reference counting.
     """
     segment_id: int
-    head: Optional[BuddyTreeBlock] = None
-    tail: Optional[BuddyTreeBlock] = None
+    head: Optional[KVCacheBlock] = None
+    tail: Optional[KVCacheBlock] = None
+    _blocks: list[KVCacheBlock] = field(default_factory=list, repr=False)
     _length: int = 0
     _capacity: int = 0
     _segment_hash: Optional[SegmentHashWithGroupId] = field(init=False, default=None)
@@ -305,20 +306,12 @@ class SemanticSegment:
         return self._length
     
     def __iter__(self):
-        current = self.head
-        while current:
-            yield current
-            current = current.next_block
+        return iter(self._blocks)
     
     @property
-    def blocks(self) -> list[BuddyTreeBlock]:
+    def blocks(self) -> list[KVCacheBlock]:
         """Get all blocks in this segment."""
-        blocks = []
-        current = self.head
-        while current:
-            blocks.append(current)
-            current = current.next_block
-        return blocks
+        return list(self._blocks)
     
     @property
     def capacity(self) -> int:
@@ -340,27 +333,27 @@ class SemanticSegment:
         self._segment_hash = segment_hash
         
     @overload
-    def append(self, block: BuddyTreeBlock) -> None:
+    def append(self, block: KVCacheBlock) -> None:
         ...
 
     @overload
-    def append(self, block: list[BuddyTreeBlock]) -> None:
+    def append(self, block: list[KVCacheBlock]) -> None:
         ...
 
-    def append(self, block: BuddyTreeBlock | list[BuddyTreeBlock]) -> None:
+    def append(self, block: KVCacheBlock | list[KVCacheBlock]) -> None:
         """Add block(s) to this segment."""
         if isinstance(block, list):
             for b in block:
                 self.append(b)
         else:
-            block.segment = self
+            setattr(block, "segment", self)
+            setattr(block, "prev_block", self.tail)
+            setattr(block, "next_block", None)
             if self.tail:
-                self.tail.next_block = block
-                block.prev_block = self.tail
-                self.tail = block
-            else:
-                self.head = block
-                self.tail = block
+                setattr(self.tail, "next_block", block)
+            self._blocks.append(block)
+            self.head = self._blocks[0]
+            self.tail = block
             self._length += 1
             self._capacity += block.size
             
@@ -373,15 +366,13 @@ class SemanticSegment:
         if self.is_sealed:
             raise RuntimeError("Segment is already sealed")
         self.is_sealed = True
-        current = self.head
-        while current:
-            current.segment = self
-            current.is_sealed = True
-            current = current.next_block
+        for block in self._blocks:
+            setattr(block, "segment", self)
+            setattr(block, "is_sealed", True)
         self.ref_cnt = ref_cnt
     
     @property
-    def last_block(self) -> BuddyTreeBlock:
+    def last_block(self) -> KVCacheBlock:
         """Get the last block in this segment."""
         if not self.tail:
             raise IndexError("Segment is empty")
@@ -394,12 +385,10 @@ class SemanticSegment:
         """
         self.is_sealed = False
         self.is_consolidated = False
-        current = self.head
-        while current:
-            current.is_sealed = False
-            current.segment = None
-            current.ref_cnt = 1
-            current = current.next_block
+        for block in self._blocks:
+            setattr(block, "is_sealed", False)
+            setattr(block, "segment", None)
+            block.ref_cnt = 1
 
     def reset_hash(self):
         """Reset the segment hash when the segment is evicted."""
@@ -407,10 +396,11 @@ class SemanticSegment:
 
     def __repr__(self) -> str:
         block_ids = []
-        current = self.head
-        while current:
-            block_ids.append(current.full_id)
-            current = current.next_block
+        for block in self._blocks:
+            block_ids.append(
+                block.full_id if isinstance(block, BuddyTreeBlock)
+                else block.block_id
+            )
         return (f"SemanticSegment(segment_id={self.segment_id}, "
                 f"block_ids={block_ids}, "
                 f"length={len(self)}, "
@@ -419,8 +409,8 @@ class SemanticSegment:
         
         
 def replace_block_in_segment(
-    old_block: BuddyTreeBlock, 
-    new_blocks: list[BuddyTreeBlock] | BuddyTreeBlock
+    old_block: KVCacheBlock, 
+    new_blocks: list[KVCacheBlock] | KVCacheBlock
 ) -> None:
     """Replace a block in its segment with new blocks.
     Args:
@@ -430,45 +420,14 @@ def replace_block_in_segment(
     if old_block.segment:
         segment = old_block.segment
         
-        if isinstance(new_blocks, BuddyTreeBlock):
+        if not isinstance(new_blocks, list):
             new_blocks = [new_blocks]
-        
-        # 1. Link new blocks together and update segment pointers
-        for i in range(len(new_blocks) - 1):
-            new_blocks[i].next_block = new_blocks[i+1]
-            new_blocks[i+1].prev_block = new_blocks[i]
-            new_blocks[i].segment = segment
-            new_blocks[i].ref_cnt = segment.ref_cnt
-            new_blocks[i].is_sealed = segment.is_sealed
-            
-        # Handle the last block separately
-        new_blocks[-1].segment = segment
-        new_blocks[-1].ref_cnt = segment.ref_cnt
-        new_blocks[-1].is_sealed = segment.is_sealed
-        
-        # 2. Link first new block to prev
-        first_block = new_blocks[0]
-        first_block.prev_block = old_block.prev_block
-        if first_block.prev_block:
-            first_block.prev_block.next_block = first_block
-            
-        # 3. Link last new block to next
-        last_block = new_blocks[-1]
-        last_block.next_block = old_block.next_block
-        if last_block.next_block:
-            last_block.next_block.prev_block = last_block
-            
-        # 4. Update segment head/tail if needed
-        if segment.head == old_block:
-            segment.head = first_block
-        if segment.tail == old_block:
-            segment.tail = last_block
-            
-        # 5. Update segment length and capacity
-        segment._length += len(new_blocks) - 1
-        segment._capacity += sum(b.size for b in new_blocks) - old_block.size
 
-        # 6. Detach the replaced block from the segment.
+        idx = segment._blocks.index(old_block)
+        segment._blocks[idx:idx + 1] = new_blocks
+        _refresh_segment_block_metadata(segment)
+
+        # Detach the replaced block from the segment.
         # Callers may defer freeing (e.g. after an async move). Keeping the
         # old block linked/sealed can break segment traversal and violate
         # allocator invariants during deferred free.
@@ -480,6 +439,26 @@ def replace_block_in_segment(
         old_block.ref_cnt = 1
     else:
         raise RuntimeError("Block to replace is not in a segment")
+
+
+def _refresh_segment_block_metadata(segment: SemanticSegment) -> None:
+    segment.head = segment._blocks[0] if segment._blocks else None
+    segment.tail = segment._blocks[-1] if segment._blocks else None
+    segment._length = len(segment._blocks)
+    segment._capacity = sum(block.size for block in segment._blocks)
+
+    for idx, block in enumerate(segment._blocks):
+        prev_block = segment._blocks[idx - 1] if idx > 0 else None
+        next_block = (
+            segment._blocks[idx + 1]
+            if idx + 1 < len(segment._blocks)
+            else None
+        )
+        setattr(block, "prev_block", prev_block)
+        setattr(block, "next_block", next_block)
+        setattr(block, "segment", segment)
+        setattr(block, "is_sealed", segment.is_sealed)
+        block.ref_cnt = 1 if segment.is_sealed else segment.ref_cnt
     
     
 def swap_blocks(
@@ -500,93 +479,16 @@ def swap_blocks(
     if not seg1 or not seg2:
         raise RuntimeError("Both blocks must be in a segment to swap")
 
-    # 1. Update links for swap
-    if block1.next_block == block2:
-        # Case: block1 -> block2 (adjacent)
-        prev1 = block1.prev_block
-        next2 = block2.next_block
+    idx1 = seg1._blocks.index(block1)
+    idx2 = seg2._blocks.index(block2)
+    seg1._blocks[idx1] = block2
+    seg2._blocks[idx2] = block1
 
-        block2.prev_block = prev1
-        block2.next_block = block1
-        block1.prev_block = block2
-        block1.next_block = next2
-
-        if prev1:
-            prev1.next_block = block2
-        if next2:
-            next2.prev_block = block1
-
-    elif block2.next_block == block1:
-        # Case: block2 -> block1 (adjacent)
-        prev2 = block2.prev_block
-        next1 = block1.next_block
-
-        block1.prev_block = prev2
-        block1.next_block = block2
-        block2.prev_block = block1
-        block2.next_block = next1
-
-        if prev2:
-            prev2.next_block = block1
-        if next1:
-            next1.prev_block = block2
-
-    else:
-        # Case: Non-adjacent
-        prev1 = block1.prev_block
-        next1 = block1.next_block
-        prev2 = block2.prev_block
-        next2 = block2.next_block
-
-        block1.prev_block = prev2
-        block1.next_block = next2
-        block2.prev_block = prev1
-        block2.next_block = next1
-
-        if prev1:
-            prev1.next_block = block2
-        if next1:
-            next1.prev_block = block2
-
-        if prev2:
-            prev2.next_block = block1
-        if next2:
-            next2.prev_block = block1
-
-    # 2. Update segment head/tail pointers
-    # Use flags because updates might affect subsequent checks if seg1 == seg2
-    is_seg1_head = (seg1.head == block1)
-    is_seg1_tail = (seg1.tail == block1)
-    is_seg2_head = (seg2.head == block2)
-    is_seg2_tail = (seg2.tail == block2)
-
-    if is_seg1_head:
-        seg1.head = block2
-    if is_seg1_tail:
-        seg1.tail = block2
-
-    if is_seg2_head:
-        seg2.head = block1
-    if is_seg2_tail:
-        seg2.tail = block1
-
-    # 3. Swap num_tokens
     block1.num_tokens, block2.num_tokens = block2.num_tokens, block1.num_tokens
 
-    # 4. Handle segment membership change if needed
-    if seg1 != seg2:
-        block1.segment = seg2
-        block2.segment = seg1
-
-        block1.ref_cnt = seg2.ref_cnt
-        block1.is_sealed = seg2.is_sealed
-
-        block2.ref_cnt = seg1.ref_cnt
-        block2.is_sealed = seg1.is_sealed
-
-        diff_size = block1.size - block2.size
-        seg1._capacity -= diff_size
-        seg2._capacity += diff_size
+    _refresh_segment_block_metadata(seg1)
+    if seg2 is not seg1:
+        _refresh_segment_block_metadata(seg2)
 
 
 # TODO(huanyu): Implement a heap-based free block management strategy.

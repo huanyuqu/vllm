@@ -194,14 +194,17 @@ class MultiGroupSemanticSegments:
             ids = []
             for segment in group:
                 for blk in segment.blocks:
-                    # Convert variable-sized block to atomic block IDs
-                    start_addr = (blk.block_id * max_block_size + 
-                                  blk.relative_id * blk.size)
-                    start_id = start_addr // min_block_size
-                    num_atoms = blk.size // min_block_size
-                    ids.extend(
-                        [start_id + i for i in range(num_atoms)]
-                    )
+                    if isinstance(blk, BuddyTreeBlock):
+                        # Convert variable-sized block to atomic block IDs
+                        start_addr = (blk.block_id * max_block_size + 
+                                      blk.relative_id * blk.size)
+                        start_id = start_addr // min_block_size
+                        num_atoms = blk.size // min_block_size
+                        ids.extend(
+                            [start_id + i for i in range(num_atoms)]
+                        )
+                    else:
+                        ids.append(blk.block_id)
             block_ids.append(ids)
             
         return tuple(block_ids)
@@ -387,11 +390,12 @@ class KVCacheManager:
             assert isinstance(self.coordinator, SemanticSegmentCoordinator)
             self.coordinator.update_block_usage(request.request_id, num_computed_tokens)
 
-    def seal_segment(self, request_id: str) -> None:
+    def seal_segment(self, request: Request | str) -> bool:
         """Seal the current semantic segment."""
         if self.enable_semantic_segment:
             assert isinstance(self.coordinator, SemanticSegmentCoordinator)
-            self.coordinator.seal_segment(request_id)
+            return self.coordinator.seal_segment(request)
+        return False
 
     def consolidate_segment_memory(self, request_id: str) -> None:
         """Consolidate the memory of the sealed segments for the request."""
