@@ -129,6 +129,65 @@ def test_consolidate_memory_with_block_pool():
     ]
 
 
+def test_block_pool_partial_segments_hit_multiple_prefix_segments():
+    init_none_hash(sha256)
+    block_size = 16
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True)
+    manager = SemanticSegmentManager(
+        block_pool=pool,
+        kv_cache_group_id=0,
+        block_size=block_size,
+    )
+    block_hasher = get_request_block_hasher(block_size, sha256)
+
+    def make_request(request_id: str, token_ids: list[int]) -> Request:
+        return Request(
+            request_id=request_id,
+            prompt_token_ids=token_ids,
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            eos_token_id=None,
+            block_hasher=block_hasher,
+        )
+
+    conversation: list[int] = []
+    segment_lengths = [33, 29, 41]
+    for turn_index, segment_length in enumerate(segment_lengths):
+        new_tokens = list(
+            range(turn_index * 1000, turn_index * 1000 + segment_length)
+        )
+        request = make_request(f"req{turn_index}", conversation + new_tokens)
+        hit_segments = manager.find_longest_cache_hit(
+            request,
+            request.num_tokens - 1,
+            [0],
+            False,
+        )
+        manager.touch(hit_segments[0])
+        manager.save_new_computed_segments(
+            request.request_id,
+            hit_segments[0],
+        )
+        hit_tokens = sum(segment.num_tokens for segment in hit_segments[0])
+        num_new_tokens = request.num_tokens - hit_tokens
+        if num_new_tokens:
+            manager.allocate_new_blocks(request.request_id, num_new_tokens)
+            manager.update_block_usage(request.request_id, request.num_tokens)
+        manager.seal_segment(request, allow_partial=True)
+        manager.free(request)
+        conversation = list(request.all_token_ids)
+
+    next_request = make_request("next", conversation + [9000, 9001])
+    hit_segments = manager.find_longest_cache_hit(
+        next_request,
+        next_request.num_tokens - 1,
+        [0],
+        False,
+    )
+
+    assert [segment.num_tokens for segment in hit_segments[0]] == segment_lengths
+
+
 def test_seal_segment(segment_manager):
     request_id = "req1"
     
@@ -999,6 +1058,55 @@ def test_find_longest_cache_hit_matches_partial_tail():
     manager.allocate_new_blocks(request_id=request.request_id, num_tokens=8)
     manager.update_block_usage(request.request_id, request.num_tokens)
     manager.seal_segment(request)
+
+    next_request = Request(
+        request_id="req_next",
+        prompt_token_ids=list(request.all_token_ids) + [9, 10],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        eos_token_id=0,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+    hit_segments = manager.find_longest_cache_hit(
+        request=next_request,
+        max_length=next_request.num_tokens - 1,
+        kv_cache_group_ids=[0],
+        use_eagle=False,
+    )
+    assert len(hit_segments[0]) == 1
+    assert hit_segments[0][0].num_tokens == request.num_tokens
+
+
+def test_block_pool_completed_partial_tail_caches_and_hits():
+    init_none_hash(sha256)
+
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True)
+    manager = SemanticSegmentManager(
+        block_pool=pool,
+        kv_cache_group_id=0,
+        block_size=16,
+    )
+
+    request = Request(
+        request_id="req_partial",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        eos_token_id=0,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+    manager.allocate_new_blocks(request_id=request.request_id, num_tokens=8)
+    manager.update_block_usage(request.request_id, request.num_tokens)
+
+    assert not manager.seal_segment(request)
+    manager.free(request)
+
+    sealed = manager.completed_req_to_segments[request.request_id][0]
+    assert sealed.is_sealed
+    assert sealed.segment_hash is not None
+    assert len(manager.cached_segments) == 1
 
     next_request = Request(
         request_id="req_next",

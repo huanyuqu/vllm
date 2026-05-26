@@ -672,56 +672,18 @@ class FlashAttentionImpl(AttentionImpl):
                 prepacked_segment_block_table = attn_metadata.segment_block_table
                 prepacked_segment_start_indices = attn_metadata.segment_start_indices
                 prepacked_num_segments = attn_metadata.num_segments
-                prepacked_num_segments_cpu = attn_metadata.num_segments_cpu
                 assert (
                     prepacked_segment_lens is not None
                     and prepacked_segment_block_table is not None
                     and prepacked_segment_start_indices is not None
                     and prepacked_num_segments is not None
-                    and prepacked_num_segments_cpu is not None
                 ), "Segmented attention requires prepacked metadata"
 
-                max_num_segments = prepacked_segment_lens.shape[1]
-                pin_memory = device.type == "cuda"
-                segment_k_ptrs_cpu = torch.zeros(
-                    (num_reqs, max_num_segments),
-                    dtype=torch.int64,
-                    pin_memory=pin_memory,
-                )
-                segment_v_ptrs_cpu = torch.zeros(
-                    (num_reqs, max_num_segments),
-                    dtype=torch.int64,
-                    pin_memory=pin_memory,
-                )
-
-                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
-                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
-                k_base_ptr = k_flat.data_ptr()
-                v_base_ptr = v_flat.data_ptr()
-                k_ptr_stride_bytes = k_flat.stride(0) * k_flat.element_size()
-                v_ptr_stride_bytes = v_flat.stride(0) * v_flat.element_size()
-                n_sealed_cpu = prepacked_num_segments_cpu - 1
-
-                valid_mask = (
-                    torch.arange(max_num_segments).unsqueeze(0)
-                    < n_sealed_cpu.unsqueeze(1)
-                )
-
-                segment_k_ptrs_cpu.copy_(
-                    prepacked_segment_start_indices * k_ptr_stride_bytes + k_base_ptr
-                )
-                segment_v_ptrs_cpu.copy_(
-                    prepacked_segment_start_indices * v_ptr_stride_bytes + v_base_ptr
-                )
-                segment_k_ptrs_cpu.masked_fill_(~valid_mask, 0)
-                segment_v_ptrs_cpu.masked_fill_(~valid_mask, 0)
-
-                segment_k_ptrs = segment_k_ptrs_cpu.to(
-                    device=device, non_blocking=True
-                )
-                segment_v_ptrs = segment_v_ptrs_cpu.to(
-                    device=device, non_blocking=True
-                )
+                if prepacked_segment_start_indices.device != device:
+                    prepacked_segment_start_indices = prepacked_segment_start_indices.to(
+                        device=device,
+                        non_blocking=True,
+                    )
 
             descale_shape = (num_reqs, self.num_kv_heads)
             q_descale = None
@@ -761,8 +723,7 @@ class FlashAttentionImpl(AttentionImpl):
                     block_table=prepacked_segment_block_table,
                     segment_num=prepacked_num_segments,
                     segment_lens=prepacked_segment_lens,
-                    segment_k_ptrs=segment_k_ptrs,
-                    segment_v_ptrs=segment_v_ptrs,
+                    segment_start_indices=prepacked_segment_start_indices,
                     num_splits=attn_metadata.max_num_splits,
                     fa_version=self.vllm_flash_attn_version,
                     q_descale=q_descale,

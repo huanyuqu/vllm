@@ -517,7 +517,7 @@ class SemanticSegmentManager:
              for segment in segments:
                  if segment is unsealed_segment:
                      break
-                 current_offset += segment.capacity
+                 current_offset += segment.num_tokens
              
              current_block = unsealed_segment.head
              current_block_offset = 0
@@ -840,10 +840,8 @@ class SemanticSegmentManager:
         if (
             not self.uses_buddy_pool
             and unsealed_segment.num_tokens != unsealed_segment.capacity
+            and not allow_partial
         ):
-            if allow_partial:
-                unsealed_segment.seal()
-                return True
             return False
 
         # We can directly use the tail block's hash as the segment hash because
@@ -1304,9 +1302,12 @@ class SemanticSegmentManager:
         Returns:
             The number of tokens.
         """
-        # Calculate total existing tokens for the request
         segments = self.req_to_segments.get(request_id, SemanticSegments())
-        num_allocated_tokens = segments.capacity
+        unsealed_segment = segments.unsealed_segment
+        num_allocated_tokens = sum(
+            segment.capacity if segment is unsealed_segment else segment.num_tokens
+            for segment in segments
+        )
 
         # Total tokens in the newly computed segments
         num_computed_tokens = sum(seg.num_tokens for seg in new_computed_segments)
