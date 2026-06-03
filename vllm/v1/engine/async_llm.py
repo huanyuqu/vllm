@@ -259,12 +259,12 @@ class AsyncLLM(EngineClient):
 
         shutdown_prometheus()
 
-        if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown()
-
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+        if engine_core := getattr(self, "engine_core", None):
+            engine_core.shutdown()
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return await self.engine_core.get_supported_tasks_async()

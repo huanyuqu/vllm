@@ -24,8 +24,8 @@ _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
 def get_rope(
     head_size: int,
-    rotary_dim: int,
-    max_position: int,
+    rotary_dim: int | None = None,
+    max_position: int = 0,
     is_neox_style: bool = True,
     rope_parameters: dict[str, Any] | None = None,
     dtype: torch.dtype | None = None,
@@ -34,6 +34,8 @@ def get_rope(
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
+    if rotary_dim is None:
+        rotary_dim = head_size
     if rope_parameters is not None:
         # Transforms every value that is a list into a tuple for caching calls
         rope_parameters_tuple = {
@@ -89,7 +91,7 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        scaling_type = rope_parameters["rope_type"]
+        scaling_type = rope_parameters.get("rope_type", "default")
 
         if scaling_type == "llama3":
             scaling_factor = rope_parameters["factor"]

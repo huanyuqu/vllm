@@ -6,9 +6,12 @@ import threading
 from typing import TYPE_CHECKING, Union
 
 import torch
-from lmcache.config import LMCacheEngineConfig as Config
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig as V1Config
+try:
+    from lmcache.config import LMCacheEngineConfig as Config
+except ModuleNotFoundError:
+    Config = V1Config
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -129,7 +132,10 @@ def create_lmcache_metadata(
     """
     # Third Party
     # First Party
-    from lmcache.config import LMCacheEngineMetadata
+    try:
+        from lmcache.config import LMCacheEngineMetadata
+    except ModuleNotFoundError:
+        from lmcache.v1.metadata import LMCacheMetadata as LMCacheEngineMetadata
 
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 
@@ -163,15 +169,34 @@ def create_lmcache_metadata(
     kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
 
     # Create metadata
-    metadata = LMCacheEngineMetadata(
-        model_cfg.model,
-        parallel_cfg.world_size,
-        parallel_cfg.rank,
-        "vllm",
-        kv_dtype,
-        kv_shape,
-        use_mla,
-    )
+    try:
+        metadata = LMCacheEngineMetadata(
+            model_cfg.model,
+            parallel_cfg.world_size,
+            parallel_cfg.rank,
+            "vllm",
+            kv_dtype,
+            kv_shape,
+            use_mla,
+        )
+    except TypeError:
+        local_world_size = max(
+            1,
+            getattr(parallel_cfg, "tensor_parallel_size", 1),
+        )
+        worker_id = parallel_cfg.rank
+        metadata = LMCacheEngineMetadata(
+            model_name=model_cfg.model,
+            world_size=parallel_cfg.world_size,
+            local_world_size=local_world_size,
+            worker_id=worker_id,
+            local_worker_id=worker_id % local_world_size,
+            kv_dtype=kv_dtype,
+            kv_shape=kv_shape,
+            use_mla=use_mla,
+            role="vllm",
+            chunk_size=chunk_size,
+        )
 
     return metadata, config
 

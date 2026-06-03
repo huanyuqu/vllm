@@ -235,12 +235,42 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            num_external_computed_tokens = 0
+            num_computed_tokens = request.num_computed_tokens
+
+            if (
+                self.connector is not None
+                and request.agent_kernel_reuse_span_at(num_computed_tokens)
+                is not None
+            ):
+                if self.cache_config.enable_semantic_segment_memory_management:
+                    raise NotImplementedError(
+                        "KVTransfer with Semantic Segments is not supported yet."
+                    )
+                ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+                    request,
+                    num_computed_tokens,
+                )
+                if ext_tokens is None:
+                    req_index += 1
+                    continue
+                assert not load_kv_async
+                num_external_computed_tokens = ext_tokens
+                num_computed_tokens += num_external_computed_tokens
 
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
-                - request.num_computed_tokens
+                - num_computed_tokens
             )
+            next_reuse_start = request.next_agent_kernel_reuse_span_start(
+                num_computed_tokens
+            )
+            if next_reuse_start is not None:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    next_reuse_start - num_computed_tokens,
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -252,8 +282,9 @@ class Scheduler(SchedulerInterface):
                 request.num_prompt_tokens + request.max_tokens, self.max_model_len
             )
             num_new_tokens = min(
-                num_new_tokens, max_total_tokens - 1 - request.num_computed_tokens
+                num_new_tokens, max_total_tokens - 1 - num_computed_tokens
             )
+            num_new_tokens = max(0, num_new_tokens)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -267,12 +298,12 @@ class Scheduler(SchedulerInterface):
                     external_load_encoder_input,
                 ) = self._try_schedule_encoder_inputs(
                     request,
-                    request.num_computed_tokens,
+                    num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
                 )
 
-            if num_new_tokens == 0:
+            if num_new_tokens == 0 and num_external_computed_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -294,13 +325,13 @@ class Scheduler(SchedulerInterface):
                     if self.cache_config.enable_semantic_segment_memory_management:
                         new_blocks = self.kv_cache_manager.allocate_segment(
                             request,
-                            num_new_tokens,
+                            num_new_tokens + num_external_computed_tokens,
                             num_lookahead_tokens=self.num_lookahead_tokens,
                         )
                     else:
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
-                            num_new_tokens,
+                            num_new_tokens + num_external_computed_tokens,
                             num_lookahead_tokens=self.num_lookahead_tokens,
                         )
 
@@ -360,6 +391,18 @@ class Scheduler(SchedulerInterface):
             if new_blocks is None:
                 # Cannot schedule this request.
                 break
+
+            if self.connector is not None and num_external_computed_tokens > 0:
+                self.connector.update_state_after_alloc(
+                    request,
+                    new_blocks,
+                    num_external_computed_tokens,
+                )
+                self._update_connector_prefix_cache_stats(
+                    request,
+                    num_external_computed_tokens,
+                )
+                request.num_computed_tokens = num_computed_tokens
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
@@ -543,6 +586,16 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    next_reuse_start = (
+                        request.next_agent_kernel_reuse_span_start(
+                            num_computed_tokens
+                        )
+                    )
+                    if next_reuse_start is not None:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            next_reuse_start - num_computed_tokens,
+                        )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.

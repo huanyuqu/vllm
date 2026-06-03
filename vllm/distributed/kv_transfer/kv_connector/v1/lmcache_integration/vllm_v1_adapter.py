@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+import json
 import os
+import time
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -9,25 +11,51 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from lmcache import utils
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.compute.blend import LMCBlenderBuilder
-from lmcache.v1.config import LMCacheEngineConfig, _validate_and_set_config_value
-from lmcache.v1.gpu_connector import (
-    VLLMBufferLayerwiseGPUConnector,
-    VLLMPagedMemGPUConnectorV2,
-    VLLMPagedMemLayerwiseGPUConnector,
-)
+from lmcache.v1.config import LMCacheEngineConfig
+try:
+    from lmcache.config import LMCacheEngineMetadata
+except ModuleNotFoundError:
+    from lmcache.v1.metadata import LMCacheMetadata as LMCacheEngineMetadata
+
+try:
+    from lmcache.v1.config import _validate_and_set_config_value
+except ImportError:
+    def _validate_and_set_config_value(
+        config: LMCacheEngineConfig,
+        key: str,
+        value: object,
+    ) -> bool:
+        if not hasattr(config, key):
+            return False
+        setattr(config, key, value)
+        return True
+try:
+    from lmcache.v1.gpu_connector import (
+        VLLMBufferLayerwiseGPUConnector,
+        VLLMPagedMemGPUConnectorV2,
+        VLLMPagedMemLayerwiseGPUConnector,
+    )
+    _HAS_LEGACY_GPU_CONNECTORS = True
+except ImportError:
+    from lmcache.v1.gpu_connector import CreateGPUConnector
+    _HAS_LEGACY_GPU_CONNECTORS = False
 from lmcache.v1.internal_api_server.api_server import InternalAPIServer
 from lmcache.v1.lookup_client import LookupClientFactory
 from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
     LMCacheAsyncLookupServer,
 )
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
-from lmcache.v1.plugin.plugin_launcher import PluginLauncher
+try:
+    from lmcache.v1.plugin.plugin_launcher import PluginLauncher
+except ModuleNotFoundError:
+    from lmcache.v1.plugin.runtime_plugin_launcher import (
+        RuntimePluginLauncher as PluginLauncher,
+    )
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -60,6 +88,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _emit_agent_kernel_kv_metric(event: str, **attrs: Any) -> None:
+    path = os.environ.get("AGENT_KERNEL_KV_METRICS_PATH")
+    if not path:
+        return
+    record = {
+        "event": event,
+        "ts_ns": time.perf_counter_ns(),
+        **attrs,
+    }
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+@dataclass
+class LoadRange:
+    start: int
+    end: int
+    request_configs: dict | None = None
+    reuse_policy: str | None = None
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -68,6 +117,12 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Agent span reuse needs an exact token mask because the retained span can
+    # start at a structured-context boundary that is not LMCache chunk aligned.
+    exact_vllm_cached_tokens: bool = False
+    # Exact token ranges to load for structured-context reuse. Empty means
+    # use the legacy contiguous range [vllm_cached_tokens, lmcache_cached_tokens).
+    load_ranges: list[LoadRange] = field(default_factory=list)
 
 
 @dataclass
@@ -440,16 +495,14 @@ def _init_lmcache_engine(
     if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
         return curr_engine
 
-    model_config = vllm_config.model_config
-    parallel_config = vllm_config.parallel_config
-    cache_config = vllm_config.cache_config
-
     assert isinstance(lmcache_config, LMCacheEngineConfig), (
         "LMCache v1 configuration is should be passed."
     )
 
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    cache_config = vllm_config.cache_config
     kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
-
     use_mla = mla_enabled(model_config)
     if use_mla and (
         lmcache_config.remote_serde != "naive"
@@ -457,35 +510,40 @@ def _init_lmcache_engine(
     ):
         raise ValueError("MLA only works with naive serde mode..")
 
-    # construct kv shape (for mem pool)
-    num_layer = model_config.get_num_layers(parallel_config)
-    num_mtp_layers = _calculate_mtp_layers(vllm_config, model_config)
-    num_layer += num_mtp_layers
-    chunk_size = lmcache_config.chunk_size
-    num_kv_head = model_config.get_num_kv_heads(parallel_config)
-    head_size = model_config.get_head_size()
-    kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
+    num_layer, kv_shape = _lmcache_kv_shape(lmcache_config, vllm_config)
     logger.info(
         "use mla: %s, kv shape: %s, num_mtp_layers: %s",
         use_mla,
         kv_shape,
-        num_mtp_layers,
+        num_layer - model_config.get_num_layers(parallel_config),
     )
+
+    metadata = _make_lmcache_metadata_from_vllm_config(
+        lmcache_config,
+        vllm_config,
+    )
+
+    if not _HAS_LEGACY_GPU_CONNECTORS:
+        vllm_gpu_connector = CreateGPUConnector(
+            lmcache_config,
+            metadata,
+            utils.EngineType.VLLM,
+        )
+        tpg = get_tp_group()
+        return LMCacheEngineBuilder.get_or_create(
+            ENGINE_NAME,
+            lmcache_config,
+            metadata,
+            vllm_gpu_connector,
+            tpg.broadcast,
+            tpg.broadcast_object,
+        )
 
     # Change current device.
     num_gpus = torch.cuda.device_count()
     local_rank = parallel_config.rank % num_gpus
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    metadata = LMCacheEngineMetadata(
-        model_config.model,
-        parallel_config.world_size,
-        parallel_config.rank,
-        "vllm",
-        kv_dtype,
-        kv_shape,
-        use_mla,
-    )
 
     use_gpu = need_gpu_interm_buffer(lmcache_config)
     vllm_gpu_connector: (
@@ -542,6 +600,103 @@ def _init_lmcache_engine(
     return engine
 
 
+def _lmcache_kv_shape(
+    lmcache_config: LMCacheEngineConfig,
+    vllm_config: "VllmConfig",
+) -> tuple[int, tuple[int, int, int, int, int]]:
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    use_mla = mla_enabled(model_config)
+    num_layer = model_config.get_num_layers(parallel_config)
+    num_layer += _calculate_mtp_layers(vllm_config, model_config)
+    chunk_size = lmcache_config.chunk_size
+    num_kv_head = model_config.get_num_kv_heads(parallel_config)
+    head_size = model_config.get_head_size()
+    kv_shape = (
+        num_layer,
+        1 if use_mla else 2,
+        chunk_size,
+        num_kv_head,
+        head_size,
+    )
+    return num_layer, kv_shape
+
+
+def _make_lmcache_metadata_from_vllm_config(
+    lmcache_config: LMCacheEngineConfig,
+    vllm_config: "VllmConfig",
+):
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    cache_config = vllm_config.cache_config
+    kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
+    use_mla = mla_enabled(model_config)
+    _, kv_shape = _lmcache_kv_shape(lmcache_config, vllm_config)
+    return _make_lmcache_metadata(
+        model_config,
+        parallel_config,
+        vllm_config,
+        kv_dtype,
+        kv_shape,
+        use_mla,
+        lmcache_config.chunk_size,
+    )
+
+
+def _make_lmcache_metadata(
+    model_config,
+    parallel_config,
+    vllm_config: "VllmConfig",
+    kv_dtype: torch.dtype,
+    kv_shape: tuple[int, int, int, int, int],
+    use_mla: bool,
+    chunk_size: int,
+):
+    local_world_size = max(
+        1,
+        getattr(parallel_config, "tensor_parallel_size", 1),
+    )
+    worker_id = parallel_config.rank
+    local_worker_id = worker_id % local_world_size
+    extra_config = None
+    if vllm_config.kv_transfer_config is not None:
+        extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config
+        )
+    engine_id = (
+        vllm_config.kv_transfer_config.engine_id
+        if vllm_config.kv_transfer_config is not None
+        else None
+    )
+    try:
+        metadata = LMCacheEngineMetadata(
+            model_name=model_config.model,
+            world_size=parallel_config.world_size,
+            local_world_size=local_world_size,
+            worker_id=worker_id,
+            local_worker_id=local_worker_id,
+            kv_dtype=kv_dtype,
+            kv_shape=kv_shape,
+            use_mla=use_mla,
+            role="vllm",
+            chunk_size=chunk_size,
+            kv_connector_extra_config=extra_config,
+        )
+    except TypeError:
+        metadata = LMCacheEngineMetadata(
+            model_config.model,
+            parallel_config.world_size,
+            parallel_config.rank,
+            "vllm",
+            kv_dtype,
+            kv_shape,
+            use_mla,
+        )
+    if hasattr(metadata, "engine_id"):
+        metadata.engine_id = engine_id
+    return metadata
+
+
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
@@ -595,9 +750,13 @@ class LMCacheConnectorV1Impl:
         self.layerwise_retrievers: list[Generator[torch.Tensor | None, None, None]] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         if role == KVConnectorRole.SCHEDULER:
-            # Create lookup client using factory
+            metadata = _make_lmcache_metadata_from_vllm_config(
+                config,
+                vllm_config,
+            )
             self.lookup_client = LookupClientFactory.create_lookup_client(
-                vllm_config, config
+                config,
+                metadata,
             )
             self._unfinished_requests: dict[str, Request] = {}
             self._lookup_requests_in_step: list[str] = []
@@ -611,7 +770,7 @@ class LMCacheConnectorV1Impl:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
 
-            if self.enable_blending:
+            if self.enable_blending and self.use_layerwise:
                 self.blender = LMCBlenderBuilder.get_or_create(
                     ENGINE_NAME,
                     self.lmcache_engine,
@@ -619,15 +778,14 @@ class LMCacheConnectorV1Impl:
                     config,
                 )
 
-            # Create lookup server using factory
             assert self.lmcache_engine is not None
             self.lookup_server = LookupClientFactory.create_lookup_server(
-                self.lmcache_engine, vllm_config
+                self.lmcache_engine,
+                self.lmcache_engine.metadata,
             )
 
             self.offload_server = ZMQOffloadServer(
                 self.lmcache_engine,
-                vllm_config,
                 get_tensor_model_parallel_rank(),
             )
 
@@ -827,64 +985,161 @@ class LMCacheConnectorV1Impl:
             self._stats_monitor.update_interval_vllm_hit_tokens(
                 request.load_spec.vllm_cached_tokens
             )
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
-            masked_token_count = (
-                request.load_spec.vllm_cached_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
-            token_mask[:masked_token_count] = False
-
+            retrieve_batches = []
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            if self.use_layerwise:
-                sync = idx == last_idx
-                # NOTE(Jiayi): Perform blending before layerwise prefix caching
-                if self.enable_blending:
-                    # TODO(Jiayi): Need to make prefix caching and blending
-                    # compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    )
-                else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        sync=sync,
-                    )
-                    # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
+            if (
+                request.load_spec.exact_vllm_cached_tokens
+                and request.load_spec.load_ranges
+            ):
+                for load_range in request.load_spec.load_ranges:
+                    retrieve_batches.append((
+                        tokens[load_range.start:load_range.end],
+                        torch.ones(
+                            load_range.end - load_range.start,
+                            dtype=torch.bool,
+                        ),
+                        slot_mapping[load_range.start:load_range.end],
+                        load_range.request_configs,
+                        load_range.reuse_policy,
+                    ))
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                )
+                token_mask = torch.ones(len(tokens), dtype=torch.bool)
+                if request.load_spec.exact_vllm_cached_tokens:
+                    masked_token_count = request.load_spec.vllm_cached_tokens
+                else:
+                    masked_token_count = (
+                        request.load_spec.vllm_cached_tokens
+                        // self._lmcache_chunk_size
+                        * self._lmcache_chunk_size
+                    )
+                token_mask[:masked_token_count] = False
 
-                # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
-                )
-                if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!"
+                retrieve_tokens = tokens[:lmcache_cached_tokens]
+                retrieve_token_mask = token_mask[:lmcache_cached_tokens]
+                retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
+                if request.load_spec.exact_vllm_cached_tokens:
+                    span_start = request.load_spec.vllm_cached_tokens
+                    if span_start < lmcache_cached_tokens:
+                        retrieve_tokens = tokens[span_start:lmcache_cached_tokens]
+                        retrieve_token_mask = torch.ones(
+                            len(retrieve_tokens),
+                            dtype=torch.bool,
+                        )
+                        retrieve_slot_mapping = slot_mapping[
+                            span_start:lmcache_cached_tokens
+                        ]
+                retrieve_batches.append((
+                    retrieve_tokens,
+                    retrieve_token_mask,
+                    retrieve_slot_mapping,
+                    request.request_configs,
+                    None,
+                ))
+
+            last_batch_idx = len(retrieve_batches) - 1
+            for batch_idx, (
+                retrieve_tokens,
+                retrieve_token_mask,
+                retrieve_slot_mapping,
+                retrieve_request_configs,
+                retrieve_reuse_policy,
+            ) in enumerate(retrieve_batches):
+                if self.use_layerwise:
+                    sync = idx == last_idx and batch_idx == last_batch_idx
+                    has_agent_source_span = (
+                        isinstance(retrieve_request_configs, dict)
+                        and retrieve_request_configs.get(
+                            "lmcache.tag.agent_source_span"
+                        ) is not None
                     )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
-                        num_retrieved_tokens,
-                        num_expected_tokens,
+                    # NOTE(Jiayi): Perform blending before layerwise prefix caching
+                    if (
+                        self.enable_blending
+                        and has_agent_source_span
+                        and retrieve_reuse_policy == "cacheblend"
+                    ):
+                        # TODO(Jiayi): Need to make prefix caching and blending
+                        # compatible
+                        self.blender.blend(
+                            retrieve_tokens,
+                            retrieve_token_mask,
+                            kvcaches=kvcaches,
+                            slot_mapping=retrieve_slot_mapping,
+                            request_configs=retrieve_request_configs,
+                            req_id=request.req_id,
+                        )
+                    else:
+                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                            retrieve_tokens,
+                            retrieve_token_mask,
+                            kvcaches=kvcaches,
+                            slot_mapping=retrieve_slot_mapping,
+                            request_configs=retrieve_request_configs,
+                            req_id=request.req_id,
+                            sync=sync,
+                        )
+                        # NOTE: retrieve for two layers at the first layer
+                        next(layerwise_retriever)
+                        next(layerwise_retriever)
+                        self.layerwise_retrievers.append(layerwise_retriever)
+                else:
+                    ret_token_mask = self.lmcache_engine.retrieve(
+                        retrieve_tokens,
+                        retrieve_token_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=retrieve_slot_mapping,
+                        request_configs=retrieve_request_configs,
+                        req_id=request.req_id,
                     )
+
+                    # Check the result
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+                    if request.load_spec.exact_vllm_cached_tokens:
+                        num_expected_tokens = len(retrieve_tokens)
+                    else:
+                        num_expected_tokens = (
+                            lmcache_cached_tokens
+                            - request.load_spec.vllm_cached_tokens
+                        )
+                    source_span_key = (
+                        retrieve_request_configs.get(
+                            "lmcache.tag.agent_source_span")
+                        if isinstance(retrieve_request_configs, dict)
+                        else None
+                    )
+                    reuse_policy = (
+                        retrieve_request_configs.get(
+                            "lmcache.tag.agent_reuse_policy")
+                        if isinstance(retrieve_request_configs, dict)
+                        else None
+                    ) or retrieve_reuse_policy
+                    if (
+                        source_span_key is not None
+                        or request.load_spec.exact_vllm_cached_tokens
+                    ):
+                        _emit_agent_kernel_kv_metric(
+                            "agent_cacheblend_retrieve",
+                            request_id=request.req_id,
+                            source_span_key=source_span_key,
+                            reuse_policy=reuse_policy,
+                            expected_tokens=num_expected_tokens,
+                            retrieved_tokens=int(num_retrieved_tokens),
+                            success=(
+                                num_retrieved_tokens >= num_expected_tokens
+                            ),
+                            exact_vllm_cached_tokens=(
+                                request.load_spec.exact_vllm_cached_tokens
+                            ),
+                        )
+                    if num_retrieved_tokens < num_expected_tokens:
+                        logger.error(
+                            "The number of retrieved tokens is less than the "
+                            "expected number of tokens! This should not happen!"
+                        )
+                        logger.error(
+                            "Num retrieved tokens: %d, num expected tokens: %d",
+                            num_retrieved_tokens, num_expected_tokens,
+                        )
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1000,6 +1255,8 @@ class LMCacheConnectorV1Impl:
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
+                    request_configs=request.request_configs,
+                    req_id=request.req_id,
                     sync=is_first,
                 )
                 self.layerwise_storers.append(layerwise_storer)
@@ -1018,9 +1275,12 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
-        self.lmcache_engine.lookup_unpin(  # type: ignore
-            connector_metadata.lookup_requests_in_step
-        )
+        if self.use_layerwise:
+            for lookup_id in connector_metadata.lookup_requests_in_step:
+                self.lmcache_engine.lookup_pins.pop(lookup_id, None)  # type: ignore
+        else:
+            for lookup_id in connector_metadata.lookup_requests_in_step:
+                self.lmcache_engine.lookup_unpin(lookup_id)  # type: ignore
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
@@ -1103,6 +1363,20 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
             )
+            source_span_key = (
+                request.request_configs.get("lmcache.tag.agent_source_span")
+                if isinstance(request.request_configs, dict)
+                else None
+            )
+            if source_span_key is not None:
+                _emit_agent_kernel_kv_metric(
+                    "agent_cacheblend_store",
+                    request_id=request.req_id,
+                    source_span_key=source_span_key,
+                    token_count=len(token_ids),
+                    stored_tokens=int(store_mask.sum().item()),
+                    skip_leading_tokens=skip_leading_tokens,
+                )
 
             # NOTE(Jiayi): We assume all tokens are saved
             save_spec.skip_leading_tokens = len(token_ids)
@@ -1156,12 +1430,42 @@ class LMCacheConnectorV1Impl:
 
         if request.sampling_params:
             request_configs = extract_request_configs(request.sampling_params)
+            extra_args = request.sampling_params.extra_args
         else:
             request_configs = None
+            extra_args = None
+
+        if (
+            extra_args is not None
+            and extra_args.get("agent_kernel_prefill_warmup")
+            and extra_args.get("agent_kernel_source_request_id") is None
+        ):
+            return 0
 
         if self.skip_last_n_tokens > 0:
             assert token_ids is not None
             token_ids = token_ids[: -self.skip_last_n_tokens]
+
+        agent_load_spec, agent_reuse_active = (
+            self._get_agent_kernel_reuse_load_spec(
+                request,
+                token_ids,
+                num_computed_tokens,
+                request_configs,
+            )
+        )
+        if agent_reuse_active:
+            if agent_load_spec is None:
+                return None
+            self.load_specs[request.request_id] = agent_load_spec
+            return max(
+                0,
+                agent_load_spec.lmcache_cached_tokens - num_computed_tokens,
+            )
+
+        if self.config.use_layerwise and self.config.enable_blending:
+            return 0
+
         lookup_id = request.request_id if self.async_loading else str(uuid.uuid4())
 
         self._lookup_requests_in_step.append(lookup_id)
@@ -1208,6 +1512,259 @@ class LMCacheConnectorV1Impl:
             return 0
 
         return need_to_allocate
+
+    def _get_agent_kernel_reuse_load_spec(
+        self,
+        request: "Request",
+        token_ids: list[int] | None,
+        num_computed_tokens: int,
+        request_configs: dict | None,
+    ) -> tuple[LoadSpec | None, bool]:
+        """Use agent context spans to drive LMCache KV reuse retrieval.
+
+        vLLM's scheduler advances a request monotonically. Agent context reuse
+        therefore loads retained spans only when the current compute position is
+        exactly at the span boundary. Adjacent full-span hits are combined into
+        one scheduler stage; gaps or misses fall back to normal prefill.
+        """
+        if token_ids is None:
+            return None, False
+
+        reuse_plan = getattr(request, "agent_kernel_reuse_plan", None)
+        if (
+            reuse_plan is not None
+            and reuse_plan.get("reuse_policy") in ("cacheblend", "direct")
+        ):
+            load_spec, active = self._lookup_agent_kernel_reuse_span(
+                request,
+                token_ids,
+                num_computed_tokens,
+                request_configs,
+                {
+                    **reuse_plan,
+                    "context_id": "prefill",
+                    "start": num_computed_tokens,
+                    "end": len(token_ids),
+                },
+            )
+            if active:
+                return load_spec, True
+
+        combined_load_spec: LoadSpec | None = None
+        current_tokens = num_computed_tokens
+        for span in self._agent_kernel_reuse_spans(request):
+            start = int(span["start"])
+            if start < current_tokens:
+                continue
+            if start > current_tokens:
+                break
+            load_spec, active = self._lookup_agent_kernel_reuse_span(
+                request,
+                token_ids,
+                current_tokens,
+                request_configs,
+                span,
+            )
+            if active:
+                if load_spec is None:
+                    return None, True
+                if load_spec.lmcache_cached_tokens <= current_tokens:
+                    if combined_load_spec is None:
+                        return load_spec, True
+                    return combined_load_spec, True
+                if combined_load_spec is None:
+                    combined_load_spec = LoadSpec(
+                        vllm_cached_tokens=num_computed_tokens,
+                        lmcache_cached_tokens=load_spec.lmcache_cached_tokens,
+                        can_load=False,
+                        exact_vllm_cached_tokens=True,
+                        load_ranges=list(load_spec.load_ranges),
+                    )
+                else:
+                    combined_load_spec.lmcache_cached_tokens = (
+                        load_spec.lmcache_cached_tokens
+                    )
+                    combined_load_spec.load_ranges.extend(load_spec.load_ranges)
+                current_tokens = load_spec.lmcache_cached_tokens
+                if current_tokens < int(span["end"]):
+                    return combined_load_spec, True
+
+        if combined_load_spec is not None:
+            return combined_load_spec, True
+        return None, False
+
+    def _agent_kernel_reuse_spans(self, request: "Request") -> list[dict]:
+        spans = getattr(request, "agent_kernel_context_spans", [])
+        return sorted(
+            (
+                span
+                for span in spans
+                if span.get("reuse_policy") in ("cacheblend", "direct")
+                and span.get("source_request_id") is not None
+            ),
+            key=lambda span: int(span["start"]),
+        )
+
+    def _lookup_agent_kernel_reuse_span(
+        self,
+        request: "Request",
+        token_ids: list[int],
+        num_computed_tokens: int,
+        request_configs: dict | None,
+        span: dict,
+    ) -> tuple[LoadSpec | None, bool]:
+        if span.get("source_request_id") is None:
+            return None, False
+        if span.get("source_start") is None or span.get("source_end") is None:
+            return None, False
+        start = int(span["start"])
+        end = int(span["end"])
+        if start != num_computed_tokens:
+            return None, False
+        reuse_policy = span.get("reuse_policy")
+        load_end = end
+        if load_end >= len(token_ids):
+            load_end = max(start, len(token_ids) - 1)
+        if load_end <= start:
+            _emit_agent_kernel_kv_metric(
+                "agent_cacheblend_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_request_id=span.get("source_request_id"),
+                source_start=span.get("source_start"),
+                source_end=span.get("source_end"),
+                reuse_policy=reuse_policy,
+                start=start,
+                end=end,
+                load_end=load_end,
+                expected_tokens=0,
+                hit_tokens=0,
+                status="no_load_window",
+            )
+            return (
+                LoadSpec(
+                    vllm_cached_tokens=num_computed_tokens,
+                    lmcache_cached_tokens=num_computed_tokens,
+                    can_load=False,
+                    exact_vllm_cached_tokens=True,
+                    load_ranges=[],
+                ),
+                True,
+            )
+
+        span_tokens = token_ids[start:load_end]
+        span_request_configs = self._source_span_request_configs(
+            request_configs,
+            span,
+        )
+        lookup_id = f"{request.request_id}:agent:{span.get('context_id', start)}"
+        self._lookup_requests_in_step.append(lookup_id)
+        hit_tokens = self.lookup_client.lookup(
+            span_tokens,
+            lookup_id=lookup_id,
+            request_configs=span_request_configs,
+        )
+        if hit_tokens is None:
+            _emit_agent_kernel_kv_metric(
+                "agent_cacheblend_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_request_id=span.get("source_request_id"),
+                source_start=span.get("source_start"),
+                source_end=span.get("source_end"),
+                reuse_policy=reuse_policy,
+                start=start,
+                end=end,
+                load_end=load_end,
+                expected_tokens=len(span_tokens),
+                hit_tokens=None,
+                status="lookup_miss",
+            )
+            return None, True
+        if hit_tokens < len(span_tokens):
+            _emit_agent_kernel_kv_metric(
+                "agent_cacheblend_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_request_id=span.get("source_request_id"),
+                source_start=span.get("source_start"),
+                source_end=span.get("source_end"),
+                reuse_policy=reuse_policy,
+                start=start,
+                end=end,
+                load_end=load_end,
+                expected_tokens=len(span_tokens),
+                hit_tokens=hit_tokens,
+                status="partial_hit",
+            )
+            return (
+                LoadSpec(
+                    vllm_cached_tokens=num_computed_tokens,
+                    lmcache_cached_tokens=num_computed_tokens,
+                    can_load=False,
+                    exact_vllm_cached_tokens=True,
+                    load_ranges=[],
+                ),
+                True,
+            )
+
+        logger.info(
+            "Reqid: %s, agent CacheBlend span %s hit %d tokens "
+            "(source_request=%s, source_range=[%s,%s), "
+            "vllm_cached=%d, lmcache_cached=%d)",
+            request.request_id,
+            span.get("context_id"),
+            len(span_tokens),
+            span.get("source_request_id"),
+            span.get("source_start"),
+            span.get("source_end"),
+            num_computed_tokens,
+            load_end,
+        )
+        _emit_agent_kernel_kv_metric(
+            "agent_cacheblend_lookup",
+            request_id=request.request_id,
+            context_id=span.get("context_id"),
+            source_request_id=span.get("source_request_id"),
+            source_start=span.get("source_start"),
+            source_end=span.get("source_end"),
+            reuse_policy=reuse_policy,
+            start=start,
+            end=end,
+            load_end=load_end,
+            expected_tokens=len(span_tokens),
+            hit_tokens=hit_tokens,
+            status="hit",
+        )
+        return (
+            LoadSpec(
+                vllm_cached_tokens=num_computed_tokens,
+                lmcache_cached_tokens=load_end,
+                can_load=False,
+                exact_vllm_cached_tokens=True,
+                load_ranges=[
+                    LoadRange(
+                        start,
+                        load_end,
+                        span_request_configs,
+                        reuse_policy,
+                    )
+                ],
+            ),
+            True,
+        )
+
+    def _source_span_request_configs(
+        self,
+        request_configs: dict | None,
+        span: dict,
+    ) -> dict | None:
+        source_span_key = span.get("source_span_key")
+        if source_span_key is None:
+            return request_configs
+        span_request_configs = dict(request_configs or {})
+        span_request_configs["lmcache.tag.agent_source_span"] = source_span_key
+        return span_request_configs
 
     @_lmcache_nvtx_annotate
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
@@ -1360,11 +1917,17 @@ class LMCacheConnectorV1Impl:
 
         for i, req_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._request_trackers[req_id]
+            load_spec = self.load_specs.pop(req_id, None)
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             if cached_request := self._unfinished_requests.get(req_id):
                 num_current_tokens = len(request_tracker.token_ids)
+                new_token_end = num_current_tokens + num_new_tokens
+                if load_spec is not None:
+                    new_token_end = (
+                        cached_reqs.num_computed_tokens[i] + num_new_tokens
+                    )
                 new_token_ids = cached_request.all_token_ids[
-                    num_current_tokens : num_current_tokens + num_new_tokens
+                    num_current_tokens:new_token_end
                 ]
             else:
                 raise ValueError(
@@ -1379,7 +1942,7 @@ class LMCacheConnectorV1Impl:
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
-                load_spec=None,
+                load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self._save_decode_cache,
             )

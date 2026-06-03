@@ -66,6 +66,8 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
         self.agent_kernel_prefill_warmup = False
+        self.agent_kernel_context_spans: list[dict[str, Any]] = []
+        self.agent_kernel_reuse_plan: dict[str, Any] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -83,6 +85,25 @@ class Request:
                 self.agent_kernel_prefill_warmup = (
                     extra_args.get("agent_kernel_prefill_warmup") is True
                 )
+                self.agent_kernel_context_spans = list(
+                    extra_args.get("agent_kernel_context_spans") or []
+                )
+                reuse_policy = extra_args.get("agent_kernel_reuse_policy")
+                if reuse_policy is not None:
+                    self.agent_kernel_reuse_plan = {
+                        "reuse_policy": reuse_policy,
+                        "source_kv_id": extra_args.get("agent_kernel_source_kv_id"),
+                        "source_request_id": extra_args.get(
+                            "agent_kernel_source_request_id"
+                        ),
+                        "source_span_key": extra_args.get(
+                            "agent_kernel_source_span_key"
+                        ),
+                        "source_start": extra_args.get(
+                            "agent_kernel_source_start"
+                        ),
+                        "source_end": extra_args.get("agent_kernel_source_end"),
+                    }
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -135,6 +156,36 @@ class Request:
         self.segment_hashes: list[SegmentHash] = []
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+
+    def agent_kernel_reuse_span_at(
+        self,
+        token_pos: int,
+    ) -> dict[str, Any] | None:
+        for span in self._agent_kernel_reuse_spans():
+            if int(span["start"]) == token_pos:
+                return span
+        return None
+
+    def next_agent_kernel_reuse_span_start(
+        self,
+        token_pos: int,
+    ) -> int | None:
+        for span in self._agent_kernel_reuse_spans():
+            start = int(span["start"])
+            if start > token_pos:
+                return start
+        return None
+
+    def _agent_kernel_reuse_spans(self) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                span
+                for span in self.agent_kernel_context_spans
+                if span.get("reuse_policy") in ("cacheblend", "direct")
+                and span.get("source_request_id") is not None
+            ),
+            key=lambda span: int(span["start"]),
+        )
 
     @classmethod
     def from_engine_core_request(

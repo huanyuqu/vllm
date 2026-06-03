@@ -2414,6 +2414,28 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    def _register_lmcache_blending_model(self) -> None:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config.kv_connector != "LMCacheConnectorV1":
+            return
+
+        from lmcache.v1.compute.models.utils import VLLMModelTracker
+        from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils import (
+            ENGINE_NAME,
+            lmcache_get_or_create_config,
+        )
+
+        lmcache_config = lmcache_get_or_create_config()
+        if not (lmcache_config.use_layerwise and lmcache_config.enable_blending):
+            return
+
+        VLLMModelTracker._vllm_models[ENGINE_NAME] = self.get_model()
+        logger.info_once(
+            "Registered vLLM model for LMCache CacheBlend instance %s.",
+            ENGINE_NAME,
+            scope="local",
+        )
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -3654,6 +3676,7 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+        self._register_lmcache_blending_model()
         prepare_communication_buffer_for_model(self.model)
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
