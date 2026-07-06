@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Iterable, Mapping, MutableSequence, Set
+from contextlib import contextmanager, nullcontext
 from typing import (
     TYPE_CHECKING,
     ClassVar,
@@ -50,7 +51,6 @@ The output embeddings must be one of the following formats:
 - A single 3D tensor, with the batch dimension grouping the 2D tensors.
 """
 
-
 @runtime_checkable
 class SupportsMultiModal(Protocol):
     """The interface required for all multi-modal models."""
@@ -85,6 +85,16 @@ class SupportsMultiModal(Protocol):
     multimodal_cpu_fields: ClassVar[Set[str]] = frozenset()
     """
     A set indicating CPU-only multimodal fields.
+    """
+
+    _language_model_names: list[str] = []
+    """
+    Set internally by `_mark_language_model`.
+    """
+
+    _tower_model_names: list[str] = []
+    """
+    Set internally by `_mark_tower_model`.
     """
 
     @classmethod
@@ -123,6 +133,76 @@ class SupportsMultiModal(Protocol):
             torch.nn.Module: The core language model component.
         """
         ...
+
+    @contextmanager
+    def _mark_language_model(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+    ):
+        """
+        Mark child modules assigned in this context as the language model.
+
+        Language-model modules are skipped in `--mm-encoder-only` mode.
+        """
+        from .utils import StageMissingLayer, collect_children, no_init_weights
+
+        mm_config = vllm_config.model_config.multimodal_config
+
+        with collect_children(self, targets=targets) as children_names:
+            with (
+                no_init_weights(
+                    self,
+                    lambda mod: StageMissingLayer("language_model", mod),
+                    targets=targets,
+                )
+                if getattr(mm_config, "mm_encoder_only", False)
+                else nullcontext()
+            ):
+                yield
+
+        self._language_model_names = children_names
+
+    @contextmanager
+    def _mark_tower_model(
+        self,
+        vllm_config: VllmConfig,
+        modalities: set[str] | str,
+        *,
+        targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+    ):
+        """
+        Mark child modules assigned in this context as multimodal tower modules.
+
+        Tower modules are skipped when all requested modalities have
+        `--limit-mm-per-prompt` set to zero.
+        """
+        from .utils import StageMissingLayer, collect_children, no_init_weights
+
+        if isinstance(modalities, str):
+            modalities = {modalities}
+
+        if modalities == {"image", "video"}:
+            stage_name = "vision_tower"
+        else:
+            stage_name = "_".join([*modalities, "tower"])
+
+        mm_config = vllm_config.model_config.multimodal_config
+
+        with collect_children(self, targets=targets) as children_names:
+            with (
+                no_init_weights(
+                    self,
+                    lambda mod: StageMissingLayer(stage_name, mod),
+                    targets=targets,
+                )
+                if all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
+                else nullcontext()
+            ):
+                yield
+
+        self._tower_model_names = children_names
 
     @overload
     def embed_input_ids(self, input_ids: Tensor) -> Tensor: ...

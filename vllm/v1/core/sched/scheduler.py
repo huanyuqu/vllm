@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -48,6 +50,19 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _emit_agent_kernel_direct_metric(event: str, **attrs: Any) -> None:
+    path = os.environ.get("AGENT_KERNEL_KV_METRICS_PATH")
+    if not path:
+        return
+    record = {
+        "event": event,
+        "ts_ns": time.perf_counter_ns(),
+        **attrs,
+    }
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 class Scheduler(SchedulerInterface):
@@ -136,6 +151,7 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._agent_kernel_source_blocks: dict[str, dict[str, Any]] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -202,6 +218,444 @@ class Scheduler(SchedulerInterface):
         ].kv_cache_spec.block_size
         return block_size, block_size
 
+    def _record_agent_kernel_source_blocks(self, request: Request) -> None:
+        if self.cache_config.enable_semantic_segment_memory_management:
+            return
+        params = request.kv_transfer_params or {}
+        source_span_key = params.get("lmcache.tag.agent_source_span")
+        if source_span_key is None:
+            return
+        source_start = int(params.get("lmcache.tag.agent_source_start") or 0)
+        source_end = params.get("lmcache.tag.agent_source_end")
+        if source_end is not None:
+            source_end = int(source_end)
+
+        blocks = self.kv_cache_manager.get_blocks(request.request_id)
+        if self.cache_config.enable_prefix_caching:
+            self.kv_cache_manager.block_pool.touch(blocks.blocks)
+        block_ids = blocks.get_block_ids()
+        block_hashes = tuple(
+            [block.block_hash for block in group]
+            for group in blocks.blocks
+        )
+        self._agent_kernel_source_blocks[source_span_key] = {
+            "block_ids": block_ids,
+            "block_hashes": block_hashes,
+            "token_ids": list(request.all_token_ids),
+            "source_start": source_start,
+            "source_end": source_end,
+        }
+        _emit_agent_kernel_direct_metric(
+            "agent_direct_source_record",
+            request_id=request.request_id,
+            source_span_key=source_span_key,
+            source_start=source_start,
+            source_end=source_end,
+            num_tokens=request.num_tokens,
+            num_blocks=sum(len(group) for group in block_ids),
+        )
+
+    def _lookup_agent_kernel_direct_blocks(
+        self,
+        request: Request,
+        span: dict[str, Any],
+        num_computed_tokens: int,
+    ) -> tuple[KVCacheBlocks | None, int]:
+        if (
+            self.cache_config.enable_semantic_segment_memory_management
+            or span.get("reuse_policy") != "direct"
+        ):
+            return None, 0
+        if span.get("source_start") is None or span.get("source_end") is None:
+            return None, 0
+
+        start = int(span["start"])
+        end = int(span["end"])
+        if start != num_computed_tokens:
+            return None, 0
+
+        load_end = min(end, max(start, request.num_tokens - 1))
+        direct_tokens = load_end - start
+        if direct_tokens <= 0:
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=span.get("source_span_key"),
+                start=start,
+                end=end,
+                hit_tokens=0,
+                status="no_load_window",
+            )
+            return None, 0
+
+        source_span_key = span.get("source_span_key")
+        source_record = self._agent_kernel_source_blocks.get(source_span_key)
+        if source_span_key is None or source_record is None:
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                expected_tokens=direct_tokens,
+                hit_tokens=0,
+                status="source_missing",
+            )
+            return None, 0
+
+        source_start = int(span["source_start"])
+        source_end = int(span["source_end"])
+        record_source_start = int(source_record.get("source_start") or 0)
+        local_source_start = source_start - record_source_start
+        block_size = self.block_size
+        if (
+            start % block_size != 0
+            or local_source_start % block_size != 0
+            or source_start + direct_tokens > source_end
+        ):
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                source_start=source_start,
+                record_source_start=record_source_start,
+                local_source_start=local_source_start,
+                source_end=source_end,
+                expected_tokens=direct_tokens,
+                hit_tokens=0,
+                status="not_block_aligned",
+            )
+            return None, 0
+
+        expected_tokens = direct_tokens
+        aligned_direct_tokens = (direct_tokens // block_size) * block_size
+        if aligned_direct_tokens <= 0:
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                source_start=source_start,
+                record_source_start=record_source_start,
+                local_source_start=local_source_start,
+                source_end=source_end,
+                expected_tokens=expected_tokens,
+                hit_tokens=0,
+                status="not_block_aligned",
+            )
+            return None, 0
+        direct_tokens = aligned_direct_tokens
+        load_end = start + direct_tokens
+
+        source_tokens = source_record["token_ids"]
+        if (
+            local_source_start < 0
+            or local_source_start + direct_tokens > len(source_tokens)
+        ):
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                source_start=source_start,
+                record_source_start=record_source_start,
+                expected_tokens=expected_tokens,
+                hit_tokens=0,
+                status="source_range_oob",
+            )
+            return None, 0
+
+        target_tokens = list(request.all_token_ids[start:load_end])
+        source_slice = source_tokens[
+            local_source_start:local_source_start + direct_tokens
+        ]
+        if target_tokens != source_slice:
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                source_start=source_start,
+                expected_tokens=expected_tokens,
+                hit_tokens=0,
+                status="token_mismatch",
+            )
+            return None, 0
+
+        block_start = local_source_start // block_size
+        block_count = direct_tokens // block_size
+        block_stop = block_start + block_count
+        block_ids = tuple(
+            list(group[block_start:block_stop])
+            for group in source_record["block_ids"]
+        )
+        recorded_hashes = tuple(
+            list(group[block_start:block_stop])
+            for group in source_record["block_hashes"]
+        )
+        if any(len(group) != block_count for group in block_ids):
+            _emit_agent_kernel_direct_metric(
+                "agent_direct_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                expected_tokens=expected_tokens,
+                hit_tokens=0,
+                status="source_blocks_oob",
+            )
+            return None, 0
+
+        blocks = self.kv_cache_manager.get_blocks_by_ids(block_ids)
+        for group, hashes in zip(blocks.blocks, recorded_hashes):
+            for block, recorded_hash in zip(group, hashes):
+                if recorded_hash is None or block.block_hash != recorded_hash:
+                    _emit_agent_kernel_direct_metric(
+                        "agent_direct_lookup",
+                        request_id=request.request_id,
+                        context_id=span.get("context_id"),
+                        source_span_key=source_span_key,
+                        start=start,
+                        end=end,
+                        expected_tokens=expected_tokens,
+                        hit_tokens=0,
+                        status="source_evicted",
+                    )
+                    return None, 0
+
+        _emit_agent_kernel_direct_metric(
+            "agent_direct_lookup",
+            request_id=request.request_id,
+            context_id=span.get("context_id"),
+            source_span_key=source_span_key,
+            source_request_id=span.get("source_request_id"),
+            source_start=source_start,
+            source_end=source_end,
+            start=start,
+            end=end,
+            expected_tokens=expected_tokens,
+            hit_tokens=direct_tokens,
+            block_count=block_count,
+            status="hit" if direct_tokens == expected_tokens else "partial_hit",
+        )
+        return blocks, direct_tokens
+
+    def _prepare_agent_kernel_hbm_cacheblend_source(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> None:
+        """Attach HBM source slot metadata for CacheBlend spans when possible.
+
+        LMCache CacheBlend normally retrieves source KV from its storage backend.
+        For agent spans whose source request blocks are still resident in vLLM's
+        paged KV cache, pass the source slot mapping through request configs so
+        the worker can blend from HBM instead.
+        """
+        if self.cache_config.enable_semantic_segment_memory_management:
+            return
+
+        span = request.agent_kernel_reuse_span_at(num_computed_tokens)
+        if span is None or span.get("reuse_policy") != "cacheblend":
+            return
+        if span.get("hbm_cacheblend_source_slot_mapping") is not None:
+            return
+        if span.get("source_start") is None or span.get("source_end") is None:
+            return
+
+        start = int(span["start"])
+        end = int(span["end"])
+        if start != num_computed_tokens:
+            return
+
+        load_end = min(end, max(start, request.num_tokens - 1))
+        hbm_tokens = load_end - start
+        if hbm_tokens <= 0:
+            return
+
+        source_span_key = span.get("source_span_key")
+        source_record = self._agent_kernel_source_blocks.get(source_span_key)
+        if source_span_key is None or source_record is None:
+            _emit_agent_kernel_direct_metric(
+                "agent_hbm_cacheblend_source_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                start=start,
+                end=end,
+                expected_tokens=hbm_tokens,
+                hit_tokens=0,
+                status="source_missing",
+            )
+            return
+
+        source_start = int(span["source_start"])
+        source_end = int(span["source_end"])
+        record_source_start = int(source_record.get("source_start") or 0)
+        local_source_start = source_start - record_source_start
+        if source_start + hbm_tokens > source_end:
+            _emit_agent_kernel_direct_metric(
+                "agent_hbm_cacheblend_source_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                source_start=source_start,
+                source_end=source_end,
+                expected_tokens=hbm_tokens,
+                hit_tokens=0,
+                status="source_span_short",
+            )
+            return
+
+        source_tokens = source_record["token_ids"]
+        if (
+            local_source_start < 0
+            or local_source_start + hbm_tokens > len(source_tokens)
+        ):
+            _emit_agent_kernel_direct_metric(
+                "agent_hbm_cacheblend_source_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                source_start=source_start,
+                record_source_start=record_source_start,
+                expected_tokens=hbm_tokens,
+                hit_tokens=0,
+                status="source_range_oob",
+            )
+            return
+
+        target_tokens = list(request.all_token_ids[start:load_end])
+        source_slice = source_tokens[
+            local_source_start:local_source_start + hbm_tokens
+        ]
+        if target_tokens != source_slice:
+            _emit_agent_kernel_direct_metric(
+                "agent_hbm_cacheblend_source_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                source_start=source_start,
+                expected_tokens=hbm_tokens,
+                hit_tokens=0,
+                status="token_mismatch",
+            )
+            return
+
+        source_block_ids = source_record["block_ids"][0]
+        source_block_hashes = source_record["block_hashes"][0]
+        first_block = local_source_start // self.block_size
+        last_block = (local_source_start + hbm_tokens - 1) // self.block_size
+        if last_block >= len(source_block_ids):
+            _emit_agent_kernel_direct_metric(
+                "agent_hbm_cacheblend_source_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_span_key=source_span_key,
+                source_start=source_start,
+                expected_tokens=hbm_tokens,
+                hit_tokens=0,
+                status="source_blocks_oob",
+            )
+            return
+
+        for block_idx in range(first_block, last_block + 1):
+            block_id = source_block_ids[block_idx]
+            block = self.kv_cache_manager.block_pool.blocks[block_id]
+            recorded_hash = (
+                source_block_hashes[block_idx]
+                if block_idx < len(source_block_hashes)
+                else None
+            )
+            if recorded_hash is not None and block.block_hash != recorded_hash:
+                _emit_agent_kernel_direct_metric(
+                    "agent_hbm_cacheblend_source_lookup",
+                    request_id=request.request_id,
+                    context_id=span.get("context_id"),
+                    source_span_key=source_span_key,
+                    source_start=source_start,
+                    expected_tokens=hbm_tokens,
+                    hit_tokens=0,
+                    status="source_evicted",
+                )
+                return
+            if recorded_hash is None and block.ref_cnt <= 0:
+                _emit_agent_kernel_direct_metric(
+                    "agent_hbm_cacheblend_source_lookup",
+                    request_id=request.request_id,
+                    context_id=span.get("context_id"),
+                    source_span_key=source_span_key,
+                    source_start=source_start,
+                    expected_tokens=hbm_tokens,
+                    hit_tokens=0,
+                    status="source_unpinned",
+                )
+                return
+
+        source_slot_mapping = []
+        for token_offset in range(hbm_tokens):
+            source_pos = local_source_start + token_offset
+            block_idx, block_offset = divmod(source_pos, self.block_size)
+            source_slot_mapping.append(
+                source_block_ids[block_idx] * self.block_size + block_offset
+            )
+
+        span["hbm_cacheblend_source_slot_mapping"] = source_slot_mapping
+        span["hbm_cacheblend_source_positions"] = [
+            local_source_start + i for i in range(hbm_tokens)
+        ]
+        span["hbm_cacheblend_hit_tokens"] = hbm_tokens
+        _emit_agent_kernel_direct_metric(
+            "agent_hbm_cacheblend_source_lookup",
+            request_id=request.request_id,
+            context_id=span.get("context_id"),
+            source_span_key=source_span_key,
+            source_request_id=span.get("source_request_id"),
+            source_start=source_start,
+            source_end=source_end,
+            start=start,
+            end=end,
+            expected_tokens=hbm_tokens,
+            hit_tokens=hbm_tokens,
+            block_count=last_block - first_block + 1,
+            status="hit",
+        )
+
+    def _consume_agent_kernel_direct_blocks(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> tuple[KVCacheBlocks, int, int]:
+        direct_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        total_direct_tokens = 0
+        while True:
+            span = request.agent_kernel_reuse_span_at(num_computed_tokens)
+            if span is None or span.get("reuse_policy") != "direct":
+                break
+            blocks, direct_tokens = self._lookup_agent_kernel_direct_blocks(
+                request,
+                span,
+                num_computed_tokens,
+            )
+            if blocks is None or direct_tokens == 0:
+                break
+            direct_blocks = direct_blocks + blocks
+            total_direct_tokens += direct_tokens
+            num_computed_tokens += direct_tokens
+        return direct_blocks, total_direct_tokens, num_computed_tokens
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -236,7 +690,23 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             num_external_computed_tokens = 0
+            num_direct_computed_tokens = 0
+            direct_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
             num_computed_tokens = request.num_computed_tokens
+
+            (
+                direct_computed_blocks,
+                num_direct_computed_tokens,
+                num_computed_tokens,
+            ) = self._consume_agent_kernel_direct_blocks(
+                request,
+                num_computed_tokens,
+            )
+
+            self._prepare_agent_kernel_hbm_cacheblend_source(
+                request,
+                num_computed_tokens,
+            )
 
             if (
                 self.connector is not None
@@ -332,6 +802,8 @@ class Scheduler(SchedulerInterface):
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
                             num_new_tokens + num_external_computed_tokens,
+                            num_direct_computed_tokens,
+                            direct_computed_blocks,
                             num_lookahead_tokens=self.num_lookahead_tokens,
                         )
 
@@ -402,11 +874,16 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_external_computed_tokens,
                 )
+            if num_direct_computed_tokens > 0 or num_external_computed_tokens > 0:
                 request.num_computed_tokens = num_computed_tokens
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
-            req_to_new_blocks[request.request_id] = new_blocks
+            req_to_new_blocks[request.request_id] = (
+                direct_computed_blocks + new_blocks
+                if num_direct_computed_tokens > 0
+                else new_blocks
+            )
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -522,6 +999,26 @@ class Scheduler(SchedulerInterface):
                             self.kv_cache_manager.get_computed_blocks(request)
                         )
                         new_computed_segments = None
+
+                    if not self.cache_config.enable_semantic_segment_memory_management:
+                        (
+                            direct_computed_blocks,
+                            num_direct_computed_tokens,
+                            num_new_local_computed_tokens,
+                        ) = self._consume_agent_kernel_direct_blocks(
+                            request,
+                            num_new_local_computed_tokens,
+                        )
+                        if num_direct_computed_tokens > 0:
+                            assert new_computed_blocks is not None
+                            new_computed_blocks = (
+                                new_computed_blocks + direct_computed_blocks
+                            )
+
+                        self._prepare_agent_kernel_hbm_cacheblend_source(
+                            request,
+                            num_new_local_computed_tokens,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1448,6 +1945,7 @@ class Scheduler(SchedulerInterface):
     def _free_request(self, request: Request) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._record_agent_kernel_source_blocks(request)
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id

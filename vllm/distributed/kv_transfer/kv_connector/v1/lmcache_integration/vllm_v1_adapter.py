@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import lmcache.c_ops as lmc_ops
 from lmcache import utils
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
@@ -17,6 +18,7 @@ from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import MemoryFormat
 try:
     from lmcache.config import LMCacheEngineMetadata
 except ModuleNotFoundError:
@@ -917,6 +919,229 @@ class LMCacheConnectorV1Impl:
         """
         return VLLM_VERSION
 
+    @staticmethod
+    def _get_hbm_cacheblend_source(
+        request_configs: dict | None,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not isinstance(request_configs, dict):
+            return None
+        source_slots = request_configs.get(
+            "lmcache.tag.agent_hbm_source_slot_mapping"
+        )
+        if source_slots is None:
+            return None
+        source_positions = request_configs.get(
+            "lmcache.tag.agent_hbm_source_positions"
+        )
+        if source_positions is None:
+            source_positions = list(range(len(source_slots)))
+        if len(source_positions) != len(source_slots):
+            logger.warning(
+                "HBM CacheBlend source metadata has mismatched lengths: "
+                "slots=%d positions=%d",
+                len(source_slots),
+                len(source_positions),
+            )
+            return None
+        return (
+            torch.tensor(source_slots, dtype=torch.long, device=device),
+            torch.tensor(source_positions, dtype=torch.long, device=device),
+        )
+
+    def _hbm_cacheblend_retrieve_layer(
+        self,
+        tokens: torch.Tensor | list[int],
+        mask: torch.Tensor | None = None,
+        *,
+        source_slot_mapping: torch.Tensor,
+        source_positions: torch.Tensor,
+        **kwargs,
+    ) -> Generator[torch.Tensor | None, None, None]:
+        """Layerwise CacheBlend retrieve that reads source KV from vLLM HBM."""
+        assert self.lmcache_engine is not None
+        gpu_connector = self.lmcache_engine.gpu_connector
+        if gpu_connector is None:
+            raise RuntimeError("HBM CacheBlend requires an LMCache GPU connector")
+        if not hasattr(gpu_connector, "buffer_mapping"):
+            raise RuntimeError(
+                "HBM CacheBlend requires the layerwise buffer GPU connector"
+            )
+        if mask is not None and not bool(mask.all().item()):
+            raise RuntimeError(
+                "HBM CacheBlend currently supports exact all-True load ranges"
+            )
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        gpu_connector.initialize_kvcaches_ptr(**kwargs)
+        assert gpu_connector.kvcaches is not None
+        gpu_connector._lazy_initialize_buffer(gpu_connector.kvcaches)
+        assert gpu_connector.gpu_buffer_allocator is not None
+
+        target_slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        num_tokens = len(tokens)
+        if len(source_slot_mapping) != num_tokens:
+            raise RuntimeError(
+                "HBM CacheBlend source slots do not match token count: "
+                f"{len(source_slot_mapping)} vs {num_tokens}"
+            )
+        if len(target_slot_mapping) != num_tokens:
+            raise RuntimeError(
+                "HBM CacheBlend target slots do not match token count: "
+                f"{len(target_slot_mapping)} vs {num_tokens}"
+            )
+
+        if (
+            getattr(gpu_connector, "fused_rotary_emb", None) is None
+            and getattr(gpu_connector, "cache_positions", False)
+        ):
+            gpu_connector.lmc_model = LMCBlenderBuilder.get(
+                ENGINE_NAME
+            ).layerwise_model
+            gpu_connector.fused_rotary_emb = gpu_connector.lmc_model.fused_rotary_emb
+
+        buffer_shape = gpu_connector.get_shape(num_tokens)
+        new_positions = torch.arange(
+            0,
+            num_tokens,
+            dtype=torch.int64,
+            device=target_slot_mapping.device,
+        )
+        source_positions = source_positions.to(
+            device=target_slot_mapping.device,
+            dtype=torch.int64,
+        )
+        source_slot_mapping = source_slot_mapping.to(
+            device=target_slot_mapping.device,
+            dtype=torch.long,
+        )
+
+        active_layer: int | None = None
+        active_buffer = None
+
+        def copy_active_to_target() -> None:
+            nonlocal active_layer, active_buffer
+            if active_layer is None or active_buffer is None:
+                return
+            assert active_buffer.tensor is not None
+            lmc_ops.single_layer_kv_transfer(
+                active_buffer.tensor,
+                gpu_connector.kvcaches[active_layer],
+                target_slot_mapping,
+                lmc_ops.TransferDirection.H2D,
+                gpu_connector.gpu_kv_format,
+                token_major=False,
+            )
+            gpu_connector.buffer_mapping.pop(active_layer, None)
+            active_buffer.ref_count_down()
+            active_layer = None
+            active_buffer = None
+
+        try:
+            yield torch.tensor(num_tokens, dtype=torch.long)
+            for layer_id in range(self.num_layers):
+                copy_active_to_target()
+                active_buffer = gpu_connector.gpu_buffer_allocator.allocate(
+                    buffer_shape,
+                    gpu_connector.dtype,
+                    MemoryFormat.KV_2TD,
+                )
+                if active_buffer is None or active_buffer.tensor is None:
+                    raise RuntimeError(
+                        "Failed to allocate GPU buffer for HBM CacheBlend"
+                    )
+                lmc_ops.single_layer_kv_transfer(
+                    active_buffer.tensor,
+                    gpu_connector.kvcaches[layer_id],
+                    source_slot_mapping,
+                    lmc_ops.TransferDirection.D2H,
+                    gpu_connector.gpu_kv_format,
+                    token_major=False,
+                )
+                if getattr(gpu_connector, "cache_positions", False):
+                    active_buffer.tensor[0] = gpu_connector.fused_rotary_emb(
+                        source_positions,
+                        new_positions,
+                        active_buffer.tensor[0],
+                    )
+                gpu_connector.buffer_mapping[layer_id] = active_buffer
+                active_layer = layer_id
+                yield None
+
+            copy_active_to_target()
+            yield None
+        finally:
+            if active_layer is not None:
+                gpu_connector.buffer_mapping.pop(active_layer, None)
+            if active_buffer is not None:
+                active_buffer.ref_count_down()
+
+    def _blend_from_hbm_cacheblend_source(
+        self,
+        retrieve_tokens: list[int] | torch.Tensor,
+        retrieve_token_mask: torch.Tensor,
+        *,
+        kvcaches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        request_configs: dict | None,
+        req_id: str,
+    ) -> bool:
+        if (
+            not isinstance(request_configs, dict)
+            or "lmcache.tag.agent_hbm_source_slot_mapping" not in request_configs
+        ):
+            return False
+        device = getattr(slot_mapping, "device", None)
+        if device is None:
+            return False
+        hbm_source = self._get_hbm_cacheblend_source(
+            request_configs,
+            device,
+        )
+        if hbm_source is None:
+            return False
+        source_slot_mapping, source_positions = hbm_source
+        if len(source_slot_mapping) != len(retrieve_tokens):
+            logger.warning(
+                "Skipping HBM CacheBlend for %s because source slots (%d) "
+                "do not match tokens (%d)",
+                req_id,
+                len(source_slot_mapping),
+                len(retrieve_tokens),
+            )
+            return False
+
+        original_retrieve_layer = self.blender.cache_engine.retrieve_layer
+
+        def retrieve_layer_from_hbm(
+            tokens: torch.Tensor | list[int],
+            mask: torch.Tensor | None = None,
+            **kwargs,
+        ) -> Generator[torch.Tensor | None, None, None]:
+            yield from self._hbm_cacheblend_retrieve_layer(
+                tokens,
+                mask,
+                source_slot_mapping=source_slot_mapping,
+                source_positions=source_positions,
+                **kwargs,
+            )
+
+        self.blender.cache_engine.retrieve_layer = retrieve_layer_from_hbm
+        try:
+            self.blender.blend(
+                retrieve_tokens,
+                retrieve_token_mask,
+                kvcaches=kvcaches,
+                slot_mapping=slot_mapping,
+                request_configs=request_configs,
+                req_id=req_id,
+            )
+        finally:
+            self.blender.cache_engine.retrieve_layer = original_retrieve_layer
+        return True
+
     @_lmcache_nvtx_annotate
     def _init_kv_caches_from_forward_context(self, forward_context: "ForwardContext"):
         for layer_name in forward_context.no_compile_layers:
@@ -1044,6 +1269,25 @@ class LMCacheConnectorV1Impl:
                 retrieve_request_configs,
                 retrieve_reuse_policy,
             ) in enumerate(retrieve_batches):
+                source_span_key = (
+                    retrieve_request_configs.get(
+                        "lmcache.tag.agent_source_span")
+                    if isinstance(retrieve_request_configs, dict)
+                    else None
+                )
+                metric_reuse_policy = (
+                    retrieve_request_configs.get(
+                        "lmcache.tag.agent_reuse_policy")
+                    if isinstance(retrieve_request_configs, dict)
+                    else None
+                ) or retrieve_reuse_policy
+                should_emit_agent_metric = (
+                    source_span_key is not None
+                    or request.load_spec.exact_vllm_cached_tokens
+                )
+                num_expected_tokens = int(
+                    retrieve_token_mask.sum().item()
+                )
                 if self.use_layerwise:
                     sync = idx == last_idx and batch_idx == last_batch_idx
                     has_agent_source_span = (
@@ -1060,7 +1304,7 @@ class LMCacheConnectorV1Impl:
                     ):
                         # TODO(Jiayi): Need to make prefix caching and blending
                         # compatible
-                        self.blender.blend(
+                        used_hbm_source = self._blend_from_hbm_cacheblend_source(
                             retrieve_tokens,
                             retrieve_token_mask,
                             kvcaches=kvcaches,
@@ -1068,6 +1312,31 @@ class LMCacheConnectorV1Impl:
                             request_configs=retrieve_request_configs,
                             req_id=request.req_id,
                         )
+                        if not used_hbm_source:
+                            self.blender.blend(
+                                retrieve_tokens,
+                                retrieve_token_mask,
+                                kvcaches=kvcaches,
+                                slot_mapping=retrieve_slot_mapping,
+                                request_configs=retrieve_request_configs,
+                                req_id=request.req_id,
+                            )
+                        if should_emit_agent_metric:
+                            _emit_agent_kernel_kv_metric(
+                                "agent_cacheblend_retrieve",
+                                request_id=request.req_id,
+                                source_span_key=source_span_key,
+                                reuse_policy=metric_reuse_policy,
+                                source_backend=(
+                                    "hbm" if used_hbm_source else "lmcache"
+                                ),
+                                expected_tokens=num_expected_tokens,
+                                retrieved_tokens=num_expected_tokens,
+                                success=True,
+                                exact_vllm_cached_tokens=(
+                                    request.load_spec.exact_vllm_cached_tokens
+                                ),
+                            )
                     else:
                         layerwise_retriever = self.lmcache_engine.retrieve_layer(
                             retrieve_tokens,
@@ -1082,6 +1351,19 @@ class LMCacheConnectorV1Impl:
                         next(layerwise_retriever)
                         next(layerwise_retriever)
                         self.layerwise_retrievers.append(layerwise_retriever)
+                        if should_emit_agent_metric:
+                            _emit_agent_kernel_kv_metric(
+                                "agent_cacheblend_retrieve",
+                                request_id=request.req_id,
+                                source_span_key=source_span_key,
+                                reuse_policy=metric_reuse_policy,
+                                expected_tokens=num_expected_tokens,
+                                retrieved_tokens=num_expected_tokens,
+                                success=True,
+                                exact_vllm_cached_tokens=(
+                                    request.load_spec.exact_vllm_cached_tokens
+                                ),
+                            )
                 else:
                     ret_token_mask = self.lmcache_engine.retrieve(
                         retrieve_tokens,
@@ -1101,18 +1383,6 @@ class LMCacheConnectorV1Impl:
                             lmcache_cached_tokens
                             - request.load_spec.vllm_cached_tokens
                         )
-                    source_span_key = (
-                        retrieve_request_configs.get(
-                            "lmcache.tag.agent_source_span")
-                        if isinstance(retrieve_request_configs, dict)
-                        else None
-                    )
-                    reuse_policy = (
-                        retrieve_request_configs.get(
-                            "lmcache.tag.agent_reuse_policy")
-                        if isinstance(retrieve_request_configs, dict)
-                        else None
-                    ) or retrieve_reuse_policy
                     if (
                         source_span_key is not None
                         or request.load_spec.exact_vllm_cached_tokens
@@ -1121,7 +1391,7 @@ class LMCacheConnectorV1Impl:
                             "agent_cacheblend_retrieve",
                             request_id=request.req_id,
                             source_span_key=source_span_key,
-                            reuse_policy=reuse_policy,
+                            reuse_policy=metric_reuse_policy,
                             expected_tokens=num_expected_tokens,
                             retrieved_tokens=int(num_retrieved_tokens),
                             success=(
@@ -1657,6 +1927,45 @@ class LMCacheConnectorV1Impl:
             request_configs,
             span,
         )
+        hbm_hit_tokens = int(span.get("hbm_cacheblend_hit_tokens") or 0)
+        if (
+            reuse_policy == "cacheblend"
+            and hbm_hit_tokens >= len(span_tokens)
+            and span.get("hbm_cacheblend_source_slot_mapping") is not None
+        ):
+            _emit_agent_kernel_kv_metric(
+                "agent_cacheblend_lookup",
+                request_id=request.request_id,
+                context_id=span.get("context_id"),
+                source_request_id=span.get("source_request_id"),
+                source_start=span.get("source_start"),
+                source_end=span.get("source_end"),
+                reuse_policy=reuse_policy,
+                start=start,
+                end=end,
+                load_end=load_end,
+                expected_tokens=len(span_tokens),
+                hit_tokens=len(span_tokens),
+                source_backend="hbm",
+                status="hbm_hit",
+            )
+            return (
+                LoadSpec(
+                    vllm_cached_tokens=num_computed_tokens,
+                    lmcache_cached_tokens=load_end,
+                    can_load=False,
+                    exact_vllm_cached_tokens=True,
+                    load_ranges=[
+                        LoadRange(
+                            start,
+                            load_end,
+                            span_request_configs,
+                            reuse_policy,
+                        )
+                    ],
+                ),
+                True,
+            )
         lookup_id = f"{request.request_id}:agent:{span.get('context_id', start)}"
         self._lookup_requests_in_step.append(lookup_id)
         hit_tokens = self.lookup_client.lookup(
@@ -1764,6 +2073,22 @@ class LMCacheConnectorV1Impl:
             return request_configs
         span_request_configs = dict(request_configs or {})
         span_request_configs["lmcache.tag.agent_source_span"] = source_span_key
+        if span.get("source_start") is not None:
+            span_request_configs["lmcache.tag.agent_source_start"] = int(
+                span["source_start"]
+            )
+        if span.get("source_end") is not None:
+            span_request_configs["lmcache.tag.agent_source_end"] = int(
+                span["source_end"]
+            )
+        if span.get("hbm_cacheblend_source_slot_mapping") is not None:
+            span_request_configs[
+                "lmcache.tag.agent_hbm_source_slot_mapping"
+            ] = span["hbm_cacheblend_source_slot_mapping"]
+            span_request_configs[
+                "lmcache.tag.agent_hbm_source_positions"
+            ] = span.get("hbm_cacheblend_source_positions")
+            span_request_configs["lmcache.tag.agent_hbm_cacheblend"] = True
         return span_request_configs
 
     @_lmcache_nvtx_annotate

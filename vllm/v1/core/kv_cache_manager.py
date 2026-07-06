@@ -689,6 +689,14 @@ class KVCacheManager:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
 
+    def get_blocks_by_ids(self, block_ids: tuple[list[int], ...]) -> KVCacheBlocks:
+        """Get block objects by block ids for direct HBM reuse."""
+        blocks = tuple(
+            [self.block_pool.blocks[block_id] for block_id in group_ids]
+            for group_ids in block_ids
+        )
+        return self.create_kv_cache_blocks(blocks)
+
     def get_segments(self, request_id: str) -> MultiGroupSemanticSegments:
         """Get the segments of a request."""
         if not isinstance(self.coordinator, SemanticSegmentCoordinator):

@@ -2416,7 +2416,10 @@ class GPUModelRunner(
 
     def _register_lmcache_blending_model(self) -> None:
         kv_transfer_config = self.vllm_config.kv_transfer_config
-        if kv_transfer_config.kv_connector != "LMCacheConnectorV1":
+        if (
+            kv_transfer_config is None
+            or kv_transfer_config.kv_connector != "LMCacheConnectorV1"
+        ):
             return
 
         from lmcache.v1.compute.models.utils import VLLMModelTracker

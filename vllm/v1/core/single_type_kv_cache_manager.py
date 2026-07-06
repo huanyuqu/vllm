@@ -116,8 +116,14 @@ class SingleTypeKVCacheManager(ABC):
             req_blocks.extend(new_computed_blocks)
             self.num_cached_block[request_id] = len(new_computed_blocks)
         else:
-            # A running request. Should not have new computed blocks.
-            assert len(new_computed_blocks) == 0
+            # Agent direct reuse can append exact-match HBM blocks to a running
+            # request at a structured-context span boundary.
+            req_blocks = self.req_to_blocks[request_id]
+            req_blocks.extend(new_computed_blocks)
+            self.num_cached_block[request_id] = max(
+                self.num_cached_block[request_id],
+                len(req_blocks),
+            )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int
